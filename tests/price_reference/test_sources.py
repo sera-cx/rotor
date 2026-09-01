@@ -10,6 +10,7 @@ import pytest
 
 from rotor.price_reference.sources import (
     BnmRateSource,
+    CoinGeckoRateSource,
     EcbRateSource,
     FedH10RateSource,
     MasRateSource,
@@ -245,3 +246,110 @@ def test_mas_source_crosses_rates_through_sgd():
 
     assert obs.rate == Decimal("1.35")
     assert obs.pair == "USD/SGD"
+
+
+def _coingecko_response(**legs):
+    # simple/price nests each vs_currency under the coin id, lower-cased.
+    return {"tether": {**legs}}
+
+
+def test_coingecko_source_crosses_through_bridge_and_stamps_update_time():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        seen["has_key_header"] = "x-cg-demo-api-key" in request.headers
+        return httpx.Response(200, json=_coingecko_response(
+            sgd=1.29, usd=0.999, last_updated_at=1756000000
+        ))
+
+    src = CoinGeckoRateSource(
+        base_url="https://api.coingecko.test/api/v3",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    obs = src.quote("SGD", "USD")
+
+    # Bridge units cancel: (USD per bridge) / (SGD per bridge) = USD per SGD.
+    assert obs.rate == Decimal("0.999") / Decimal("1.29")
+    assert obs.pair == "SGD/USD"
+    assert obs.source == "coingecko"
+    # Freshness must follow CoinGecko's own timestamp, not fetch time.
+    assert obs.ts == 1756000000.0
+    assert obs.raw["bridge_id"] == "tether"
+    assert seen["path"].endswith("/simple/price")
+    # Both legs are fetched in one request.
+    assert seen["params"]["vs_currencies"] == "sgd,usd"
+    assert seen["params"]["ids"] == "tether"
+    # No key configured means no key header is sent.
+    assert seen["has_key_header"] is False
+
+
+def test_coingecko_source_sends_api_key_header_when_configured():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["key"] = request.headers.get("x-cg-pro-api-key")
+        return httpx.Response(200, json=_coingecko_response(sgd=1.29, usd=0.999))
+
+    src = CoinGeckoRateSource(
+        base_url="https://pro-api.coingecko.test/api/v3",
+        api_key="cg-key-123",
+        api_key_header="x-cg-pro-api-key",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    src.quote("SGD", "USD")
+
+    assert seen["key"] == "cg-key-123"
+
+
+def test_coingecko_source_same_currency_pair_is_unity():
+    def handler(request: httpx.Request) -> httpx.Response:
+        # A same-currency pair must not ask for a duplicated vs_currency.
+        assert dict(request.url.params)["vs_currencies"] == "usd"
+        return httpx.Response(200, json=_coingecko_response(usd=0.999))
+
+    src = CoinGeckoRateSource(
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert src.quote("USD", "USD").rate == Decimal(1)
+
+
+def test_coingecko_source_rejects_unsupported_vs_currency():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        # CoinGecko silently omits fiat currencies it does not support.
+        return httpx.Response(200, json=_coingecko_response(usd=0.999))
+
+    src = CoinGeckoRateSource(
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="unsupported vs_currency"):
+        src.quote("MYR", "USD")
+
+
+def test_coingecko_source_rejects_unknown_bridge_id():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        # An unknown coin id returns an empty object, not an error status.
+        return httpx.Response(200, json={})
+
+    src = CoinGeckoRateSource(
+        bridge_id="not-a-coin",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="no prices for bridge id"):
+        src.quote("SGD", "USD")
+
+
+def test_coingecko_source_rejects_non_positive_rate():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_coingecko_response(sgd=0, usd=0.999))
+
+    src = CoinGeckoRateSource(
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="rate must be positive"):
+        src.quote("SGD", "USD")

@@ -6,6 +6,7 @@ from rotor.price_reference.config import load_price_reference_source, load_token
 from rotor.price_reference.models import PriceObservation, ReferencePrice
 from rotor.price_reference.sources import (
     BnmRateSource,
+    CoinGeckoRateSource,
     EcbRateSource,
     FedH10RateSource,
     MasRateSource,
@@ -21,6 +22,7 @@ __all__ = [
     "ReferencePrice",
     "ReferencePriceOracle",
     "ReferenceUnavailable",
+    "CoinGeckoRateSource",
     "EcbRateSource",
     "FedH10RateSource",
     "BnmRateSource",

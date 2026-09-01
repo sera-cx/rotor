@@ -42,7 +42,7 @@ def test_load_price_reference_source_rejects_unknown_source():
         load_price_reference_source("manual")
 
 
-@pytest.mark.parametrize("name", ["wise", "ecb", "fed", "bnm", "mas"])
+@pytest.mark.parametrize("name", ["wise", "ecb", "fed", "bnm", "mas", "coingecko"])
 def test_load_price_reference_source_accepts_supported_sources(name):
     assert load_price_reference_source(name).name in {name, "fed"}
 

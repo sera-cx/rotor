@@ -81,6 +81,9 @@ PUBLIC_CASES = [
     ("ecb", "EUR", "USD", Decimal("0.7"), Decimal("1.7")),
     ("bnm", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
     ("mas", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
+    # Both orientations, because a crossed source is where a flipped rate hides.
+    ("coingecko", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
+    ("coingecko", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
 ]
 
 # Sources that need a credential. fed uses the FRED API (the legacy fredgraph.csv

@@ -5,6 +5,7 @@ from __future__ import annotations
 from rotor.config import get_config, get_config_json
 from rotor.price_reference.sources import (
     BnmRateSource,
+    CoinGeckoRateSource,
     EcbRateSource,
     FedH10RateSource,
     MasRateSource,
@@ -86,8 +87,23 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
             ),
             max_age_s=_max_age_override("MAS"),
         )
+    if source_name in {"coingecko", "cg"}:
+        # Public endpoint; the API key is optional and only raises rate limits.
+        # The bridge asset is configurable because a depeg would land directly
+        # in the crossed rate.
+        return CoinGeckoRateSource(
+            base_url=str(
+                get_config("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3")
+            ),
+            bridge_id=get_config("COINGECKO_BRIDGE_ID", None),
+            api_key=str(get_config("COINGECKO_API_KEY", "") or ""),
+            api_key_header=get_config("COINGECKO_API_KEY_HEADER", None),
+            max_age_s=_max_age_override("COINGECKO"),
+        )
     # Keep accepted source names closed so misspellings fail loudly.
-    raise ValueError("PRICE_REFERENCE_SOURCE must be one of: wise, ecb, fed, bnm, mas")
+    raise ValueError(
+        "PRICE_REFERENCE_SOURCE must be one of: wise, ecb, fed, bnm, mas, coingecko"
+    )
 
 
 def _max_age_override(prefix: str) -> float | None:

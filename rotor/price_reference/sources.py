@@ -416,6 +416,101 @@ class MasRateSource:
         return rate, {"currency": currency, "resource_id": resource_id, **row}
 
 
+class CoinGeckoRateSource:
+    """CoinGecko simple-price adapter — crypto-native intraday FX reference.
+
+    CoinGecko prices one asset in many fiat currencies at once, so a fiat pair is
+    obtained by asking for a single bridge asset in both legs and crossing it —
+    the same shape as `EcbRateSource` crossing through EUR:
+
+        SGD/USD = (USD per bridge) / (SGD per bridge)
+
+    The bridge defaults to a fiat-pegged stablecoin, which keeps crypto basis out
+    of the crossed rate to first order; a depegged or thinly-priced bridge would
+    push straight into the quote, so it stays operator-configurable. Both legs
+    come from one response and therefore share one publication timestamp.
+
+    The endpoint is public. An API key is optional and only raises rate limits.
+    """
+
+    # Source name carried into observations and logs.
+    name = "coingecko"
+    # CoinGecko refreshes continuously; hold it to the intraday window.
+    DEFAULT_MAX_AGE_S = INTRADAY_MAX_AGE_S
+    # Fiat-pegged bridge asset used to cross two fiat legs in one request.
+    DEFAULT_BRIDGE_ID = "tether"
+    # Demo keys use this header; Pro deployments override it with the base URL.
+    DEFAULT_API_KEY_HEADER = "x-cg-demo-api-key"
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "https://api.coingecko.com/api/v3",
+        bridge_id: str | None = None,
+        api_key: str = "",
+        api_key_header: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        max_age_s: float | None = None,
+        http: httpx.Client | None = None,
+    ) -> None:
+        """Configure the CoinGecko simple-price client and bridge asset."""
+        # Drop a trailing slash so endpoint joins are deterministic.
+        self.base_url = base_url.rstrip("/")
+        # Empty/whitespace config falls back to the default bridge.
+        self.bridge_id = (str(bridge_id).strip() or self.DEFAULT_BRIDGE_ID) if bridge_id else self.DEFAULT_BRIDGE_ID
+        # Optional; absent means the public rate limit applies.
+        self.api_key = str(api_key or "").strip()
+        self.api_key_header = (
+            str(api_key_header).strip() if api_key_header else self.DEFAULT_API_KEY_HEADER
+        )
+        # Per-source freshness window; defaults to the class intraday window.
+        self.default_max_age_s = (
+            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
+        )
+        # Allow tests to inject a fake client; otherwise create a bounded client.
+        self._http = http or httpx.Client(timeout=timeout)
+
+    def quote(
+        self, base: str, quote: str, *, amount: Decimal | None = None
+    ) -> PriceObservation:
+        """Fetch both legs in one request and cross them through the bridge."""
+        base_ccy = base.upper()
+        quote_ccy = quote.upper()
+        # One request covers both legs; de-duplicate so a same-currency pair
+        # still asks for a valid single vs_currency.
+        vs_currencies = sorted({base_ccy.lower(), quote_ccy.lower()})
+        headers = {self.api_key_header: self.api_key} if self.api_key else None
+        response = self._http.get(
+            f"{self.base_url}/simple/price",
+            params={
+                "ids": self.bridge_id,
+                "vs_currencies": ",".join(vs_currencies),
+                "include_last_updated_at": "true",
+            },
+            headers=headers,
+        )
+        # Let httpx expose non-2xx responses (including 429s) as provider failures.
+        response.raise_for_status()
+        base_per_bridge, quote_per_bridge, last_updated = _coingecko_bridge_legs(
+            response.json(), self.bridge_id, base_ccy, quote_ccy
+        )
+        return PriceObservation(
+            source=self.name,
+            pair=_pair(base, quote),
+            # Bridge units cancel, leaving quote-per-base.
+            rate=quote_per_bridge / base_per_bridge,
+            # Stamp CoinGecko's own update time so a stalled feed is detectable
+            # by the freshness guard rather than looking fresh on fetch time.
+            ts=_parse_ts(last_updated),
+            raw={
+                "bridge_id": self.bridge_id,
+                "rate_base": str(base_per_bridge),
+                "rate_quote": str(quote_per_bridge),
+                "last_updated_at": last_updated,
+            },
+        )
+
+
 def _pair(base: str, quote: str) -> str:
     """Format a normalized ISO pair label."""
     return f"{base.upper()}/{quote.upper()}"
@@ -604,3 +699,30 @@ def _parse_bnm_rate(row: dict) -> Decimal:
     if buying is None or selling is None:
         raise ValueError(f"BNM row has no usable rate: {row!r}")
     return (_positive_decimal(buying) + _positive_decimal(selling)) / Decimal("2") / unit
+
+
+def _coingecko_bridge_legs(
+    body: Any, bridge_id: str, base: str, quote: str
+) -> tuple[Decimal, Decimal, Any]:
+    """Extract both fiat legs of the bridge asset from a simple-price payload.
+
+    Returns `(base_per_bridge, quote_per_bridge, last_updated_at)`. Missing keys
+    are raised as ValueError rather than KeyError so the oracle attributes the
+    failure to the provider with a message naming what was unsupported.
+    """
+    entry = body.get(bridge_id) if isinstance(body, dict) else None
+    if not isinstance(entry, dict):
+        # An unknown coin id returns `{}` rather than an error status.
+        raise ValueError(f"coingecko returned no prices for bridge id {bridge_id!r}")
+
+    def leg(currency: str) -> Decimal:
+        # simple/price keys vs_currencies in lower case.
+        value = entry.get(currency.lower())
+        if value is None:
+            raise ValueError(
+                f"coingecko does not price {bridge_id!r} in {currency} "
+                "(unsupported vs_currency)"
+            )
+        return _positive_decimal(value)
+
+    return leg(base), leg(quote), entry.get("last_updated_at")
