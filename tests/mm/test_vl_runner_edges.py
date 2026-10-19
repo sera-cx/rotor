@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from decimal import Decimal
 
 import pytest
@@ -16,6 +17,7 @@ from rotor.mm.exchange.client import (
     VLBatchResult,
     VLCancelledLeg,
 )
+from rotor.mm.positions import Position
 from rotor.mm.quote_engine import LiveOrder
 from rotor.mm.vl_config import BudgetConfig, VLConfig
 
@@ -64,23 +66,6 @@ def _market() -> MarketInfo:
         min_bid_quote_amount=Decimal("1"),
         min_ask_amount=Decimal("1"),
     )
-
-
-def test_quote_with_return_sides_tightens_only_requested_side():
-    quote = vr.QuoteSet(
-        benchmark_rate=Decimal("1.0000"),
-        bid_price=Decimal("0.9900"),
-        ask_price=Decimal("1.0100"),
-        qty_base=Decimal("100"),
-        fixed_bps=Decimal("100"),
-    )
-
-    tightened = vr._quote_with_return_sides(
-        _market(), quote, {"ask"}, Decimal("1"))
-
-    assert tightened.bid_price == Decimal("0.9900")
-    assert tightened.ask_price == Decimal("1.0001")
-    assert tightened.fixed_bps == Decimal("100")
 
 
 def test_validate_budget_caps_allows_exact_bid_cap():
@@ -251,16 +236,58 @@ def test_state_store_dedupes_and_prunes_unresolved_state(tmp_path):
         assert loaded[0].orders[0].uuid_int == 2**252
         assert loaded[0].orders[0].qty_base == Decimal("25")
 
-        store.replace_pending_returns({"XSGD/USDC": {"ask"}})
-        store.replace_pending_returns({"XSGD/USDC": {"ask"}})
-        assert store.load_pending_returns() == {"XSGD/USDC": {"ask"}}
-
         store.replace_active([])
-        store.replace_pending_returns({})
         assert store.load_active({"XSGD/USDC"}) == []
-        assert store.load_pending_returns() == {}
     finally:
         store.close()
+
+
+def test_state_store_keeps_unsettled_orders_and_positions_across_restarts(tmp_path):
+    path = tmp_path / "state.sqlite"
+    order = vr.UnsettledOrder(
+        order_id="order-1",
+        market="XSGD/USDC",
+        side="ask",
+        price=Decimal("1.0050"),
+        expiration=1000,
+        placed_at=10.0,
+    )
+    store = vr.StateStore(path)
+    try:
+        store.add_unsettled([order])
+        store.add_unsettled([order])
+        assert store.load_unsettled() == [order]
+        store.settle_order(order, Decimal("25"))
+    finally:
+        store.close()
+
+    store = vr.StateStore(path)
+    try:
+        assert store.load_unsettled() == []
+        assert store.load_positions() == {
+            "XSGD/USDC": Position(Decimal("-25"), Decimal("1.0050"), 10.0)
+        }
+    finally:
+        store.close()
+
+
+def test_state_store_drops_the_superseded_pending_returns_table(tmp_path):
+    path = tmp_path / "state.sqlite"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE pending_returns (market TEXT, side TEXT)")
+    db.commit()
+    db.close()
+
+    vr.StateStore(path).close()
+
+    tables = {
+        row[0]
+        for row in sqlite3.connect(path).execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert "pending_returns" not in tables
+    assert {"unsettled_orders", "positions"} <= tables
 
 
 def test_prune_fully_filled_placements_drops_only_known_full_fills():

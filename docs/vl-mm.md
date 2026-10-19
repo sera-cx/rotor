@@ -2,15 +2,59 @@
 
 `rotor mm vl` is a fixed-spread, cadence-based Sera VL runner. Each tick:
 
-1. Fetches the latest source mid for every configured pair.
-2. Builds one bid and one ask at `fixed_bps` from the mid.
-3. Polls fills on the tracked live quote set.
+1. Reads the fills of its live quotes and of every placed order not yet settled.
+   Fully filled orders stop being tracked, and positions are brought up to date.
+2. Fetches the latest source mid for every configured pair.
+3. Builds one bid and one ask at `fixed_bps` from the mid. A market with an open
+   position quotes its return order on that side instead.
 4. Cancels tracked old placements when the local cancel guard permits.
-5. Places the fresh quote set, using VL for eligible same-spent-token groups.
+5. Places the fresh quote set, using VL for eligible same-spent-token groups, and
+   records every placed order for settlement.
 
-If a fill is detected, the next quote set tightens the opposite side to
-`return_bps` from the latest source mid. Rotor does not place extra return
-orders.
+## Returning fills
+
+A fill moves inventory: a filled bid leaves rotor holding extra base tokens, a
+filled ask leaves it short of them. Rotor records that as a per-market
+**position** (net base quantity, size-weighted fill price, size-weighted fill
+time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
+
+- The return order replaces the normal order on that side. It starts at the
+  normal opposite quote at fill time (`2 x fixed_bps` from the fill price) and
+  walks linearly to the fill price over `return_window_hours` (default 48): a
+  reverse Dutch auction that asks for less profit the longer it waits.
+- After the window it **holds at the fill price indefinitely**. Rotor never
+  returns a position at a loss against its fill price. Breakeven is measured on
+  price alone; any fees or gas a deployment charges are not included.
+- It never quotes closer to the latest mid than `return_bps`. If the market moved
+  in rotor's favour, the order sits `return_bps` from mid instead of overpaying.
+- It never spends more than the normal order it replaces, so a larger position is
+  returned over several fills and budgets see no new spend. A position below the
+  market's minimum order keeps the normal order on that side; the next fill there
+  absorbs it.
+- The other side keeps quoting normally. Fills there grow the position, and its
+  fill price and clock become size-weighted averages.
+
+Fills are counted from a ledger, not from the resting quote set. Every order
+rotor places is recorded with its side, limit price, and signed expiry, and each
+tick rotor reads the fills of every order in the ledger. Once an order has
+expired (plus 60 seconds) and none of its fills is still `pending` or
+`confirming`, its `settled` quantity is added to the stored position in the same
+database transaction that removes it from the ledger. Each order is therefore
+counted exactly once, however it left the book: cancelled at boot, left behind
+by a previous `--once` run, or cancelled by a failed tick. Fills on orders that
+are not final yet (still resting, cancelled but unexpired, or settling) are added
+on top when quoting, so a fill holds its return side from the first tick that
+sees it; only settled fills are stored. `failed` and `reverted` fills count as
+nothing. The order's limit price stands in for the fill price: fills happen at
+that price or better (on Sera a maker receives exactly its limit), so the
+breakeven is never optimistic. A fill that lands between a tick's fill read and
+its cancel is seen one tick later.
+
+Positions do not see deposits, withdrawals, or trades outside this rotor's own
+orders, orders placed by an older rotor version, or fills on a VL batch whose
+returned order ids did not line up with its legs. A position on a market that is
+no longer configured is kept but not quoted. Deleting the state file forgets
+every position.
 
 ## Config
 
@@ -21,6 +65,7 @@ amount = "5000"
 
 fixed_bps = "50"
 return_bps = "2"
+return_window_hours = "48"
 
 [[pair]]
 market = "XSGD/USDC"
@@ -47,7 +92,8 @@ Rules:
   The other sources are pure mid/reference rates. Pin a Wise method with
   `WISE_PAY_IN`/`WISE_PAY_OUT` if you do not want cheapest-enabled.
 - `fixed_bps` can be global or overridden per pair.
-- `return_bps` must be positive.
+- `return_bps` must be positive. It is the closest a return order quotes to mid.
+- `return_window_hours` must be positive (default 48).
 
 See `rotor/price_reference/README.md` for provider-specific endpoint and
 cross-rate details.
@@ -133,9 +179,11 @@ do not pass `--cancel-on-exit` (quotes should rest between fires). See
 ## Unresolved State
 
 Rotor writes a small SQLite file at `.rotor_state.sqlite` by default. This is
-not trade history. It stores only unresolved active orders and pending
-return-side signals, then prunes rows after cancellation or after the return
-side is used. Set `ROTOR_STATE_PATH` to move the file.
+not trade history. It stores unresolved active orders, placed orders whose fills
+are not yet counted (`unsettled_orders`), open positions (`positions`), and open
+stale-reference alerts, and prunes rows once they resolve. Positions must survive
+restarts: deleting the file forgets them. Set `ROTOR_STATE_PATH` to move the
+file.
 
 Add `--telegram` to send lifecycle/error alerts through the optional Telegram
 notifier. Install the optional dependency with:
@@ -200,6 +248,7 @@ poetry run python -m pytest -q tests/testnet/test_vl_runner_scenarios.py
 ```
 
 Those scenarios run the actual tick loop with a deterministic test mid, fill a
-maker quote from a taker wallet between ticks, and verify the return-side
-requote. They default to a `305` second wait between ticks so live cancellation
-cooldowns can clear.
+maker quote from a taker wallet between ticks, and verify that the fill settles
+into a position and is quoted back as a return order sized to the fill. They
+default to a `305` second wait between ticks so live cancellation cooldowns can
+clear, and run four ticks so the filled order expires and settles.

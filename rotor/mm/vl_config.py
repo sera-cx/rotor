@@ -54,8 +54,10 @@ class VLConfig:
     pairs: list[PairConfig]
     # Global defaults copied into pairs when pair-level values are absent.
     fixed_bps: Decimal
-    # Distance from the latest source mid for the side tightened after a fill.
+    # Closest a return order may quote to the latest source mid.
     return_bps: Decimal
+    # Hours a return order takes to walk from the normal quote to the fill price.
+    return_window_hours: Decimal = Decimal("48")
 
     @property
     def budget_tokens(self) -> set[str]:
@@ -82,6 +84,9 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
     return_bps = _decimal(raw, "return_bps", Decimal("2"))
     if return_bps <= 0:
         raise ValueError(f"{source}: return_bps must be > 0")
+    return_window_hours = _decimal(raw, "return_window_hours", Decimal("48"))
+    if return_window_hours <= 0:
+        raise ValueError(f"{source}: return_window_hours must be > 0")
 
     # Budgets define the shared spend caps that make VL safe.
     budgets = _parse_budgets(raw.get("budget"), source=source)
@@ -99,6 +104,7 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
         pairs=pairs,
         fixed_bps=fixed_bps,
         return_bps=return_bps,
+        return_window_hours=return_window_hours,
     )
 
 

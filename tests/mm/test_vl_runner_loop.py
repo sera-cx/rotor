@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
+from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
 from rotor.price_reference import ReferenceTooStale, ReferenceUnavailable
 from rotor.price_reference.models import PriceObservation, ReferencePrice
@@ -114,6 +115,7 @@ class _FakeClient:
         open_orders: list[dict] | None = None,
         fill_first_xsgd_bid: bool = False,
         cancel_ok: bool = True,
+        fill_status: str = "settled",
     ) -> None:
         self.markets_by_symbol = {
             "XSGD/USDC": _market("XSGD/USDC", "XSGD", "USDC"),
@@ -129,7 +131,7 @@ class _FakeClient:
         self.batch_places: list[dict] = []
         self.standalone_places: list[dict] = []
         self.fill_order_ids: set[str] = set()
-        self.polled_fill_ids: set[str] = set()
+        self.fill_status = fill_status
         self._batch_count = 0
         self._order_count = 0
         self._uuid_int = 100
@@ -146,9 +148,8 @@ class _FakeClient:
 
     def expiration_from_server_time(self, order_ttl_seconds: int) -> int:
         self.events.append(("expiration", order_ttl_seconds))
-        return 1_000_000 + len([
-            event for event in self.events if event[0] == "expiration"
-        ])
+        # Sera's clock follows the local one, which tests may fake.
+        return int(time.time()) + order_ttl_seconds
 
     def place_vl_batch(self, legs) -> VLBatchResult:
         self._batch_count += 1
@@ -212,9 +213,9 @@ class _FakeClient:
 
     def get_order_fills(self, order_id: str) -> list[dict]:
         self.events.append(("fills", order_id))
-        if order_id in self.fill_order_ids and order_id not in self.polled_fill_ids:
-            self.polled_fill_ids.add(order_id)
-            return [{"quantity": "5", "price": "1.0"}]
+        if order_id in self.fill_order_ids:
+            # Like Sera, every call lists all of the order's fills so far.
+            return [{"quantity": "5", "price": "1.0", "settlement_status": self.fill_status}]
         return []
 
     def cancel_vl_batch(self, vl_batch_id: str) -> bool:
@@ -258,46 +259,170 @@ def _stop_after_sleeps(monkeypatch, count: int) -> list[float]:
     return sleeps
 
 
-def test_run_requotes_four_orders_and_tightens_return_side_after_fill(monkeypatch):
+HOUR = 3600.0
+# A fixed start for faked clocks: well past any real order's expiry.
+T0 = 1_800_000_000.0
+
+
+def _fake_clock(monkeypatch, *, steps: list[float]) -> dict[str, float]:
+    """Fake the clock and stop the run loop after one sleep per step.
+
+    Each sleep moves time forward by the next step, so tick n runs at
+    T0 + sum(steps[:n]).
+    """
+    clock = {"now": T0}
+    stop = _StopFlag()
+    pending = list(steps)
+
+    def fake_sleep(_started: float, _poll_seconds: float, _stop=None) -> None:
+        clock["now"] += pending.pop(0)
+        if not pending:
+            stop.requested = True
+
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+    monkeypatch.setattr(vr, "sleep_remaining", fake_sleep)
+    return clock
+
+
+def _xsgd_asks(client: _FakeClient) -> list[tuple[Decimal, Decimal]]:
+    return [
+        (row["qty"], row["price"]) for row in client.standalone_places
+        if row["market"] == "XSGD/USDC" and row["side"] == "ask"
+    ]
+
+
+def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
+    monkeypatch, tmp_path,
+):
+    # Tick 1's XSGD bid buys 5 XSGD at 0.9950. Ticks run at 0h, 12h, 24h and
+    # 60h; SGD falls from 1.0000 to 0.9800 before the third tick.
     client = _FakeClient(fill_first_xsgd_bid=True)
     source = _SequencedSource({
-        ("SGD", "USD"): ["1.0000", "1.0100"],
-        ("EUR", "USD"): ["2.0000", "2.0200"],
+        ("SGD", "USD"): ["1.0000", "1.0000", "0.9800", "0.9800"],
+        ("EUR", "USD"): ["2.0000"],
     })
     _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    _stop_after_sleeps(monkeypatch, 2)
+    _fake_clock(monkeypatch, steps=[12 * HOUR, 12 * HOUR, 36 * HOUR, 1.0])
 
     result = vr.run(
         config_path="vl.toml",
         poll_seconds=305.0,
         min_requote_seconds=0.0,
         log_level="ERROR",
-        state_path=":memory:",
+        state_path=tmp_path / "state.sqlite",
     )
 
     assert result == 0
-    assert len(client.active_orders) == 4
-    assert len(client.batch_places) == 2
-    assert len(client.standalone_places) == 4
-    assert ("cancel_vl", "batch-1") in client.events
-
-    xsgd_asks = [
-        row for row in client.standalone_places
-        if row["market"] == "XSGD/USDC" and row["side"] == "ask"
+    assert _xsgd_asks(client) == [
+        # 0h: the normal ask, 50 bps over mid.
+        (Decimal("10"), Decimal("1.0050")),
+        # 12h: the settled fill is now a position. The ask sells back only the
+        # 5 XSGD bought, 75 bps over the fill price (a quarter of the window gone).
+        (Decimal("5"), Decimal("1.0025")),
+        # 24h: halfway, 50 bps over the fill price, though the market fell to 0.98.
+        (Decimal("5"), Decimal("1.0000")),
+        # 60h: past the window, it holds at the fill price above the market.
+        (Decimal("5"), Decimal("0.9950")),
     ]
-    assert [row["price"] for row in xsgd_asks] == [
-        Decimal("1.0050"),
-        Decimal("1.0102"),
-    ]
-
+    # The bid side keeps quoting normally around the latest mid throughout.
     xsgd_bids = [
-        leg for batch in client.batch_places for leg in batch["legs"]
+        leg["price"] for batch in client.batch_places for leg in batch["legs"]
         if leg["market"] == "XSGD/USDC" and leg["side"] == "bid"
     ]
-    assert [leg["price"] for leg in xsgd_bids] == [
-        Decimal("0.9950"),
-        Decimal("1.0049"),
+    assert xsgd_bids == [
+        Decimal("0.9950"), Decimal("0.9950"), Decimal("0.9751"), Decimal("0.9751")]
+
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        assert store.load_positions() == {
+            "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)
+        }
+    finally:
+        store.close()
+
+
+def test_fire_once_runs_settle_the_previous_runs_fills(monkeypatch, tmp_path):
+    # Each fire-once run is a new process: fills on the last run's orders must
+    # still reach a position through the state file.
+    client = _FakeClient(fill_first_xsgd_bid=True)
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    clock = {"now": T0}
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    state_path = tmp_path / "state.sqlite"
+
+    def fire() -> int:
+        return vr.run(
+            config_path="vl.toml",
+            once=True,
+            min_requote_seconds=0.0,
+            log_level="ERROR",
+            state_path=state_path,
+        )
+
+    assert fire() == 0
+    clock["now"] += HOUR
+    assert fire() == 0
+
+    # One hour into the window: 0.9950 x (1 + 100 bps x 47/48), rounded up.
+    assert _xsgd_asks(client) == [
+        (Decimal("10"), Decimal("1.0050")),
+        (Decimal("5"), Decimal("1.0048")),
     ]
+
+
+def test_run_holds_the_return_side_from_the_tick_after_a_fill(monkeypatch, tmp_path):
+    # At the normal cadence the filled order is still resting (and unexpired) on
+    # the next tick; its fill already decides that tick's ask.
+    client = _FakeClient(fill_first_xsgd_bid=True)
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    assert result == 0
+    # 305 s into the window the auction is still at the normal ask's price; only
+    # the size shows it is the return order for the 5 XSGD bought.
+    assert _xsgd_asks(client) == [
+        (Decimal("10"), Decimal("1.0050")),
+        (Decimal("5"), Decimal("1.0050")),
+    ]
+
+
+def test_run_holds_a_fill_that_is_still_settling_without_storing_it(monkeypatch, tmp_path):
+    client = _FakeClient(fill_first_xsgd_bid=True, fill_status="confirming")
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[12 * HOUR, 1.0])
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    assert result == 0
+    # The fill holds the ask as soon as it is visible...
+    assert _xsgd_asks(client) == [
+        (Decimal("10"), Decimal("1.0050")),
+        (Decimal("5"), Decimal("1.0025")),
+    ]
+    # ...but only a settled fill is written to the stored position.
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        assert store.load_positions() == {}
+        assert "batch-1-leg-0" in {row.order_id for row in store.load_unsettled()}
+    finally:
+        store.close()
 
 
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):

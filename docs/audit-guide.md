@@ -18,12 +18,13 @@ Read these files in order:
 3. `rotor/cli/main.py`
 4. `rotor/mm/vl_config.py`
 5. `rotor/mm/vl_runner.py`
-6. `rotor/mm/quote_engine.py`
-7. `rotor/mm/exchange/client.py`
-8. `rotor/mm/exchange/eip712.py`
-9. `rotor/security/key.py`
-10. `rotor/updater.py`
-11. `rotor/notifications/telegram.py`
+6. `rotor/mm/positions.py`
+7. `rotor/mm/quote_engine.py`
+8. `rotor/mm/exchange/client.py`
+9. `rotor/mm/exchange/eip712.py`
+10. `rotor/security/key.py`
+11. `rotor/updater.py`
+12. `rotor/notifications/telegram.py`
 
 ## First Commands
 
@@ -56,7 +57,26 @@ Pricing:
 - A failing, past-carry-limit, or sub-minimum pair is skipped in isolation; the
   other pairs still quote. A tick is fully skipped only when no pair produces a
   quote.
-- Return-side quotes use `return_bps` from the latest source mid.
+
+Positions and return orders:
+
+- Every placed order is recorded in `unsettled_orders` (side, limit price,
+  signed expiry) as soon as Sera accepts it, including orders a failed tick then
+  cancels.
+- An order is settled only after its expiry plus 60 seconds of Sera server time,
+  and only when none of its fills is `pending`/`confirming` (or an unknown
+  status). Only `settled` fills count; `failed`/`reverted` count as zero.
+- Settling an order updates its market's position and deletes its ledger row in
+  one SQLite transaction, so each order is counted exactly once.
+- Each tick reads the fills of every ledger order and every live order once.
+  Quoting adds the visible (not `failed`/`reverted`) fills of unsettled orders
+  on top of the stored positions; only settled fills are ever stored.
+- The breakeven is the order's limit price, which fills meet or beat.
+- A return bid is never above the position's fill price and an ask never below
+  it; bids round down and asks round up, so grid rounding cannot cross it.
+- A return order is never closer to mid than `return_bps`, never spends more than
+  the normal order it replaces, and replaces only the normal order on its side.
+- All price math, including the auction's time fraction, is `Decimal`.
 
 Live order lifecycle:
 
@@ -66,8 +86,9 @@ Live order lifecycle:
 - Startup cancellation is default-on and runs before the first quote tick.
 - If boot cancellation leaves placements live, Rotor waits 5 minutes and retries
   once while keeping any remaining placements tracked.
-- `.rotor_state.sqlite` stores only unresolved active orders and pending return
-  sides; cancelled/completed rows are pruned instead of retained as history.
+- `.rotor_state.sqlite` stores unresolved active orders, unsettled orders, open
+  positions, and open stale-reference alerts; resolved rows are pruned instead of
+  retained as history. Positions persist until returned.
 - Each live cadence replaces the tracked quote set; old placements are cancelled
   before fresh placements.
 - Cancel cooldowns keep local tracking for later retry, but an order Sera reports
@@ -108,8 +129,8 @@ VL behavior:
 - Oversized same-spent-token groups are split into chunks of at most Sera's batch
   maximum, so one large group cannot fail every tick.
 - Sera remains the authoritative shared-budget enforcer.
-- Fills mark the opposite side for the next cadence quote; Rotor does not place
-  extra return orders.
+- A position's return order takes the place of the normal order on its side;
+  Rotor never places a second order per market side.
 
 Autonomous updates:
 
@@ -162,8 +183,12 @@ wallets to fill the actual loop between ticks.
 
 Highest-signal files:
 
-- `tests/mm/test_vl_runner_loop.py`: multi-tick quote replacement, fill-driven
-  return-side tightening, tick-error recovery, and auto-update restart.
+- `tests/mm/test_vl_runner_loop.py`: multi-tick quote replacement, a fill
+  settling into a position and walking the return auction to the fill price,
+  `--once` settlement across runs, tick-error recovery, and auto-update restart.
+- `tests/mm/test_positions.py`: position netting and the return-order price.
+- `tests/mm/test_vl_runner.py`: fill settlement statuses and exactly-once
+  counting, return-order sizing, and ledger recording on placement.
 - `tests/mm/test_client.py`: Sera preview/sign/place/cancel behavior.
 - `tests/mm/test_eip712.py`: EIP-712 schema and packed UUID layout.
 - `tests/security/test_key.py`: private-key loading, signing, and lock behavior.
@@ -184,6 +209,11 @@ Stop and investigate if you find:
 - A path that places or cancels in dry-run mode.
 - A partial placement path that leaves already placed orders unmanaged.
 - A cancel failure path that drops local order tracking.
+- A placed order that never reaches `unsettled_orders`, or that leaves it without
+  its settled fills applied in the same transaction (a fill missed or counted
+  twice).
+- A return order priced through its position's fill price, or sized above the
+  normal order it replaces.
 - A stale source quote that still places orders outside the carry rules: a stale
   `wise` quote, a daily rate past its carry limit, or any stale rate under
   `--halt-on-stale-reference`.

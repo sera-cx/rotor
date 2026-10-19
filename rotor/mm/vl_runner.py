@@ -13,7 +13,7 @@ import datetime as dt
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,14 +22,18 @@ try:  # pragma: no cover - POSIX-only single-instance lock.
 except ImportError:  # pragma: no cover - non-POSIX fallback (no flock).
     fcntl = None
 
-from rotor.algo import (
-    QuoteSet,
-    SimpleMarketMakingAlgo,
-    SimpleMarketMakingConfig,
+from rotor.algo import QuoteSet
+
+# Return orders use the same grid rounding and minimum checks as normal quotes.
+from rotor.algo.simple_market_making import (
+    _quantize_price,
+    _quantize_qty,
+    _validate_minimums,
 )
 from rotor.config import get_config
 from rotor.mm.exchange import errors
 from rotor.mm.exchange.client import OrderRecord, SeraClient, VLBatchResult, VLLeg
+from rotor.mm.positions import Position, apply_fill, return_price
 from rotor.mm.quote_engine import (
     LiveOrder,
     StopFlag,
@@ -65,6 +69,9 @@ DEFAULT_STATE_PATH = ".rotor_state.sqlite"
 # While pairs quote on carried-forward reference rates, repeat the warning at
 # most this often, so a weekend produces a handful of messages, not one per tick.
 STALE_REMINDER_SECONDS = 6 * 60 * 60.0
+# An order's fills are counted this long after it expires, so a match made just
+# before expiry has time to show up in its fill list.
+SETTLE_GRACE_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,21 @@ class LivePlacement:
     intent_by_order_id: dict[str, OrderIntent] | None = None
 
 
+@dataclass(frozen=True)
+class UnsettledOrder:
+    """An order rotor placed whose fills are not yet in a position."""
+
+    order_id: str
+    market: str
+    side: str
+    # Limit price. Fills happen at this price or better, so it is a safe breakeven.
+    price: Decimal
+    # Signed expiry in Sera server time; the order cannot fill after it.
+    expiration: int
+    # Local placement time; the position's return window starts here.
+    placed_at: float
+
+
 @dataclass
 class TickReferences:
     """How each pair's reference fared while one tick's quotes were built."""
@@ -177,11 +199,26 @@ class StateStore:
             )
         """)
         self._ensure_active_order_columns()
+        # Superseded by positions; its rows were one-tick signals, safe to drop.
+        self._db.execute("DROP TABLE IF EXISTS pending_returns")
+        # Every order rotor placed, until its fills are final and counted.
         self._db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_returns (
+            CREATE TABLE IF NOT EXISTS unsettled_orders (
+                order_id TEXT PRIMARY KEY,
                 market TEXT NOT NULL,
                 side TEXT NOT NULL,
-                PRIMARY KEY (market, side)
+                price TEXT NOT NULL,
+                expiration INTEGER NOT NULL,
+                placed_at REAL NOT NULL
+            )
+        """)
+        # One row per market whose fills have moved inventory; gone once flat.
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                market TEXT PRIMARY KEY,
+                net_base TEXT NOT NULL,
+                price TEXT NOT NULL,
+                opened_at REAL NOT NULL
             )
         """)
         self._db.execute("""
@@ -315,29 +352,92 @@ class StateStore:
             )
         return out
 
-    def replace_pending_returns(self, return_sides: dict[str, set[str]]) -> None:
-        """Replace pending return signals, pruning them once consumed."""
+    def add_unsettled(self, orders: list[UnsettledOrder]) -> None:
+        """Record placed orders so their fills are counted once they are final."""
         rows = [
-            (market, side)
-            for market, sides in return_sides.items()
-            for side in sides
-            if side in {"bid", "ask"}
+            (
+                order.order_id,
+                order.market,
+                order.side,
+                str(order.price),
+                int(order.expiration),
+                float(order.placed_at),
+            )
+            for order in orders
         ]
         with self._db:
-            self._db.execute("DELETE FROM pending_returns")
             self._db.executemany(
-                "INSERT OR REPLACE INTO pending_returns (market, side) VALUES (?, ?)",
+                """
+                INSERT OR IGNORE INTO unsettled_orders (
+                    order_id, market, side, price, expiration, placed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
                 rows,
             )
 
-    def load_pending_returns(self) -> dict[str, set[str]]:
-        """Load unresolved return-side signals."""
-        out: dict[str, set[str]] = {}
-        for market, side in self._db.execute(
-            "SELECT market, side FROM pending_returns ORDER BY market, side"
-        ):
-            out.setdefault(market, set()).add(side)
-        return out
+    def load_unsettled(self) -> list[UnsettledOrder]:
+        """Load orders whose fills are not yet counted, oldest first."""
+        return [
+            UnsettledOrder(
+                order_id=order_id,
+                market=market,
+                side=side,
+                price=Decimal(price),
+                expiration=int(expiration),
+                placed_at=float(placed_at),
+            )
+            for order_id, market, side, price, expiration, placed_at in self._db.execute(
+                "SELECT order_id, market, side, price, expiration, placed_at "
+                "FROM unsettled_orders ORDER BY placed_at, order_id"
+            )
+        ]
+
+    def load_positions(self) -> dict[str, Position]:
+        """Load every open position by market."""
+        return {
+            market: Position(Decimal(net_base), Decimal(price), float(opened_at))
+            for market, net_base, price, opened_at in self._db.execute(
+                "SELECT market, net_base, price, opened_at FROM positions ORDER BY market"
+            )
+        }
+
+    def settle_order(
+        self, order: UnsettledOrder, filled_base: Decimal
+    ) -> tuple[Position | None, Position | None]:
+        """Count one order's final fills into its market's position.
+
+        The position update and the ledger delete commit together, so an order is
+        counted exactly once: a crash before the commit leaves it for next tick.
+        Returns the position before and after.
+        """
+        with self._db:
+            row = self._db.execute(
+                "SELECT net_base, price, opened_at FROM positions WHERE market = ?",
+                (order.market,),
+            ).fetchone()
+            before = (
+                None if row is None
+                else Position(Decimal(row[0]), Decimal(row[1]), float(row[2]))
+            )
+            after = before
+            if filled_base > 0:
+                after = apply_fill(
+                    before, order.side, filled_base, order.price, order.placed_at)
+                if after is None:
+                    self._db.execute(
+                        "DELETE FROM positions WHERE market = ?", (order.market,))
+                else:
+                    self._db.execute(
+                        """
+                        INSERT OR REPLACE INTO positions (
+                            market, net_base, price, opened_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (order.market, str(after.net_base), str(after.price), after.opened_at),
+                    )
+            self._db.execute(
+                "DELETE FROM unsettled_orders WHERE order_id = ?", (order.order_id,))
+        return before, after
 
     def replace_reference_alerts(self, episodes: dict[str, StaleAlertState]) -> None:
         """Replace open stale-reference alert episodes, pruning resolved ones."""
@@ -633,10 +733,6 @@ def run(
     if state is not None:
         state.replace_active(live)
 
-    # return_sides: market -> sides that should quote at return_bps this tick.
-    return_sides: dict[str, set[str]] = (
-        {} if state is None else state.load_pending_returns()
-    )
     restart_after_update = False
     # Stall watchdog: alert the operator (once per window) when the loop has not
     # placed a fresh quote set for a while because every tick is skipping
@@ -693,29 +789,29 @@ def run(
                         return 1
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
-            # Phase 1: poll fills on the resting quote set. A fill does not
-            # create an extra order; it marks the opposite side of the next
-            # normal quote set to use return_bps around the latest source mid.
-            if not dry_run and live:
+            # Phase 1: read the fills of every order rotor accounts for: its live
+            # quotes and every placed order not yet settled. Fully filled live
+            # orders stop being tracked, and positions are brought up to date.
+            # A failure skips the tick rather than quote on missing fills.
+            positions: dict[str, Position] = {}
+            if not dry_run:
                 try:
-                    fill_return_sides, filled_by_order_id = _poll_placement_fills(
-                        client,
-                        live,
-                        log,
-                    )
-                    _merge_return_sides(
-                        return_sides,
-                        fill_return_sides,
-                    )
+                    unsettled = [] if state is None else state.load_unsettled()
+                    fills = _read_fills(client, [
+                        *(order.order_id for order in unsettled),
+                        *(order.order_id for placement in live for order in placement.orders),
+                    ])
                     live = _prune_fully_filled_placements(
-                        live,
-                        filled_by_order_id,
-                        log,
-                    )
+                        live, _filled_quantities(fills), log)
                     if state is not None:
                         state.replace_active(live)
-                    if state is not None:
-                        state.replace_pending_returns(return_sides)
+                        positions = _positions_for_quoting(
+                            state,
+                            unsettled,
+                            fills,
+                            server_now=tick_expiration - order_ttl_seconds,
+                            log=log,
+                        )
                 except Exception as exc:
                     log.warning("skip tick: fill polling failed: %s", exc)
                     if once:
@@ -724,13 +820,14 @@ def run(
                     continue
 
             # Phase 2: ask each pair's algo for a fresh quote and flatten it
-            # into per-leg intents. Any return side uses latest source mid.
+            # into per-leg intents. A market with an open position quotes its
+            # return order on that side instead of the normal one.
             tick_refs = TickReferences()
             try:
                 intents = _build_tick_intents(
                     config,
                     runtimes,
-                    return_sides,
+                    positions,
                     expiration=tick_expiration,
                     log=log,
                     refs=tick_refs,
@@ -812,13 +909,12 @@ def run(
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
 
-            # Phase 7: place exactly the fresh quote set. Placement fills only
-            # seed next tick's return sides; they never add extra live orders.
-            placed = _place_groups(client, groups, log)
+            # Phase 7: place exactly the fresh quote set. Every placed order is
+            # recorded for settlement as soon as Sera accepts it.
+            placed = _place_groups(client, groups, log, state=state)
             if placed:
                 live = placed
                 try:
-                    return_sides = _return_sides_from_placement_fills(placed, log)
                     live = _prune_fully_filled_placements(
                         live,
                         _filled_quantities_from_placement_fills(placed),
@@ -826,10 +922,8 @@ def run(
                     )
                 except Exception as exc:
                     log.warning("placement fill tracking failed: %s", exc)
-                    return_sides = {}
                 if state is not None:
                     state.replace_active(live)
-                    state.replace_pending_returns(return_sides)
                 # A fresh quote set went out: reset the stall watchdog.
                 last_quote_ok = time.time()
                 if notifier is not None:
@@ -1006,11 +1100,12 @@ def _intent_spend_amount(intent: OrderIntent) -> Decimal:
 def _build_tick_intents(
     config: VLConfig,
     runtimes: list[PairRuntime],
-    return_sides: dict[str, set[str]],
+    positions: dict[str, Position],
     *,
     expiration: int,
     log: logging.Logger,
     refs: TickReferences | None = None,
+    now: float | None = None,
 ) -> list[OrderIntent]:
     """Build all order intents for one loop tick.
 
@@ -1019,13 +1114,19 @@ def _build_tick_intents(
     misbehaving market cannot sideline quoting on every other healthy market.
     When `refs` is given it records what each pair quoted on or why it skipped.
     """
+    now = time.time() if now is None else now
     out: list[OrderIntent] = []
     for runtime in runtimes:
         try:
             out.extend(
                 _intents_for_runtime(
-                    runtime, return_sides, config.return_bps,
-                    expiration=expiration, log=log, refs=refs,
+                    runtime,
+                    config,
+                    positions.get(runtime.config.market),
+                    expiration=expiration,
+                    log=log,
+                    refs=refs,
+                    now=now,
                 )
             )
         except Exception as exc:
@@ -1037,12 +1138,13 @@ def _build_tick_intents(
 
 def _intents_for_runtime(
     runtime: PairRuntime,
-    return_sides: dict[str, set[str]],
-    return_bps: Decimal,
+    config: VLConfig,
+    position: Position | None,
     *,
     expiration: int,
     log: logging.Logger,
     refs: TickReferences | None = None,
+    now: float,
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
     # Fetch a fresh reference for this pair, priced for the worked base size so
@@ -1052,18 +1154,10 @@ def _intents_for_runtime(
     )
     # Build the fixed-spread quote from the latest source mid.
     quote = dispatch_quote(runtime.algo, runtime.info, ref.rate)
-    sides = return_sides.get(runtime.config.market, set())
-    quote = _quote_with_return_sides(
-        runtime.info,
-        quote,
-        sides,
-        return_bps,
-    )
-    return_text = _return_side_text(sides, return_bps)
     # Debug-only per-pair quote trace for operators and audits.
     log.debug(
         "%s algo=%s benchmark=%s fixed_bps=%s bid=%s ask=%s qty=%s "
-        "src=%s%s%s",
+        "src=%s%s",
         runtime.config.market,
         runtime.algo.name,
         fmt(quote.benchmark_rate),
@@ -1073,11 +1167,13 @@ def _intents_for_runtime(
         fmt(quote.qty_base),
         ref.source,
         f" stale_age={ref.age_s:.0f}s" if ref.stale else "",
-        return_text,
     )
     # Flatten the two-sided quote into concrete order intents.
     intents = _intents_from_quote(
         runtime.config.market, runtime.info, quote, expiration)
+    if position is not None:
+        intents = _with_return_order(
+            intents, runtime, position, config, now=now, log=log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
     return intents
@@ -1120,40 +1216,82 @@ def _intents_from_quote(
     return out
 
 
-def _quote_with_return_sides(
-    info,
-    quote: QuoteSet,
-    sides: set[str],
-    return_bps: Decimal,
-) -> QuoteSet:
-    """Tighten filled-return sides while preserving the algo's other outputs."""
-    active = {side for side in sides if side in {"bid", "ask"}}
-    if not active:
-        return quote
-    tight = SimpleMarketMakingAlgo(
-        SimpleMarketMakingConfig(qty_base=quote.qty_base, fixed_bps=return_bps)
-    ).quote(info, quote.benchmark_rate)
-    return QuoteSet(
-        benchmark_rate=quote.benchmark_rate,
-        bid_price=(
-            tight.bid_price
-            if "bid" in active and quote.bid_price is not None else quote.bid_price
-        ),
-        ask_price=(
-            tight.ask_price
-            if "ask" in active and quote.ask_price is not None else quote.ask_price
-        ),
-        qty_base=quote.qty_base,
-        fixed_bps=quote.fixed_bps,
+def _with_return_order(
+    intents: list[OrderIntent],
+    runtime: PairRuntime,
+    position: Position,
+    config: VLConfig,
+    *,
+    now: float,
+    log: logging.Logger,
+) -> list[OrderIntent]:
+    """Swap the normal order on a position's return side for its return order.
+
+    The return order never spends more than the normal order it replaces, so
+    budgets and the per-tick budget guard see no new spend; a larger position is
+    returned over several fills. A position too small to meet the market minimum
+    keeps the normal order instead, and the next fill on that side absorbs it.
+    """
+    side = position.return_side
+    normal = next((intent for intent in intents if intent.side == side), None)
+    if normal is None:
+        return intents
+    info = runtime.info
+    target = return_price(
+        position,
+        normal.benchmark_rate,
+        fixed_bps=runtime.config.fixed_bps,
+        return_bps=config.return_bps,
+        now=now,
+        window_seconds=float(config.return_window_hours) * 3600.0,
     )
+    # Bids round down and asks round up, so rounding never crosses the fill price.
+    price = _quantize_price(info, target, side)
+    if price <= 0:
+        return intents
+    # A bid spends quote tokens (qty x price); an ask spends base tokens (qty).
+    limit = normal.qty_base if side == "ask" else normal.qty_base * normal.price / price
+    qty = _quantize_qty(info, min(abs(position.net_base), limit))
+    try:
+        _validate_minimums(
+            info,
+            qty,
+            price if side == "bid" else None,
+            price if side == "ask" else None,
+        )
+    except ValueError as exc:
+        log.debug(
+            "%s position %s too small to return alone (%s); quoting normally",
+            runtime.config.market,
+            fmt(position.net_base),
+            exc,
+        )
+        return intents
+    log.debug(
+        "%s return %s qty=%s price=%s position=%s@%s",
+        runtime.config.market,
+        side,
+        fmt(qty),
+        fmt(price),
+        fmt(position.net_base),
+        fmt(position.price),
+    )
+    returning = replace(normal, qty_base=qty, price=price)
+    return [returning if intent is normal else intent for intent in intents]
 
 
 def _place_groups(
     client: SeraClient,
     groups: list[tuple[str, list[OrderIntent], bool]],
     log: logging.Logger,
+    *,
+    state: StateStore | None = None,
 ) -> list[LivePlacement]:
-    """Place grouped intents and return local live-placement records."""
+    """Place grouped intents and return local live-placement records.
+
+    With `state`, each placement's orders are recorded for fill settlement as
+    soon as Sera accepts them, including any a later failure cancels.
+    """
     placed: list[LivePlacement] = []
     try:
         for spent_token, intents, use_vl in groups:
@@ -1173,6 +1311,8 @@ def _place_groups(
                 placement = _placement_from_vl_result(
                     spent_token, result, intents)
                 placed.append(placement)
+                if state is not None:
+                    state.add_unsettled(_unsettled_orders(placement))
                 log.debug(
                     "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
                     result.vl_batch_id,
@@ -1192,23 +1332,23 @@ def _place_groups(
                         intent.price,
                         intent.expiration,
                     )
-                    placed.append(
-                        LivePlacement(
-                            kind="standalone",
-                            spent_token=intent.spent_token,
-                            orders=[_live_from_record(
-                                intent.market,
-                                intent.side,
-                                record,
-                                qty_base=intent.qty_base,
-                            )],
-                            placed_at=time.time(),
-                            # Track the source intent so a fill on this
-                            # standalone order can tighten the opposite side on
-                            # the next cadence quote.
-                            intent_by_order_id={record.order_id: intent},
-                        )
+                    placement = LivePlacement(
+                        kind="standalone",
+                        spent_token=intent.spent_token,
+                        orders=[_live_from_record(
+                            intent.market,
+                            intent.side,
+                            record,
+                            qty_base=intent.qty_base,
+                        )],
+                        placed_at=time.time(),
+                        # Track the source intent so this order's fills can be
+                        # counted at its price once they settle.
+                        intent_by_order_id={record.order_id: intent},
                     )
+                    placed.append(placement)
+                    if state is not None:
+                        state.add_unsettled(_unsettled_orders(placement))
                     # Reason helps operators understand why VL was not used.
                     reason = (
                         "singleton"
@@ -1250,14 +1390,18 @@ def _placement_from_vl_result(
         for a in result.amendments
         if a.order_id and a.actual_amount not in (None, "")
     }
-    # Map returned order ids back to their source intents for fill-side tracking.
+    # Map returned order ids back to their source intents for fill settlement.
+    # When Sera returns a different number of ids than legs, that positional
+    # match is unreliable, so no fills are attributed to the batch at all.
     rows = list(zip(result.records, intents, strict=False))
+    attributable = len(result.records) == len(intents)
     orders: list[LiveOrder] = []
     intent_by_order_id: dict[str, OrderIntent] = {}
     for record, intent in rows:
         if record.order_id in cancelled_ids:
             continue
-        intent_by_order_id[record.order_id] = intent
+        if attributable:
+            intent_by_order_id[record.order_id] = intent
         orders.append(
             LiveOrder(
                 side=intent.side,
@@ -1475,64 +1619,139 @@ def _load_live_placements(
                 vl_batch_id=vl_batch_id,
             )
         )
-    # Reattached placements have no intent_by_order_id, but each LiveOrder keeps
-    # enough market/side metadata to let fills tighten the next cadence quote.
+    # Reattached placements have no intent_by_order_id: they are tracked for
+    # cancellation only. Fills are settled from the unsettled_orders ledger, which
+    # recorded each order when it was placed.
     if out and announce:
         log.debug("reattached %d open placement(s)", len(out))
     return out
 
 
-def _return_sides_from_placement_fills(
-    placements: list[LivePlacement],
-    log: logging.Logger,
-) -> dict[str, set[str]]:
-    """Read immediate placement fills and mark sides to tighten next tick."""
-    out: dict[str, set[str]] = {}
-    for placement in placements:
-        if not placement.fills:
-            continue
-        for fill in placement.fills:
-            order_id = str(fill.get("order_id") or "")
-            order = _find_live_order(placement, order_id)
-            source = (
-                (placement.intent_by_order_id or {}).get(order_id)
-                if order_id else None
-            )
-            _record_return_side(out, order, source, fill, log)
+def _read_fills(client: SeraClient, order_ids: list[str]) -> dict[str, list[dict]]:
+    """Fetch each order's fills once. An order Sera does not know has none."""
+    out: dict[str, list[dict]] = {}
+    for order_id in dict.fromkeys(order_ids):
+        try:
+            out[order_id] = client.get_order_fills(order_id)
+        except errors.SeraError as exc:
+            if exc.status_code != 404:
+                raise
+            out[order_id] = []
     return out
 
 
-def _return_sides_from_polled_fills(
-    client: SeraClient,
-    placements: list[LivePlacement],
-    log: logging.Logger,
-) -> dict[str, set[str]]:
-    """Poll Sera for fills and mark sides to tighten on the next quote set."""
-    return _poll_placement_fills(client, placements, log)[0]
+def _filled_quantities(fills: dict[str, list[dict]]) -> dict[str, Decimal]:
+    """Return each order's filled base quantity across all of its fills."""
+    return {
+        order_id: sum((_filled_base_qty(fill) for fill in rows), Decimal("0"))
+        for order_id, rows in fills.items()
+    }
 
 
-def _poll_placement_fills(
-    client: SeraClient,
-    placements: list[LivePlacement],
+def _unsettled_orders(placement: LivePlacement) -> list[UnsettledOrder]:
+    """Ledger rows for a placement's orders whose intent (price, side) is known."""
+    intents = placement.intent_by_order_id or {}
+    return [
+        UnsettledOrder(
+            order_id=order.order_id,
+            market=intents[order.order_id].market,
+            side=intents[order.order_id].side,
+            price=intents[order.order_id].price,
+            expiration=intents[order.order_id].expiration,
+            placed_at=order.placed_at,
+        )
+        for order in placement.orders
+        if order.order_id in intents
+    ]
+
+
+def _positions_for_quoting(
+    state: StateStore,
+    unsettled: list[UnsettledOrder],
+    fills: dict[str, list[dict]],
+    *,
+    server_now: float,
     log: logging.Logger,
-) -> tuple[dict[str, set[str]], dict[str, Decimal]]:
-    """Poll fills and return both return-side signals and filled quantities."""
-    out: dict[str, set[str]] = {}
-    filled_by_order_id: dict[str, Decimal] = {}
-    for placement in placements:
-        for order in placement.orders:
-            source = (placement.intent_by_order_id or {}).get(order.order_id)
-            # Poll fills for each tracked source order.
-            fills = client.get_order_fills(order.order_id)
-            for fill in fills:
-                qty_base = _filled_base_qty(fill)
-                if qty_base > 0:
-                    filled_by_order_id[order.order_id] = (
-                        filled_by_order_id.get(order.order_id, Decimal("0"))
-                        + qty_base
-                    )
-                _record_return_side(out, order, source, fill, log)
-    return out, filled_by_order_id
+) -> dict[str, Position]:
+    """Settle every final order into the stored positions, then add fills in flight.
+
+    An order is final once its signed expiration (plus a short grace) has passed
+    in Sera server time and none of its fills is still settling: nothing about it
+    can change, so its settled quantity goes into the stored position and the
+    order leaves the ledger in one transaction. That holds however the order left
+    the book (cancelled, filled, expired, or orphaned by a restart), so no fill is
+    missed or counted twice. Visible fills on every other order are added on top
+    for quoting only, so a fill holds its return side from the first tick it shows.
+    """
+    in_flight: list[tuple[UnsettledOrder, Decimal]] = []
+    for order in unsettled:
+        rows = fills.get(order.order_id, [])
+        settled = _settled_fill_qty(rows)
+        if settled is None or server_now < order.expiration + SETTLE_GRACE_SECONDS:
+            in_flight.append((order, _visible_fill_qty(rows)))
+            continue
+        before, after = state.settle_order(order, settled)
+        if settled > 0:
+            log.info(
+                "%s %s filled %s @ %s; position %s -> %s",
+                order.market,
+                order.side,
+                fmt(settled),
+                fmt(order.price),
+                _position_text(before),
+                _position_text(after),
+            )
+    positions = state.load_positions()
+    for order, qty in in_flight:
+        if qty <= 0:
+            continue
+        moved = apply_fill(
+            positions.get(order.market), order.side, qty, order.price, order.placed_at)
+        if moved is None:
+            positions.pop(order.market, None)
+        else:
+            positions[order.market] = moved
+    return positions
+
+
+def _settled_fill_qty(fills: list[dict]) -> Decimal | None:
+    """Return an order's settled base quantity, or None while a fill is unsettled.
+
+    Failed and reverted fills moved no tokens and count as zero. A fill with no
+    `settlement_status` counts as settled; any other status means wait.
+    """
+    total = Decimal("0")
+    for fill in fills:
+        status = _settlement_status(fill)
+        if status == "settled":
+            total += _filled_base_qty(fill)
+        elif status not in ("failed", "reverted"):
+            return None
+    return total
+
+
+def _visible_fill_qty(fills: list[dict]) -> Decimal:
+    """Return the base quantity of every fill that has not failed or reverted."""
+    return sum(
+        (
+            _filled_base_qty(fill)
+            for fill in fills
+            if _settlement_status(fill) not in ("failed", "reverted")
+        ),
+        Decimal("0"),
+    )
+
+
+def _settlement_status(fill: dict) -> str:
+    """Return a fill's settlement status, treating a missing one as settled."""
+    return str(fill.get("settlement_status") or "settled").lower()
+
+
+def _position_text(position: Position | None) -> str:
+    """Format a position for logs: flat, or signed base size @ breakeven."""
+    if position is None:
+        return "flat"
+    return f"{fmt(position.net_base)} @ {fmt(position.price)}"
 
 
 def _filled_quantities_from_placement_fills(
@@ -1579,52 +1798,6 @@ def _prune_fully_filled_placements(
             placement.orders = leftover
             remaining.append(placement)
     return remaining
-
-
-def _record_return_side(
-    out: dict[str, set[str]],
-    order: LiveOrder | None,
-    source: OrderIntent | None,
-    fill: dict,
-    log: logging.Logger,
-) -> None:
-    """Turn one positive fill into a market/side return signal."""
-    qty_base = _filled_base_qty(fill)
-    if qty_base <= 0:
-        return
-    order_id = str(fill.get("order_id") or (order.order_id if order else ""))
-    market = source.market if source is not None else (order.market if order else "")
-    side = source.side if source is not None else (order.side if order else "")
-    if not market or side not in {"bid", "ask"}:
-        log.warning("cannot mark return side: unknown filled order_id=%s", order_id)
-        return
-    return_side = "ask" if side == "bid" else "bid"
-    out.setdefault(market, set()).add(return_side)
-    log.debug(
-        "fill marked return side order=%s market=%s filled_side=%s return_side=%s qty=%s",
-        order_id,
-        market,
-        side,
-        return_side,
-        fmt(qty_base),
-    )
-
-
-def _find_live_order(placement: LivePlacement, order_id: str) -> LiveOrder | None:
-    """Find a live order by id inside one placement."""
-    for order in placement.orders:
-        if order.order_id == order_id:
-            return order
-    return None
-
-
-def _merge_return_sides(
-    target: dict[str, set[str]],
-    source: dict[str, set[str]],
-) -> None:
-    """Merge newly found fill signals into the pending quote-side map."""
-    for market, sides in source.items():
-        target.setdefault(market, set()).update(sides)
 
 
 def _filled_base_qty(fill: dict) -> Decimal:
@@ -1693,11 +1866,3 @@ def _live_from_record(
         market=market,
         qty_base=qty_base,
     )
-
-
-def _return_side_text(sides: set[str], return_bps: Decimal) -> str:
-    """Format optional return-side state for quote logs."""
-    active = sorted(side for side in sides if side in {"bid", "ask"})
-    if not active:
-        return ""
-    return f" return_sides={','.join(active)} return_bps={fmt(return_bps)}"

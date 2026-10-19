@@ -16,7 +16,6 @@ import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from rotor.algo import SimpleMarketMakingAlgo, SimpleMarketMakingConfig
 from rotor.config import get_config
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import OrderRecord, SeraClient, VLBatchResult
@@ -269,21 +268,6 @@ def _write_config(
     )
 
 
-def _expected_return_price(
-    client: SeraClient,
-    *,
-    market: str,
-    side: str,
-    qty_base: Decimal,
-    mid: Decimal,
-    return_bps: Decimal,
-) -> Decimal:
-    quote = SimpleMarketMakingAlgo(
-        SimpleMarketMakingConfig(qty_base=qty_base, fixed_bps=return_bps)
-    ).quote(client.markets_by_symbol[market], mid)
-    return quote.bid_price if side == "bid" else quote.ask_price
-
-
 def _first_order(
     maker: _RecordingClient,
     *,
@@ -366,6 +350,9 @@ def _install_runner_hooks(
 ) -> None:
     source = _StaticRateSource(mid)
     calls = 0
+    # Tick 1 quotes and is filled; the filled order expires and its fill settles
+    # into a position by tick 2 or 3, which then quotes the return order.
+    ticks = 3
 
     def build_client(*, dry_run: bool, log):
         assert not dry_run
@@ -376,6 +363,7 @@ def _install_runner_hooks(
         calls += 1
         if calls == 1:
             fill_after_first_tick()
+        if calls < ticks:
             if wait_between_ticks > 0:
                 time.sleep(wait_between_ticks)
             return
@@ -511,21 +499,29 @@ def test_testnet_vl_runner_fill_then_return_requote(
             except Exception:  # pragma: no cover - filled taker orders may not cancel.
                 pass
 
+    # The fill settled into a position at the maker order's price.
+    maker_order = _first_order(maker, market=target_market, side=maker_side)
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        position = store.load_positions().get(target_market)
+    finally:
+        store.close()
+    assert position is not None, "the maker fill did not settle into a position"
+    assert position.net_base == (qty_base if maker_side == "bid" else -qty_base)
+    assert position.price == maker_order.price
+
+    # A later tick quoted it back without crossing the fill price.
     return_side = _opposite_side(maker_side)
-    expected_price = _expected_return_price(
-        maker.inner,
-        market=target_market,
-        side=return_side,
-        qty_base=qty_base,
-        mid=mid,
-        return_bps=return_bps,
-    )
     return_orders = [
         order for order in maker.placed_orders
         if (
             order.market == target_market
             and order.side == return_side
-            and order.price == expected_price
+            and order.order_id != maker_order.order_id
+            and (
+                order.price <= maker_order.price if return_side == "bid"
+                else order.price >= maker_order.price
+            )
         )
     ]
 

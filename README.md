@@ -5,8 +5,10 @@ Small Sera Virtual Liquidity market maker.
 Rotor runs one autonomous command: `rotor mm vl`. On each cadence tick it fetches
 the latest source mid for each configured market, builds fixed-bps bid/ask quotes,
 cancels the previous tracked quote set when safe, and places the fresh set through
-Sera VL where possible. Filled sides tighten the opposite side to `return_bps`
-on the next tick.
+Sera VL where possible. Inventory a fill moves becomes a position that rotor quotes
+back on the opposite side: the return order walks from the normal quote to the
+fill price over 48 hours (a reverse Dutch auction), then holds at the fill price
+until it fills. See [docs/vl-mm.md](docs/vl-mm.md#returning-fills).
 
 ## Install
 
@@ -73,10 +75,11 @@ poetry run rotor mm vl --config rotor/vl.config.toml --poll 305
 Live mode always cancels reattached configured orders on boot. If Sera's cancel
 cooldown is active, Rotor waits 5 minutes and retries before quoting.
 
-Rotor keeps a tiny unresolved-state database at `.rotor_state.sqlite` by
-default. It stores only active orders, pending return-side signals, and open
-stale-reference alerts, then prunes rows once they resolve. Set
-`ROTOR_STATE_PATH` to move it.
+Rotor keeps a small state database at `.rotor_state.sqlite` by default. It
+stores active orders, placed orders whose fills are not yet counted, open
+positions, and open stale-reference alerts, and prunes rows once they resolve.
+Positions are the part that must survive: deleting the file forgets them, and
+rotor goes back to quoting both sides normally. Set `ROTOR_STATE_PATH` to move it.
 
 Add `--telegram` to send lifecycle/error alerts through the optional Telegram
 notifier. Install the extra with `poetry install --extras telegram` when real
