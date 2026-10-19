@@ -20,7 +20,7 @@ token = "USDC"
 amount = "5000"
 
 fixed_bps = "50"
-return_bps = "1"
+return_bps = "2"
 
 [[pair]]
 market = "XSGD/USDC"

@@ -48,6 +48,13 @@ def test_parse_vl_config_rejects_duplicate_or_inverse_markets():
         ]))
 
 
+def test_parse_vl_config_defaults_return_bps_to_two():
+    raw = _config()
+    del raw["return_bps"]
+
+    assert parse_vl_config(raw).return_bps == Decimal("2")
+
+
 def test_parse_vl_config_rejects_non_positive_return_bps():
     with pytest.raises(ValueError, match="return_bps must be > 0"):
         parse_vl_config(_config(return_bps="0"))

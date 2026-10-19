@@ -79,7 +79,7 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
     """Validate a parsed VL config dict."""
     # Global strategy defaults apply to each pair unless the pair overrides.
     fixed_bps = _decimal(raw, "fixed_bps", Decimal("8"))
-    return_bps = _decimal(raw, "return_bps", Decimal("1"))
+    return_bps = _decimal(raw, "return_bps", Decimal("2"))
     if return_bps <= 0:
         raise ValueError(f"{source}: return_bps must be > 0")
 
