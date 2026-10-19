@@ -36,7 +36,11 @@ fixed_bps = "40"
 
 Rules:
 
-- At least one `[[budget]]` is required.
+- At least one `[[budget]]` is required. A budget caps what one token's orders
+  can spend, counted the way Sera locks it: a VL batch counts as its largest leg,
+  because its legs share one budget and only one can fill at a time; each
+  standalone order counts in full. So every pair in a VL batch can be sized to
+  the whole budget.
 - Markets cannot be duplicated, including inverse duplicates.
 - `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `wise` needs
   `WISE_API_TOKEN` and `fed` (the official FRED API) needs a free `FRED_API_KEY`;

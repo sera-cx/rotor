@@ -300,6 +300,34 @@ def test_run_requotes_four_orders_and_tightens_return_side_after_fill(monkeypatc
     ]
 
 
+def test_run_places_a_vl_batch_whose_legs_each_use_the_whole_budget(monkeypatch):
+    # The Earn setup sizes every pair to the whole stablecoin budget and relies
+    # on VL sharing it: the XSGD bid spends 9.95 USDC and the EURC bid 19.90,
+    # together more than the 20 USDC budget, but Sera locks only the largest.
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    config = VLConfig(
+        budgets=[BudgetConfig("USDC", Decimal("20"))],
+        pairs=[_pair("XSGD/USDC"), _pair("EURC/USDC")],
+        fixed_bps=Decimal("50"),
+        return_bps=Decimal("2"),
+    )
+    _wire_runner(monkeypatch, config=config, client=client, source=source)
+    _stop_after_sleeps(monkeypatch, 1)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    assert [
+        (leg["market"], leg["side"]) for leg in client.batch_places[0]["legs"]
+    ] == [("XSGD/USDC", "bid"), ("EURC/USDC", "bid")]
+
+
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):
     client = _FakeClient()
     source = _SequencedSource(

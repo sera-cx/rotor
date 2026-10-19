@@ -112,7 +112,7 @@ def test_validate_budget_caps_rejects_oversized_budgeted_intent():
 
     with pytest.raises(ValueError, match="above configured budget"):
         _validate_budget_caps([
-            _intent("XSGD/USDC", "bid", "USDC", price="1.10", qty="100")
+            ("USDC", [_intent("XSGD/USDC", "bid", "USDC", price="1.10", qty="100")], False)
         ], cfg)
 
 
