@@ -124,8 +124,10 @@ VL behavior:
 - Intents are grouped by spent token.
 - VL is used only for budgeted groups meeting Sera's batch minimum.
 - Singleton or unbudgeted groups use standalone placement.
-- Local budget checks reject when the aggregate spend of all intents sharing a
-  token exceeds that token's configured budget.
+- Local budget checks count spend the way Sera locks it: a VL batch counts as
+  its largest leg (siblings share one budget and only one can fill at a time),
+  each standalone order counts in full, and batches and standalone orders on one
+  token add up. A tick is rejected when that exceeds the token's budget.
 - Oversized same-spent-token groups are split into chunks of at most Sera's batch
   maximum, so one large group cannot fail every tick.
 - Sera remains the authoritative shared-budget enforcer.

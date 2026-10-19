@@ -69,14 +69,15 @@ def _market() -> MarketInfo:
 
 
 def test_validate_budget_caps_allows_exact_bid_cap():
-    vr._validate_budget_caps([_intent(price="1", qty="100")], _config(budget="100"))
+    vr._validate_budget_caps(
+        [("USDC", [_intent(price="1", qty="100")], False)], _config(budget="100"))
 
 
 def test_validate_budget_caps_rejects_ask_quantity_above_cap():
     intent = _intent(side="ask", spent="USDC", price="1", qty="100.01")
 
     try:
-        vr._validate_budget_caps([intent], _config(budget="100"))
+        vr._validate_budget_caps([("USDC", [intent], False)], _config(budget="100"))
     except ValueError as exc:
         assert "above configured budget" in str(exc)
     else:  # pragma: no cover - defensive assertion branch.
@@ -459,14 +460,38 @@ def test_group_intents_splits_oversized_same_token_group():
     ]
 
 
-def test_validate_budget_caps_rejects_aggregate_over_budget():
-    intents = [
+def test_validate_budget_caps_adds_up_standalone_orders_on_one_token():
+    group = ("USDC", [
         _intent(price="1", qty="60"),
         _intent(market="EURC/USDC", price="1", qty="60"),
-    ]
+    ], False)
 
-    with pytest.raises(ValueError, match="aggregate"):
-        vr._validate_budget_caps(intents, _config(budget="100"))
+    with pytest.raises(ValueError, match="could spend 120, above configured budget 100"):
+        vr._validate_budget_caps([group], _config(budget="100"))
+
+
+def test_validate_budget_caps_counts_a_vl_batch_as_its_largest_leg():
+    # Sera freezes only the largest leg of a VL batch: its legs share one budget
+    # and only one can fill at a time. Eight legs that each use the whole budget
+    # fit, as the Earn setup sizes them.
+    markets = ["XSGD", "EURC", "JPYC", "TGBP", "AXCNH", "AUDD", "CADC", "VCHF"]
+    whole_budget = [_intent(market=f"{base}/USDC", price="1", qty="100") for base in markets]
+    vr._validate_budget_caps([("USDC", whole_budget, True)], _config(budget="100"))
+
+    one_leg_over = [_intent(price="1", qty="60"), _intent(market="EURC/USDC", price="1", qty="101")]
+    with pytest.raises(ValueError, match="could spend 101"):
+        vr._validate_budget_caps([("USDC", one_leg_over, True)], _config(budget="100"))
+
+
+def test_validate_budget_caps_adds_up_separate_batches_and_standalone_orders():
+    # Each batch locks its own largest leg, and a standalone order locks in full.
+    batch_a = ("USDC", [_intent(price="1", qty="40"), _intent(market="EURC/USDC", price="1", qty="30")], True)
+    batch_b = ("USDC", [_intent(market="JPYC/USDC", price="1", qty="40"), _intent(market="AUDD/USDC", price="1", qty="20")], True)
+    solo = ("USDC", [_intent(market="CADC/USDC", price="1", qty="21")], False)
+
+    vr._validate_budget_caps([batch_a, batch_b], _config(budget="100"))
+    with pytest.raises(ValueError, match="could spend 101"):
+        vr._validate_budget_caps([batch_a, batch_b, solo], _config(budget="100"))
 
 
 def test_state_store_single_instance_lock(tmp_path):

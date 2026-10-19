@@ -854,23 +854,23 @@ def run(
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
-            # Phase 3: reject the whole tick if any single leg would spend more
-            # than its configured per-token budget (a local sanity guard; Sera's
-            # shared vl_group budget is the authoritative cap).
+            # Phase 3: group legs by spent token; a group goes through VL only
+            # when its token is budgeted and it has >= vl_batch_min legs,
+            # otherwise each leg is placed standalone.
+            groups = group_intents(
+                intents, config.budget_tokens, client.vl_batch_min, client.vl_batch_max)
+
+            # Phase 4: reject the whole tick if any budgeted token could spend
+            # more than its configured budget, counted the way Sera locks it (a
+            # local guard; Sera's shared vl_group budget is the authoritative cap).
             try:
-                _validate_budget_caps(intents, config)
+                _validate_budget_caps(groups, config)
             except Exception as exc:
                 log.warning("skip tick: %s", exc)
                 if once:
                     return 1
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
-
-            # Phase 4: group legs by spent token; a group goes through VL only
-            # when its token is budgeted and it has >= vl_batch_min legs,
-            # otherwise each leg is placed standalone.
-            groups = group_intents(
-                intents, config.budget_tokens, client.vl_batch_min, client.vl_batch_max)
             _log_groups(groups, log, dry_run=dry_run)
 
             if dry_run:
@@ -1064,26 +1064,34 @@ def _validate_budget_reachability(config: VLConfig, runtimes: list[PairRuntime])
         )
 
 
-def _validate_budget_caps(intents: list[OrderIntent], config: VLConfig) -> None:
-    """Reject when the aggregate spend of a token's intents exceeds its budget."""
+def _validate_budget_caps(
+    groups: list[tuple[str, list[OrderIntent], bool]],
+    config: VLConfig,
+) -> None:
+    """Reject when a budgeted token's placements could spend more than its budget.
+
+    Spend is counted the way Sera locks it. A VL batch's legs share one budget
+    and only one can fill at a time, so Sera freezes just its largest leg; the
+    batch counts as that leg. Each standalone order counts in full, and several
+    batches or standalone orders on one token add up.
+    """
     # Convert list config into quick lookup by token symbol.
     budgets = {budget.token: budget.amount for budget in config.budgets}
-    # Sum spend per token: several markets can share one spent token, so a
-    # per-intent check would let their combined spend exceed the local budget.
     spend_by_token: dict[str, Decimal] = {}
-    for intent in intents:
-        if intent.spent_token not in budgets:
+    for spent_token, intents, use_vl in groups:
+        if spent_token not in budgets:
             # Unbudgeted tokens may still place standalone orders.
             continue
-        spend_by_token[intent.spent_token] = (
-            spend_by_token.get(intent.spent_token, Decimal("0"))
-            + _intent_spend_amount(intent)
+        spends = [_intent_spend_amount(intent) for intent in intents]
+        group_spend = max(spends) if use_vl else sum(spends, Decimal("0"))
+        spend_by_token[spent_token] = (
+            spend_by_token.get(spent_token, Decimal("0")) + group_spend
         )
     for token, spend in spend_by_token.items():
         budget = budgets[token]
         if spend > budget:
             raise ValueError(
-                f"{token} intents spend {fmt(spend)} in aggregate, "
+                f"{token} orders could spend {fmt(spend)}, "
                 f"above configured budget {fmt(budget)}"
             )
 
