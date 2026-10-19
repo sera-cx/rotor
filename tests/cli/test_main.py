@@ -42,6 +42,7 @@ def test_vl_dry_run_passes_args_to_runner(monkeypatch):
     assert captured["auto_update"] is False
     assert captured["update_interval_seconds"] == 86400.0
     assert captured["log_level"] == "WARNING"
+    assert captured["halt_on_stale_reference"] is False
 
 
 def test_vl_auto_update_flags_pass_to_runner(monkeypatch):
@@ -69,6 +70,22 @@ def test_vl_auto_update_flags_pass_to_runner(monkeypatch):
     assert captured["auto_update"] is True
     assert captured["update_interval_seconds"] == 60.0
     assert captured["telegram"] is True
+
+
+
+def test_vl_halt_on_stale_reference_flag_passes_to_runner(monkeypatch):
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(vl_runner, "run", fake_run)
+
+    assert cli.main([
+        "mm", "vl", "--config", "vl.toml", "--dry-run", "--once", "--halt-on-stale-reference",
+    ]) == 0
+    assert captured["halt_on_stale_reference"] is True
 
 
 def test_live_vl_requires_wallet_unlock(monkeypatch, capsys):

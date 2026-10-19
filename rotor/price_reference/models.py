@@ -34,9 +34,14 @@ class ReferencePrice:
 
     # ISO pair used by the market maker.
     pair: str
-    # Fresh quote-per-base mid rate.
+    # Quote-per-base mid rate: fresh, or carried forward when `stale`.
     rate: Decimal
     # POSIX timestamp copied from the accepted observation.
     ts: float
     # Source name copied through for logs/audits.
     source: str
+    # Seconds between the source's published timestamp and when it was read.
+    age_s: float = 0.0
+    # True when the rate is past its source's freshness window but still inside
+    # the carry limit, e.g. a daily source that does not publish on weekends.
+    stale: bool = False

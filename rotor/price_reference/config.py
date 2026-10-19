@@ -19,7 +19,8 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
     Each source applies its own default staleness window (intraday for Wise,
     daily for the official references). An operator can override any source's
     window with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`) or the global
-    `PRICE_REFERENCE_MAX_AGE_S`.
+    `PRICE_REFERENCE_MAX_AGE_S`. How long a stale daily rate is still quoted on
+    comes from `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`.
     """
     # CLI-provided names override config; default to Wise for fresher live-ish
     # FX data when no explicit source is configured.
@@ -35,6 +36,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
             pay_out=get_config("WISE_PAY_OUT", None),
             default_amount=get_config("WISE_DEFAULT_AMOUNT", None),
             max_age_s=_max_age_override("WISE"),
+            max_carry_age_s=_max_carry_age_override("WISE"),
         )
     if source_name == "ecb":
         # ECB is configured by a single XML feed URL.
@@ -46,6 +48,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
                 )
             ),
             max_age_s=_max_age_override("ECB"),
+            max_carry_age_s=_max_carry_age_override("ECB"),
         )
     if source_name in {"fed", "h10", "fed_h10"}:
         return FedH10RateSource(
@@ -61,6 +64,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
                 or FedH10RateSource.DEFAULT_SERIES
             ),
             max_age_s=_max_age_override("FED"),
+            max_carry_age_s=_max_carry_age_override("FED"),
         )
     if source_name == "bnm":
         return BnmRateSource(
@@ -71,6 +75,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
                 )
             ),
             max_age_s=_max_age_override("BNM"),
+            max_carry_age_s=_max_carry_age_override("BNM"),
         )
     if source_name == "mas":
         return MasRateSource(
@@ -85,6 +90,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
                 or MasRateSource.DEFAULT_RESOURCE_IDS
             ),
             max_age_s=_max_age_override("MAS"),
+            max_carry_age_s=_max_carry_age_override("MAS"),
         )
     # Keep accepted source names closed so misspellings fail loudly.
     raise ValueError("PRICE_REFERENCE_SOURCE must be one of: wise, ecb, fed, bnm, mas")
@@ -93,7 +99,18 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
 def _max_age_override(prefix: str) -> float | None:
     """Return a per-source (then global) staleness override in seconds, if set."""
     # A source-specific window wins over the global one; both are optional.
-    for key in (f"{prefix}_MAX_AGE_S", "PRICE_REFERENCE_MAX_AGE_S"):
+    return _seconds_override(f"{prefix}_MAX_AGE_S", "PRICE_REFERENCE_MAX_AGE_S")
+
+
+def _max_carry_age_override(prefix: str) -> float | None:
+    """Return a per-source (then global) stale carry-forward limit, if set."""
+    # Same precedence as the freshness window: the source-specific key wins.
+    return _seconds_override(f"{prefix}_MAX_CARRY_AGE_S", "PRICE_REFERENCE_MAX_CARRY_AGE_S")
+
+
+def _seconds_override(*keys: str) -> float | None:
+    """Return the first configured positive number of seconds among `keys`."""
+    for key in keys:
         raw = get_config(key, None)
         if raw is None or str(raw).strip() == "":
             continue

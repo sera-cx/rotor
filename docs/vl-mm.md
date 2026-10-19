@@ -54,15 +54,27 @@ cross-rate details.
 
 ## Price Freshness
 
-Each source observation is stamped with the provider's published timestamp, and
-stale mids are rejected before quoting. Per-source default windows are 10 minutes
-for `wise` (intraday) and 48 hours for the daily references (`ecb`, `fed`, `bnm`,
-`mas`). Override a single source with `<SOURCE>_MAX_AGE_S`, all of them with
+Each source observation is stamped with the provider's published timestamp and
+checked against a per-source freshness window: 10 minutes for `wise` (intraday)
+and 48 hours for the daily references (`ecb`, `fed`, `bnm`, `mas`). Override a
+single source with `<SOURCE>_MAX_AGE_S`, all of them with
 `PRICE_REFERENCE_MAX_AGE_S`, or everything at runtime with `--max-reference-age`.
 
-Pairs are isolated within a tick: if one pair's reference is stale/unavailable or
-its quote fails market minimums, only that pair is skipped — the other configured
-pairs still quote. A tick is fully skipped only when no pair produces a quote.
+Daily references publish nothing on weekends or public holidays, so a stale daily
+rate is carried forward: the pair keeps quoting on the last published rate until
+that rate is 7 days old (`<SOURCE>_MAX_CARRY_AGE_S` or
+`PRICE_REFERENCE_MAX_CARRY_AGE_S` to change). With `--telegram`, Rotor warns once
+on the important channel when pairs start quoting on carried rates, repeats the
+warning on the normal channel every 6 hours, and reports when fresh rates return
+or when a rate passes its limit and the pair stops quoting. These alert episodes
+are kept in the state database, so `--once` runs do not repeat them. A stale
+`wise` quote is never carried. Pass `--halt-on-stale-reference` to skip every
+stale pair instead.
+
+Pairs are isolated within a tick: if one pair's reference is unavailable or past
+its carry limit, or its quote fails market minimums, only that pair is skipped —
+the other configured pairs still quote. A tick is fully skipped only when no pair
+produces a quote.
 
 ## Dry Run
 

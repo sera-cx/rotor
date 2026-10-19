@@ -1,7 +1,11 @@
 """External FX reference feeds for Rotor market-making runners."""
 
 # Re-export the reference-price public API from one package-level import path.
-from rotor.price_reference.aggregator import ReferencePriceOracle, ReferenceUnavailable
+from rotor.price_reference.aggregator import (
+    ReferencePriceOracle,
+    ReferenceTooStale,
+    ReferenceUnavailable,
+)
 from rotor.price_reference.config import load_price_reference_source, load_token_to_iso
 from rotor.price_reference.models import PriceObservation, ReferencePrice
 from rotor.price_reference.sources import (
@@ -20,6 +24,7 @@ __all__ = [
     "RateSource",
     "ReferencePrice",
     "ReferencePriceOracle",
+    "ReferenceTooStale",
     "ReferenceUnavailable",
     "EcbRateSource",
     "FedH10RateSource",

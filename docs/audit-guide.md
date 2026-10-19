@@ -48,8 +48,14 @@ Pricing:
 - Observation timestamps are the provider's published date, not fetch time, so a
   stale daily feed is detectable. Staleness windows are per-source (intraday for
   `wise`, daily for `ecb`/`fed`/`bnm`/`mas`), overridable via config/CLI.
-- A stale/failing/sub-minimum pair is skipped in isolation; the other pairs still
-  quote. A tick is fully skipped only when no pair produces a quote.
+- A stale daily reference is carried forward until its carry limit (default 7
+  days from the published date), because official sources do not publish on
+  weekends or holidays. The oracle marks that price `stale`, the runner alerts
+  on it, and a `wise` quote is never carried. `--halt-on-stale-reference`
+  disables carrying.
+- A failing, past-carry-limit, or sub-minimum pair is skipped in isolation; the
+  other pairs still quote. A tick is fully skipped only when no pair produces a
+  quote.
 - Return-side quotes use `return_bps` from the latest source mid.
 
 Live order lifecycle:
@@ -178,7 +184,9 @@ Stop and investigate if you find:
 - A path that places or cancels in dry-run mode.
 - A partial placement path that leaves already placed orders unmanaged.
 - A cancel failure path that drops local order tracking.
-- A stale source quote that still places orders.
+- A stale source quote that still places orders outside the carry rules: a stale
+  `wise` quote, a daily rate past its carry limit, or any stale rate under
+  `--halt-on-stale-reference`.
 - Destructive Git commands in the updater.
 - Telegram or logging output that includes secrets or signatures.
 - Default logs that emit per-tick chatter or grow local log files.

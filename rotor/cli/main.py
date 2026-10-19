@@ -24,6 +24,7 @@ def cmd_mm_vl(args) -> int:
         order_ttl_seconds=args.order_ttl,
         min_requote_seconds=args.min_requote_seconds,
         max_reference_age_s=args.max_reference_age,
+        halt_on_stale_reference=args.halt_on_stale_reference,
         dry_run=args.dry_run,
         once=args.once,
         cancel_on_exit=args.cancel_on_exit,
@@ -88,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="override per-source max reference age in seconds "
                               "(default: each source's own window — wise ~10m, "
                               "daily FX sources ~48h)")
+    p_mm_vl.add_argument("--halt-on-stale-reference", action="store_true",
+                         help="skip a pair once its reference is past the freshness window "
+                              "(default: keep quoting daily FX sources on their last "
+                              "published rate for up to 7 days, with a warning)")
     p_mm_vl.add_argument("--dry-run", action="store_true",
                          help="print intended VL groups; do not sign or place orders")
     p_mm_vl.add_argument("--once", action="store_true",

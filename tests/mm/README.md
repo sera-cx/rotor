@@ -14,5 +14,6 @@ Files:
   placement tracking.
 - `test_vl_runner_loop.py`: multi-tick run-loop behavior — quote replacement,
   fill-driven return sides, per-pair isolation, and auto-update restart.
+  Also covers quoting on carried-forward weekend rates and their alerts.
 - `test_vl_runner_edges.py`: additional mock-backed VL edge cases (amendments,
   cancelled/gone legs, oversized-group splitting, single-instance lock).

@@ -4,7 +4,7 @@ This folder tests source adapters and freshness checks for benchmark prices.
 
 Files:
 
-- `test_aggregator.py`: `ReferencePriceOracle` freshness handling.
+- `test_aggregator.py`: `ReferencePriceOracle` freshness and stale carry-forward handling.
 - `test_edge_cases.py`: source/config edge cases for malformed data and override
   handling.
 - `test_sources.py`: token-to-ISO mapping plus Wise, ECB, Fed (FRED API), BNM,

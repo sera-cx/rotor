@@ -74,14 +74,23 @@ Live mode always cancels reattached configured orders on boot. If Sera's cancel
 cooldown is active, Rotor waits 5 minutes and retries before quoting.
 
 Rotor keeps a tiny unresolved-state database at `.rotor_state.sqlite` by
-default. It stores only active orders and pending return-side signals, then
-prunes rows after cancellation or return-side use. Set `ROTOR_STATE_PATH` to
-move it.
+default. It stores only active orders, pending return-side signals, and open
+stale-reference alerts, then prunes rows once they resolve. Set
+`ROTOR_STATE_PATH` to move it.
 
 Add `--telegram` to send lifecycle/error alerts through the optional Telegram
 notifier. Install the extra with `poetry install --extras telegram` when real
 Telegram sends are needed; without the extra or token, sends degrade to dry-run
 logs.
+
+Daily FX sources (`ecb`, `fed`, `bnm`, `mas`) publish nothing on weekends or
+public holidays. Instead of going dark until they publish again, Rotor keeps
+quoting on a source's last published rate for up to 7 days past that rate's
+date. With `--telegram` it warns when pairs start quoting on carried rates,
+repeats the warning quietly every 6 hours, and reports when fresh rates return
+or a rate passes its limit and the pair stops. `wise` never carries a stale
+quote. Pass `--halt-on-stale-reference` to skip stale pairs instead, or change a
+source's limit with `<SOURCE>_MAX_CARRY_AGE_S`.
 
 For autonomous source checkouts, add `--auto-update`. Rotor checks once per day,
 runs `git pull --ff-only` only on a clean worktree, stops the current loop after

@@ -20,6 +20,15 @@ from rotor.price_reference.models import PriceObservation
 INTRADAY_MAX_AGE_S = 600.0          # 10 minutes
 DAILY_MAX_AGE_S = 48 * 60 * 60.0    # 48 hours
 
+# How long a daily reference may still be quoted on once it is past its
+# freshness window. Official daily sources publish nothing on weekends or public
+# holidays, so instead of a pair going dark until they publish again, the runner
+# keeps quoting on the last published rate (with a Telegram warning) until it is
+# this old. A week covers a weekend plus a run of holidays, while a feed that has
+# really died still stops being quoted. Intraday sources declare no carry: a
+# stale Wise quote means the feed is broken, not closed.
+DAILY_MAX_CARRY_AGE_S = 7 * 24 * 60 * 60.0  # 7 days
+
 # Default HTTP read/connect timeout for source fetches. Generous enough for slow
 # public endpoints (e.g. FRED's CSV graph) while staying well under the poll
 # cadence so a stuck request only costs one tick.
@@ -33,6 +42,9 @@ class RateSource(Protocol):
     name: str
     # Default freshness window (seconds) the oracle applies for this provider.
     default_max_age_s: float
+    # How long a stale observation may still be quoted on, or None to never carry
+    # one forward. Optional: the oracle treats a missing value as None.
+    default_max_carry_age_s: float | None
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
@@ -59,6 +71,8 @@ class WiseRateSource:
     name = "wise"
     # Wise returns near-real-time quotes with their own observation timestamp.
     DEFAULT_MAX_AGE_S = INTRADAY_MAX_AGE_S
+    # A stale Wise quote means the feed is broken, not closed: never carry it.
+    DEFAULT_MAX_CARRY_AGE_S = None
     # Fallback source amount when a caller does not pass one (e.g. ad-hoc checks).
     DEFAULT_AMOUNT = Decimal("1000")
 
@@ -72,6 +86,7 @@ class WiseRateSource:
         default_amount: object | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
+        max_carry_age_s: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         """Configure the Wise quotes client and credential lookup."""
@@ -92,6 +107,11 @@ class WiseRateSource:
         # Per-source freshness window; defaults to the class intraday window.
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
+        )
+        self.default_max_carry_age_s = (
+            self.DEFAULT_MAX_CARRY_AGE_S
+            if max_carry_age_s is None
+            else float(max_carry_age_s)
         )
         # Allow tests to inject a fake client; otherwise create a bounded client.
         self._http = http or httpx.Client(timeout=timeout)
@@ -160,6 +180,7 @@ class EcbRateSource:
     name = "ecb"
     # ECB publishes once per TARGET business day; tolerate a wider staleness window.
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
+    DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
     def __init__(
         self,
@@ -167,6 +188,7 @@ class EcbRateSource:
         url: str = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
+        max_carry_age_s: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         """Configure the ECB XML feed client."""
@@ -174,6 +196,11 @@ class EcbRateSource:
         self.url = url
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
+        )
+        self.default_max_carry_age_s = (
+            self.DEFAULT_MAX_CARRY_AGE_S
+            if max_carry_age_s is None
+            else float(max_carry_age_s)
         )
         # Allow tests to inject a fake client; otherwise create a bounded client.
         self._http = http or httpx.Client(timeout=timeout)
@@ -216,6 +243,7 @@ class FedH10RateSource:
     name = "fed"
     # FRED daily series lag publication and pause on US holidays.
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
+    DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
     DEFAULT_SERIES = {
         "EUR": "DEXUSEU",
@@ -232,6 +260,7 @@ class FedH10RateSource:
         series_by_currency: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
+        max_carry_age_s: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url
@@ -240,6 +269,11 @@ class FedH10RateSource:
         self.api_key = api_key
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
+        )
+        self.default_max_carry_age_s = (
+            self.DEFAULT_MAX_CARRY_AGE_S
+            if max_carry_age_s is None
+            else float(max_carry_age_s)
         )
         configured = self.DEFAULT_SERIES if series_by_currency is None else series_by_currency
         self.series_by_currency = {
@@ -302,6 +336,7 @@ class BnmRateSource:
     name = "bnm"
     # BNM publishes daily reference rates around mid-session.
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
+    DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
     def __init__(
         self,
@@ -309,11 +344,17 @@ class BnmRateSource:
         base_url: str = "https://api.bnm.gov.my/public/exchange-rate",
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
+        max_carry_age_s: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
+        )
+        self.default_max_carry_age_s = (
+            self.DEFAULT_MAX_CARRY_AGE_S
+            if max_carry_age_s is None
+            else float(max_carry_age_s)
         )
         self._http = http or httpx.Client(timeout=timeout)
 
@@ -357,6 +398,7 @@ class MasRateSource:
     name = "mas"
     # data.gov.sg exposes the latest official daily SGD rates.
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
+    DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
     DEFAULT_RESOURCE_IDS = {
         "USD": "d_046ff8d521a218d9178178cfbfc45c2c",
@@ -369,11 +411,17 @@ class MasRateSource:
         resource_ids: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
+        max_carry_age_s: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         self.url = url
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
+        )
+        self.default_max_carry_age_s = (
+            self.DEFAULT_MAX_CARRY_AGE_S
+            if max_carry_age_s is None
+            else float(max_carry_age_s)
         )
         configured = self.DEFAULT_RESOURCE_IDS if resource_ids is None else resource_ids
         self.resource_ids = {

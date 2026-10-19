@@ -9,10 +9,11 @@ placement.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
@@ -46,7 +47,9 @@ from rotor.mm.quote_engine import (
 from rotor.mm.vl_config import PairConfig, VLConfig, load_vl_config
 from rotor.notifications import TelegramNotifier
 from rotor.price_reference import (
+    ReferencePrice,
     ReferencePriceOracle,
+    ReferenceTooStale,
     load_price_reference_source,
     load_token_to_iso,
     market_to_iso_pair,
@@ -59,6 +62,9 @@ from rotor.updater import (
 
 BOOT_CANCEL_RETRY_SECONDS = 300.0
 DEFAULT_STATE_PATH = ".rotor_state.sqlite"
+# While pairs quote on carried-forward reference rates, repeat the warning at
+# most this often, so a weekend produces a handful of messages, not one per tick.
+STALE_REMINDER_SECONDS = 6 * 60 * 60.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +124,29 @@ class LivePlacement:
     intent_by_order_id: dict[str, OrderIntent] | None = None
 
 
+@dataclass
+class TickReferences:
+    """How each pair's reference fared while one tick's quotes were built."""
+
+    # market -> the reference price a pair actually quoted on this tick.
+    quoted: dict[str, ReferencePrice] = field(default_factory=dict)
+    # market -> why a pair produced no quote this tick.
+    skipped: dict[str, Exception] = field(default_factory=dict)
+
+
+@dataclass
+class StaleAlertState:
+    """One pair's open stale-reference alert episode."""
+
+    # "carrying" while the pair quotes on a carried-forward rate; "stopped" once
+    # that rate passed its carry limit and the pair stopped quoting.
+    status: str
+    # Published timestamp of the carried rate; None once stopped.
+    published_ts: float | None
+    # When the operator was last told about this episode.
+    alerted_at: float
+
+
 class StateStore:
     """Tiny unresolved-state store; this is not a trade-history database."""
 
@@ -153,6 +182,14 @@ class StateStore:
                 market TEXT NOT NULL,
                 side TEXT NOT NULL,
                 PRIMARY KEY (market, side)
+            )
+        """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS reference_alerts (
+                market TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                published_ts REAL,
+                alerted_at REAL NOT NULL
             )
         """)
         self._db.commit()
@@ -302,6 +339,193 @@ class StateStore:
             out.setdefault(market, set()).add(side)
         return out
 
+    def replace_reference_alerts(self, episodes: dict[str, StaleAlertState]) -> None:
+        """Replace open stale-reference alert episodes, pruning resolved ones."""
+        rows = [
+            (market, episode.status, episode.published_ts, float(episode.alerted_at))
+            for market, episode in episodes.items()
+        ]
+        with self._db:
+            self._db.execute("DELETE FROM reference_alerts")
+            self._db.executemany(
+                """
+                INSERT OR REPLACE INTO reference_alerts (
+                    market, status, published_ts, alerted_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def load_reference_alerts(self) -> dict[str, StaleAlertState]:
+        """Load open stale-reference alert episodes."""
+        return {
+            market: StaleAlertState(
+                status=status,
+                published_ts=None if published_ts is None else float(published_ts),
+                alerted_at=float(alerted_at),
+            )
+            for market, status, published_ts, alerted_at in self._db.execute(
+                "SELECT market, status, published_ts, alerted_at "
+                "FROM reference_alerts ORDER BY market"
+            )
+        }
+
+
+class StaleReferenceAlerts:
+    """Tell the operator when pairs quote on reference rates that stopped updating.
+
+    Official daily FX sources (BNM, ECB, the Fed, MAS) publish nothing on
+    weekends or public holidays, so the oracle carries their last rate forward
+    instead of halting the pair. Each such episode is announced once on the
+    important channel, repeated quietly every `reminder_seconds`, and closed with
+    a notice when fresh rates return, or with an important alert if the carried
+    rate passes its carry limit and the pair stops quoting. Episodes live in the
+    state store so fire-once runs do not re-announce the same weekend every run.
+    Without a notifier the same messages still reach the log.
+    """
+
+    def __init__(
+        self,
+        runtimes: list[PairRuntime],
+        *,
+        state: StateStore | None = None,
+        reminder_seconds: float = STALE_REMINDER_SECONDS,
+    ) -> None:
+        # Each pair's carry limit, so a warning can say when quoting would stop.
+        self._carry_limit = {
+            runtime.config.market: runtime.oracle.max_carry_age_s for runtime in runtimes
+        }
+        self._state = state
+        self.reminder_seconds = reminder_seconds
+        loaded = {} if state is None else state.load_reference_alerts()
+        # Drop episodes for markets that are no longer configured.
+        self._episodes = {
+            market: episode
+            for market, episode in loaded.items()
+            if market in self._carry_limit
+        }
+
+    def update(
+        self,
+        refs: TickReferences,
+        *,
+        notifier: TelegramNotifier | None,
+        log: logging.Logger,
+        now: float | None = None,
+    ) -> None:
+        """Advance each pair's episode from this tick's references and alert."""
+        now = time.time() if now is None else now
+        started: list[str] = []
+        reminded: list[str] = []
+        recovered: list[str] = []
+        stopped: list[str] = []
+        changed = False
+        for market, ref in sorted(refs.quoted.items(), key=lambda item: item[0]):
+            episode = self._episodes.get(market)
+            if not ref.stale:
+                if episode is not None:
+                    # A fresh rate closes the episode.
+                    del self._episodes[market]
+                    recovered.append(f"{market}: {ref.source} rate {_rate_date(ref.ts)}")
+                    changed = True
+                continue
+            line = self._carry_line(market, ref)
+            if episode is None or episode.status != "carrying":
+                self._episodes[market] = StaleAlertState("carrying", ref.ts, now)
+                started.append(line)
+                changed = True
+            elif now - episode.alerted_at >= self.reminder_seconds:
+                episode.published_ts = ref.ts
+                episode.alerted_at = now
+                reminded.append(line)
+                changed = True
+        for market, error in sorted(refs.skipped.items(), key=lambda item: item[0]):
+            episode = self._episodes.get(market)
+            # Only a rate past its carry limit ends a carrying episode; a one-off
+            # fetch failure in the middle of a weekend is not worth an alert.
+            if (
+                episode is not None
+                and episode.status == "carrying"
+                and isinstance(error, ReferenceTooStale)
+            ):
+                self._episodes[market] = StaleAlertState("stopped", None, now)
+                stopped.append(f"{market}: {error}")
+                changed = True
+        if changed and self._state is not None:
+            self._state.replace_reference_alerts(self._episodes)
+        for lines, icon, heading, footer, important in (
+            (
+                started,
+                "🟡",
+                "Reference rates are not updating. These pairs keep quoting on the "
+                "last published rate:",
+                "This is expected on weekends and public holidays, when daily FX "
+                "sources do not publish.",
+                True,
+            ),
+            (
+                reminded,
+                "🟡",
+                "Still quoting on reference rates that have not updated:",
+                None,
+                False,
+            ),
+            (recovered, "✅", "Reference rates updated again:", None, False),
+            (
+                stopped,
+                "⛔",
+                "Stopped quoting on reference rates past their carry limit:",
+                "Quoting resumes when the source publishes a new rate.",
+                True,
+            ),
+        ):
+            if not lines:
+                continue
+            body = "\n".join([heading, *lines, *([footer] if footer else [])])
+            # One compact log line per state change, never one per tick.
+            log.warning("%s", body.replace("\n", " | "))
+            if notifier is not None:
+                notifier.send_raw(f"{icon} {body}", important=important)
+
+    def _carry_line(self, market: str, ref: ReferencePrice) -> str:
+        """Describe one pair quoting on a carried-forward rate."""
+        limit = self._carry_limit.get(market)
+        until = (
+            ""
+            if limit is None
+            else f"; quoting stops if there is no new rate by {_fmt_utc(ref.ts + limit)}"
+        )
+        return (
+            f"{market}: {ref.source} rate {_rate_date(ref.ts)}, "
+            f"{_fmt_duration(ref.age_s)} old{until}"
+        )
+
+
+def _rate_date(ts: float) -> str:
+    """Label a published timestamp, as a plain date for date-only sources."""
+    stamp = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+    # Daily sources publish a date, which the adapters stamp as UTC midnight.
+    if (stamp.hour, stamp.minute, stamp.second) == (0, 0, 0):
+        return f"dated {stamp:%Y-%m-%d}"
+    return f"from {stamp:%Y-%m-%d %H:%M} UTC"
+
+
+def _fmt_utc(ts: float) -> str:
+    """Format POSIX seconds as a UTC minute."""
+    return f"{dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc):%Y-%m-%d %H:%M} UTC"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format an age compactly: 2d 3h, 5h 12m, or 40m."""
+    minutes = int(max(0.0, seconds) // 60)
+    days, rest = divmod(minutes, 24 * 60)
+    hours, mins = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
 
 def run(
     *,
@@ -310,6 +534,7 @@ def run(
     order_ttl_seconds: int = 600,
     min_requote_seconds: float = 300.0,
     max_reference_age_s: float | None = None,
+    halt_on_stale_reference: bool = False,
     dry_run: bool = False,
     once: bool = False,
     cancel_on_exit: bool = False,
@@ -352,6 +577,7 @@ def run(
             config,
             client,
             max_reference_age_s=max_reference_age_s,
+            carry_stale=not halt_on_stale_reference,
         )
         # Ensure at least one configured budget can actually be spent by a pair.
         _validate_budget_reachability(config, runtimes)
@@ -378,6 +604,8 @@ def run(
     except Exception as exc:
         log.error("state store failed: %s", exc)
         return 1
+    # Throttled warnings while pairs quote on carried-forward daily rates.
+    stale_alerts = StaleReferenceAlerts(runtimes, state=state)
 
     # Signal handlers flip the flag so finally cleanup can run.
     stop = StopFlag()
@@ -497,6 +725,7 @@ def run(
 
             # Phase 2: ask each pair's algo for a fresh quote and flatten it
             # into per-leg intents. Any return side uses latest source mid.
+            tick_refs = TickReferences()
             try:
                 intents = _build_tick_intents(
                     config,
@@ -504,6 +733,7 @@ def run(
                     return_sides,
                     expiration=tick_expiration,
                     log=log,
+                    refs=tick_refs,
                 )
             except Exception as exc:
                 log.warning("skip tick: %s", exc)
@@ -511,6 +741,13 @@ def run(
                     return 1
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
+
+            # Warn (throttled) while pairs quote on carried-forward daily rates.
+            # An alert failure must never cost a tick, so it is only logged.
+            try:
+                stale_alerts.update(tick_refs, notifier=notifier, log=log)
+            except Exception as exc:
+                log.warning("stale-reference alert failed: %s", exc)
 
             if not intents:
                 # No emitted sides means nothing can be safely placed this tick.
@@ -675,6 +912,7 @@ def _build_runtimes(
     client: SeraClient,
     *,
     max_reference_age_s: float | None,
+    carry_stale: bool = True,
 ) -> list[PairRuntime]:
     """Build runtime objects for every configured pair."""
     # Token-to-ISO mapping is loaded once and reused for all configured pairs.
@@ -708,7 +946,7 @@ def _build_runtimes(
                 info=info,
                 algo=algo,
                 oracle=ReferencePriceOracle(
-                    source, max_age_s=max_reference_age_s),
+                    source, max_age_s=max_reference_age_s, carry_stale=carry_stale),
                 iso_base=iso_base,
                 iso_quote=iso_quote,
             )
@@ -772,12 +1010,14 @@ def _build_tick_intents(
     *,
     expiration: int,
     log: logging.Logger,
+    refs: TickReferences | None = None,
 ) -> list[OrderIntent]:
     """Build all order intents for one loop tick.
 
-    Each pair is isolated: a stale/unavailable reference or a quote that fails
-    market minimums skips only that pair, so one misbehaving market cannot
-    sideline quoting on every other healthy market.
+    Each pair is isolated: an unavailable reference, a rate past its carry
+    limit, or a quote that fails market minimums skips only that pair, so one
+    misbehaving market cannot sideline quoting on every other healthy market.
+    When `refs` is given it records what each pair quoted on or why it skipped.
     """
     out: list[OrderIntent] = []
     for runtime in runtimes:
@@ -785,11 +1025,13 @@ def _build_tick_intents(
             out.extend(
                 _intents_for_runtime(
                     runtime, return_sides, config.return_bps,
-                    expiration=expiration, log=log,
+                    expiration=expiration, log=log, refs=refs,
                 )
             )
         except Exception as exc:
             log.warning("skip pair %s: %s", runtime.config.market, exc)
+            if refs is not None:
+                refs.skipped[runtime.config.market] = exc
     return out
 
 
@@ -800,6 +1042,7 @@ def _intents_for_runtime(
     *,
     expiration: int,
     log: logging.Logger,
+    refs: TickReferences | None = None,
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
     # Fetch a fresh reference for this pair, priced for the worked base size so
@@ -820,7 +1063,7 @@ def _intents_for_runtime(
     # Debug-only per-pair quote trace for operators and audits.
     log.debug(
         "%s algo=%s benchmark=%s fixed_bps=%s bid=%s ask=%s qty=%s "
-        "src=%s%s",
+        "src=%s%s%s",
         runtime.config.market,
         runtime.algo.name,
         fmt(quote.benchmark_rate),
@@ -829,11 +1072,15 @@ def _intents_for_runtime(
         fmt_optional(quote.ask_price),
         fmt(quote.qty_base),
         ref.source,
+        f" stale_age={ref.age_s:.0f}s" if ref.stale else "",
         return_text,
     )
     # Flatten the two-sided quote into concrete order intents.
-    return _intents_from_quote(
+    intents = _intents_from_quote(
         runtime.config.market, runtime.info, quote, expiration)
+    if refs is not None:
+        refs.quoted[runtime.config.market] = ref
+    return intents
 
 
 def _intents_from_quote(

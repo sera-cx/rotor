@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from decimal import Decimal
+from types import SimpleNamespace
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
-from rotor.price_reference.models import PriceObservation
+from rotor.price_reference import ReferenceTooStale, ReferenceUnavailable
+from rotor.price_reference.models import PriceObservation, ReferencePrice
 from rotor.updater import GitUpdateResult
 
 
@@ -453,3 +456,260 @@ def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch):
     assert ("cancel_order", "old-order", 42) in client.events
     assert client.batch_places == []
     assert client.standalone_places == []
+
+
+# ---------------------------------------------------------------------------
+# Daily reference rates that stop updating over a weekend
+# ---------------------------------------------------------------------------
+
+DAY = 24 * 3600.0
+# Friday's rate read on Monday morning, before the source publishes again.
+WEEKEND_AGE = 3 * DAY
+# A date-only publication (1970-01-21), stamped at UTC midnight like BNM's.
+FRIDAY = 20 * DAY
+LOG = logging.getLogger("rotor.test.stale")
+WEEKEND_RATES = {("SGD", "USD"): ["0.7400"], ("EUR", "USD"): ["1.1000"]}
+
+
+class _AgedSource(_SequencedSource):
+    """Daily-style source whose observations are `age_s` seconds old."""
+
+    name = "bnm"
+    default_max_age_s = 2 * DAY
+    default_max_carry_age_s = 7 * DAY
+
+    def __init__(self, rates, *, age_s: float, always_fail=None) -> None:
+        super().__init__(rates, always_fail=always_fail)
+        self.age_s = age_s
+
+    def quote(self, base: str, quote: str, *, amount=None) -> PriceObservation:
+        obs = super().quote(base, quote, amount=amount)
+        return PriceObservation(
+            source=self.name, pair=obs.pair, rate=obs.rate, ts=time.time() - self.age_s,
+        )
+
+
+class _RecordingNotifier:
+    """Stand-in for TelegramNotifier that records every message it is asked to send."""
+
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, bool]] = []
+
+    def send_raw(self, text: str, *, important: bool = False, debug: bool = False) -> None:
+        self.messages.append((text, important))
+
+    def notify_startup(self, text: str) -> None:
+        self.messages.append((text, False))
+
+    def notify_shutdown(self, text: str) -> None:
+        self.messages.append((text, False))
+
+    def notify_quote(self, market: str, **_kwargs) -> None:
+        return None
+
+    def notify_error(self, context: str, error: object) -> None:
+        self.messages.append((f"error: {context}: {error}", True))
+
+    def heartbeat(self) -> bool:
+        return False
+
+    def containing(self, needle: str) -> list[tuple[str, bool]]:
+        return [message for message in self.messages if needle in message[0]]
+
+
+def _headings(notifier: _RecordingNotifier) -> list[tuple[str, bool]]:
+    return [(text.split("\n")[0], important) for text, important in notifier.messages]
+
+
+def test_run_keeps_quoting_on_a_weekend_rate_and_warns_once(monkeypatch, tmp_path):
+    client = _FakeClient()
+    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _stop_after_sleeps(monkeypatch, 3)
+
+    result = vr.run(
+        config_path="unused.toml",
+        min_requote_seconds=0.0,
+        telegram=True,
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    assert result == 0
+    # Quotes keep going out on the carried Friday rate, tick after tick.
+    assert len(client.batch_places) == 3
+    warnings = notifier.containing("not updating")
+    assert len(warnings) == 1
+    text, important = warnings[0]
+    assert important is True
+    assert "EURC/USDC: bnm rate" in text and "XSGD/USDC: bnm rate" in text
+    assert "3d 0h old" in text
+    assert not notifier.containing("stalled")
+
+
+def test_run_with_halt_on_stale_reference_skips_weekend_rates(monkeypatch, tmp_path):
+    client = _FakeClient()
+    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    result = vr.run(
+        config_path="unused.toml",
+        once=True,
+        telegram=True,
+        halt_on_stale_reference=True,
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    assert result == 1
+    assert client.batch_places == []
+    assert client.standalone_places == []
+    assert not notifier.containing("not updating")
+
+
+def test_fire_once_runs_announce_a_weekend_only_once(monkeypatch, tmp_path):
+    client = _FakeClient()
+    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    for _ in range(3):
+        vr.run(
+            config_path="unused.toml",
+            once=True,
+            min_requote_seconds=0.0,
+            telegram=True,
+            state_path=tmp_path / "state.sqlite",
+        )
+
+    assert len(notifier.containing("not updating")) == 1
+
+
+def test_tick_references_record_carried_and_skipped_pairs(monkeypatch):
+    client = _FakeClient()
+    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE, always_fail={("EUR", "USD")})
+    config = _config()
+    _wire_runner(monkeypatch, config=config, client=client, source=source)
+    runtimes = vr._build_runtimes(config, client, max_reference_age_s=None)
+    refs = vr.TickReferences()
+
+    intents = vr._build_tick_intents(config, runtimes, {}, expiration=1, log=LOG, refs=refs)
+
+    assert {intent.market for intent in intents} == {"XSGD/USDC"}
+    assert refs.quoted["XSGD/USDC"].stale is True
+    assert isinstance(refs.skipped["EURC/USDC"], ReferenceUnavailable)
+    assert not isinstance(refs.skipped["EURC/USDC"], ReferenceTooStale)
+
+
+def test_halting_runtimes_skip_a_weekend_rate(monkeypatch):
+    client = _FakeClient()
+    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
+    config = _config()
+    _wire_runner(monkeypatch, config=config, client=client, source=source)
+    runtimes = vr._build_runtimes(config, client, max_reference_age_s=None, carry_stale=False)
+    refs = vr.TickReferences()
+
+    intents = vr._build_tick_intents(config, runtimes, {}, expiration=1, log=LOG, refs=refs)
+
+    assert intents == []
+    assert isinstance(refs.skipped["XSGD/USDC"], ReferenceTooStale)
+
+
+def _stale_alerts(*, state=None, markets=("XSGD/USDC",)) -> vr.StaleReferenceAlerts:
+    runtimes = [
+        SimpleNamespace(
+            config=SimpleNamespace(market=market),
+            oracle=SimpleNamespace(max_carry_age_s=7 * DAY),
+        )
+        for market in markets
+    ]
+    return vr.StaleReferenceAlerts(runtimes, state=state)
+
+
+def _refs(*, stale=True, age_s=WEEKEND_AGE, ts=FRIDAY) -> vr.TickReferences:
+    return vr.TickReferences(quoted={
+        "XSGD/USDC": ReferencePrice(
+            pair="SGD/USD", rate=Decimal("0.74"), ts=ts, source="bnm",
+            age_s=age_s, stale=stale,
+        ),
+    })
+
+
+STARTED = "🟡 Reference rates are not updating. These pairs keep quoting on the last published rate:"
+REMINDER = "🟡 Still quoting on reference rates that have not updated:"
+RECOVERED = "✅ Reference rates updated again:"
+STOPPED = "⛔ Stopped quoting on reference rates past their carry limit:"
+
+
+def test_stale_alerts_announce_remind_and_recover():
+    alerts = _stale_alerts()
+    notifier = _RecordingNotifier()
+    hour = 3600.0
+    monday = _refs(stale=False, age_s=60.0, ts=FRIDAY + 3 * DAY)
+
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=0.0)
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=1 * hour)
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=6 * hour)
+    alerts.update(monday, notifier=notifier, log=LOG, now=7 * hour)
+    alerts.update(monday, notifier=notifier, log=LOG, now=8 * hour)
+
+    assert _headings(notifier) == [(STARTED, True), (REMINDER, False), (RECOVERED, False)]
+    started = notifier.messages[0][0]
+    assert "XSGD/USDC: bnm rate dated 1970-01-21, 3d 0h old" in started
+    assert "no new rate by 1970-01-28 00:00 UTC" in started
+    assert "weekends and public holidays" in started
+    assert "XSGD/USDC: bnm rate dated 1970-01-24" in notifier.messages[2][0]
+
+
+def test_stale_alerts_report_a_rate_past_its_carry_limit():
+    alerts = _stale_alerts()
+    notifier = _RecordingNotifier()
+    too_old = vr.TickReferences(skipped={
+        "XSGD/USDC": ReferenceTooStale("XSGD/USDC: bnm quote is stale age=700000.0s"),
+    })
+
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=0.0)
+    alerts.update(too_old, notifier=notifier, log=LOG, now=305.0)
+    alerts.update(too_old, notifier=notifier, log=LOG, now=610.0)
+    alerts.update(_refs(stale=False, age_s=60.0), notifier=notifier, log=LOG, now=915.0)
+
+    assert _headings(notifier) == [(STARTED, True), (STOPPED, True), (RECOVERED, False)]
+    assert "age=700000.0s" in notifier.messages[1][0]
+
+
+def test_stale_alerts_ignore_a_one_off_fetch_failure():
+    alerts = _stale_alerts()
+    notifier = _RecordingNotifier()
+    blip = vr.TickReferences(skipped={
+        "XSGD/USDC": ReferenceUnavailable("XSGD/USDC: bnm failed (ReadTimeout: timed out)"),
+    })
+
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=0.0)
+    alerts.update(blip, notifier=notifier, log=LOG, now=305.0)
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=610.0)
+
+    assert _headings(notifier) == [(STARTED, True)]
+
+
+def test_stale_alert_episodes_survive_a_restart(tmp_path):
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    notifier = _RecordingNotifier()
+    try:
+        _stale_alerts(state=store).update(_refs(), notifier=notifier, log=LOG, now=0.0)
+        _stale_alerts(state=store).update(_refs(), notifier=notifier, log=LOG, now=305.0)
+    finally:
+        store.close()
+
+    assert _headings(notifier) == [(STARTED, True)]
+
+
+def test_stale_alerts_still_log_without_telegram(caplog):
+    with caplog.at_level(logging.WARNING, logger=LOG.name):
+        _stale_alerts().update(_refs(), notifier=None, log=LOG, now=0.0)
+
+    assert "Reference rates are not updating" in caplog.text

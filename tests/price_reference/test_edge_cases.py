@@ -11,7 +11,12 @@ import pytest
 from rotor.price_reference.aggregator import ReferencePriceOracle, ReferenceUnavailable
 from rotor.price_reference.config import load_price_reference_source, load_token_to_iso
 from rotor.price_reference.models import PriceObservation
-from rotor.price_reference.sources import EcbRateSource, MasRateSource, WiseRateSource
+from rotor.price_reference.sources import (
+    BnmRateSource,
+    EcbRateSource,
+    MasRateSource,
+    WiseRateSource,
+)
 from rotor.price_reference.symbols import market_to_iso_pair, parse_market_symbol
 
 
@@ -200,3 +205,28 @@ def test_reference_oracle_allows_quote_at_exact_max_age(monkeypatch):
     ref = ReferencePriceOracle(StaticSource(), max_age_s=10).get("SGD", "USD")
 
     assert ref.rate == Decimal("0.75")
+
+
+def test_daily_sources_carry_for_a_week_and_wise_never_carries():
+    assert WiseRateSource().default_max_carry_age_s is None
+    assert EcbRateSource().default_max_carry_age_s == 7 * 24 * 3600
+    assert BnmRateSource().default_max_carry_age_s == 7 * 24 * 3600
+
+
+def test_per_source_carry_override_from_config(monkeypatch):
+    monkeypatch.setenv("BNM_MAX_CARRY_AGE_S", "259200")
+
+    assert load_price_reference_source("bnm").default_max_carry_age_s == 259200.0
+
+
+def test_global_carry_override_applies_to_daily_sources(monkeypatch):
+    monkeypatch.setenv("PRICE_REFERENCE_MAX_CARRY_AGE_S", "3600")
+
+    assert load_price_reference_source("ecb").default_max_carry_age_s == 3600.0
+
+
+def test_invalid_carry_override_is_rejected(monkeypatch):
+    monkeypatch.setenv("BNM_MAX_CARRY_AGE_S", "a week")
+
+    with pytest.raises(ValueError, match="BNM_MAX_CARRY_AGE_S must be a number of seconds"):
+        load_price_reference_source("bnm")

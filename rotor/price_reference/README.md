@@ -39,7 +39,7 @@ Only `wise` and `fed` require a credential; `ecb`, `bnm`, and `mas` are keyless.
 Each observation is stamped with the provider's **published** timestamp (Wise's
 quote time; the ECB `Cube time`; the FRED/BNM/MAS row date), not fetch time, so a
 stale (e.g. weekend or holiday) feed is detectable. `ReferencePriceOracle`
-rejects an observation older than the source's window:
+treats an observation older than the source's window as stale:
 
 - `wise`: 10 minutes (intraday).
 - `ecb` / `fed` / `bnm` / `mas`: 48 hours (daily references legitimately carry
@@ -48,6 +48,16 @@ rejects an observation older than the source's window:
 Override one source with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`), all
 of them with `PRICE_REFERENCE_MAX_AGE_S`, or everything at runtime with the
 `--max-reference-age` CLI flag.
+
+Past its window a daily reference is **carried forward** rather than rejected:
+`ecb`, `fed`, `bnm`, and `mas` publish nothing on weekends or public holidays, so
+the oracle still returns the last published rate, marked `stale` with its
+`age_s`, until that rate is 7 days old. Past that it raises `ReferenceTooStale`,
+a `ReferenceUnavailable` subclass. `wise` declares no carry limit and is rejected
+as soon as it is stale. Change a limit with `<SOURCE>_MAX_CARRY_AGE_S` or
+`PRICE_REFERENCE_MAX_CARRY_AGE_S`, or disable carrying with
+`ReferencePriceOracle(..., carry_stale=False)` (`--halt-on-stale-reference` on
+the CLI).
 
 The bot maps token markets to fiat ISO pairs before pricing:
 
@@ -67,6 +77,7 @@ export FRED_API_KEY="..."              # required for the fed source
 export FED_H10_SERIES_JSON='{"EUR":"DEXUSEU","MYR":"DEXMAUS","SGD":"DEXSIUS"}'
 export MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON='{"USD":"d_046ff8d521a218d9178178cfbfc45c2c"}'
 export ECB_MAX_AGE_S="172800"          # optional per-source staleness override
+export BNM_MAX_CARRY_AGE_S="604800"    # optional: how long a stale daily rate is still quoted
 ```
 
 The same `KEY=VALUE` lines can be placed in a root `.env`. Optional local
