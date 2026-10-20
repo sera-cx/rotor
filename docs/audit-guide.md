@@ -130,6 +130,9 @@ VL behavior:
   its largest leg (siblings share one budget and only one can fill at a time),
   each standalone order counts in full, and batches and standalone orders on one
   token add up. A tick is rejected when that exceeds the token's budget.
+- Before that check, any single order that would spend more than its token's
+  budget is trimmed to fit (size rounded down), or dropped if trimming takes it
+  below the market minimum, so ordinary price drift cannot fail the tick.
 - Oversized same-spent-token groups are split into chunks of at most Sera's batch
   maximum, so one large group cannot fail every tick.
 - Sera remains the authoritative shared-budget enforcer.

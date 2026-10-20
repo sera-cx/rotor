@@ -460,6 +460,43 @@ def test_run_places_a_vl_batch_whose_legs_each_use_the_whole_budget(monkeypatch)
     ] == [("XSGD/USDC", "bid"), ("EURC/USDC", "bid")]
 
 
+def test_run_keeps_quoting_when_a_price_rise_pushes_a_bid_over_budget(monkeypatch):
+    # The XSGD bid is sized to the whole 10 USDC budget at SGD 1.0000 (it spends
+    # 9.95). SGD then rises 1%, which would make it spend 10.049: instead of the
+    # budget check stopping every market, the bid is trimmed to fit.
+    client = _FakeClient()
+    source = _SequencedSource({
+        ("SGD", "USD"): ["1.0000", "1.0100"],
+        ("EUR", "USD"): ["1.0000"],
+    })
+    config = VLConfig(
+        budgets=[BudgetConfig("USDC", Decimal("10"))],
+        pairs=[_pair("XSGD/USDC"), _pair("EURC/USDC", qty="5")],
+        fixed_bps=Decimal("50"),
+        return_bps=Decimal("2"),
+    )
+    _wire_runner(monkeypatch, config=config, client=client, source=source)
+    _stop_after_sleeps(monkeypatch, 2)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    xsgd_bids = [
+        (leg["qty"], leg["price"]) for batch in client.batch_places for leg in batch["legs"]
+        if leg["market"] == "XSGD/USDC"
+    ]
+    # Tick 2: 10 / 1.0049 = 9.9512..., rounded down to the 0.01 step.
+    assert xsgd_bids == [
+        (Decimal("10"), Decimal("0.9950")),
+        (Decimal("9.95"), Decimal("1.0049")),
+    ]
+
+
 def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):
     # Earn funds only USDC, so Sera rejects every ask (they spend XSGD/EURC the
     # wallet does not hold). The USDC bid batch must still go out every tick.

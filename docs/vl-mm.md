@@ -85,7 +85,9 @@ Rules:
   can spend, counted the way Sera locks it: a VL batch counts as its largest leg,
   because its legs share one budget and only one can fill at a time; each
   standalone order counts in full. So every pair in a VL batch can be sized to
-  the whole budget.
+  the whole budget. Sizes are fixed in base tokens, so a rising price raises a
+  bid's spend; an order that would spend more than its budget is trimmed to fit
+  (and dropped if trimming takes it below the market minimum).
 - Markets cannot be duplicated, including inverse duplicates.
 - `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `wise` needs
   `WISE_API_TOKEN` and `fed` (the official FRED API) needs a free `FRED_API_KEY`;

@@ -105,9 +105,9 @@ def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
     )
 
 
-def _vl_config(*, return_bps: str = "2") -> VLConfig:
+def _vl_config(*, return_bps: str = "2", budget: str = "1000") -> VLConfig:
     return VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal("1000"))],
+        budgets=[BudgetConfig("USDC", Decimal(budget))],
         pairs=[],
         fixed_bps=Decimal("50"),
         return_bps=Decimal(return_bps),
@@ -192,6 +192,44 @@ def test_position_below_the_market_minimum_keeps_the_normal_order():
     out = _with_return(position, intents, now=0.0, info=_market(min_bid_quote="1"))
 
     assert out == intents
+
+
+# ---------------------------------------------------------------------------
+# Orders trimmed to their budget
+# ---------------------------------------------------------------------------
+
+def test_an_order_the_price_pushed_over_budget_is_trimmed_to_fit():
+    # Sized to the whole 1,000 USDC budget at setup; the price has since risen,
+    # so 1,100 XSGD at 0.995 would spend 1,094.50 USDC.
+    over = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="1100")
+    under = _intent("EURC/USDC", "bid", "USDC", price="0.995", qty="1000")
+    unbudgeted = _intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="5000")
+
+    out = vr._within_budgets([over, under, unbudgeted], _market(), _vl_config(), LOG)
+
+    # 1,000 / 0.995 = 1,005.0251..., rounded down to the 0.01 size step.
+    assert out[0].qty_base == Decimal("1005.02")
+    assert out[0].qty_base * out[0].price <= Decimal("1000")
+    assert out[1:] == [under, unbudgeted]
+
+
+def test_an_ask_spending_a_budgeted_token_is_trimmed_to_the_budget():
+    # On a USDC-base market the ask is what spends USDC.
+    ask = _intent("USDC/AUDD", "ask", "USDC", price="1.52", qty="1200")
+
+    out = vr._within_budgets([ask], _market(), _vl_config(), LOG)
+
+    assert out[0].qty_base == Decimal("1000")
+
+
+def test_an_order_too_small_after_trimming_is_dropped(caplog):
+    bid = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="100")
+
+    out = vr._within_budgets(
+        [bid], _market(min_bid_quote="1"), _vl_config(budget="0.5"), LOG)
+
+    assert out == []
+    assert "XSGD/USDC bid dropped: trimmed to its USDC budget it is too small" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -863,6 +863,8 @@ def run(
             # Phase 4: reject the whole tick if any budgeted token could spend
             # more than its configured budget, counted the way Sera locks it (a
             # local guard; Sera's shared vl_group budget is the authoritative cap).
+            # Each order is already trimmed to its budget, so this only trips
+            # when one token's orders are split across batches (over 50 pairs).
             try:
                 _validate_budget_caps(groups, config)
             except Exception as exc:
@@ -1183,6 +1185,7 @@ def _intents_for_runtime(
     if position is not None:
         intents = _with_return_order(
             intents, runtime, position, config, now=now, log=log)
+    intents = _within_budgets(intents, runtime.info, config, log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
     return intents
@@ -1222,6 +1225,56 @@ def _intents_from_quote(
                 benchmark_rate=quote.benchmark_rate,
             )
         )
+    return out
+
+
+def _within_budgets(
+    intents: list[OrderIntent],
+    info,
+    config: VLConfig,
+    log: logging.Logger,
+) -> list[OrderIntent]:
+    """Trim any order that would spend more than its token's budget.
+
+    Sizes are fixed in base tokens, so a bid's quote spend rises with the price.
+    An order the price has pushed over its budget is cut to what the budget
+    buys, rounded down to the market's size step, instead of failing the tick's
+    budget check. One that trimming takes below the market minimum is dropped.
+    """
+    budgets = {budget.token: budget.amount for budget in config.budgets}
+    out: list[OrderIntent] = []
+    for intent in intents:
+        budget = budgets.get(intent.spent_token)
+        if budget is None or _intent_spend_amount(intent) <= budget:
+            out.append(intent)
+            continue
+        # A bid spends quote tokens (qty x price); an ask spends base tokens (qty).
+        qty = _quantize_qty(info, budget if intent.side == "ask" else budget / intent.price)
+        try:
+            _validate_minimums(
+                info,
+                qty,
+                intent.price if intent.side == "bid" else None,
+                intent.price if intent.side == "ask" else None,
+            )
+        except ValueError as exc:
+            log.warning(
+                "%s %s dropped: trimmed to its %s budget it is too small (%s)",
+                intent.market,
+                intent.side,
+                intent.spent_token,
+                exc,
+            )
+            continue
+        log.debug(
+            "%s %s trimmed from %s to %s to fit the %s budget",
+            intent.market,
+            intent.side,
+            fmt(intent.qty_base),
+            fmt(qty),
+            intent.spent_token,
+        )
+        out.append(replace(intent, qty_base=qty))
     return out
 
 
