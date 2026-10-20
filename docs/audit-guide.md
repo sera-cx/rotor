@@ -98,7 +98,9 @@ Live order lifecycle:
   clipped (amended) leg tracks its accepted size so a full fill at that size
   prunes. A malformed batch response keeps a cancelable `vl_batch_id` rather than
   orphaning the live orders.
-- Partial placement failures cancel placements already created in that tick.
+- Each VL batch and each standalone order is placed on its own: one Sera
+  rejects is logged with its error code and skipped, and the tick's other
+  placements still go out and are tracked. Nothing that placed is cancelled.
 - Only one instance may use a state file: startup takes an exclusive advisory
   lock on `<state>.lock` and refuses to start if another process holds it.
 - `--cancel-on-exit` is opt-in and cancels only tracked placements; an

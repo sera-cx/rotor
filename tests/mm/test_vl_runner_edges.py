@@ -135,7 +135,7 @@ def test_place_groups_uses_vl_batch_and_tracks_intents():
     assert placement.intent_by_order_id == {"leg-1": intents[0], "leg-2": intents[1]}
 
 
-def test_place_groups_cancels_partial_standalone_placements_on_failure():
+def test_place_groups_skips_a_rejected_order_and_places_the_rest(caplog):
     calls: list[tuple[str, str]] = []
 
     class Client:
@@ -144,8 +144,8 @@ def test_place_groups_cancels_partial_standalone_placements_on_failure():
         def place_order_previewed(self, market, side, qty_base, price, expiration):
             calls.append(("place", market))
             if market == "EURC/USDC":
-                raise RuntimeError("second failed")
-            return OrderRecord("solo-1", 1)
+                raise errors.SeraError("INSUFFICIENT_EQUITY", "not enough EURC", 400)
+            return OrderRecord(f"solo-{market}", 1)
 
         def cancel_order(self, order_id, uuid_int):
             calls.append(("cancel", order_id))
@@ -153,16 +153,15 @@ def test_place_groups_cancels_partial_standalone_placements_on_failure():
 
     placements = vr._place_groups(
         Client(),
-        [("USDC", [_intent(), _intent(market="EURC/USDC")], False)],
+        [("USDC", [_intent(), _intent(market="EURC/USDC"), _intent(market="JPYC/USDC")], False)],
         logging.getLogger("test"),
     )
 
-    assert placements == []
-    assert calls == [
-        ("place", "XSGD/USDC"),
-        ("place", "EURC/USDC"),
-        ("cancel", "solo-1"),
-    ]
+    # The rejected order is skipped; the others stay live and tracked, and
+    # nothing that did place is cancelled.
+    assert [p.orders[0].market for p in placements] == ["XSGD/USDC", "JPYC/USDC"]
+    assert calls == [("place", "XSGD/USDC"), ("place", "EURC/USDC"), ("place", "JPYC/USDC")]
+    assert "could not place EURC/USDC bid spent=USDC: INSUFFICIENT_EQUITY" in caplog.text
 
 
 def test_cancel_placements_keeps_cooldown_vl_batch():

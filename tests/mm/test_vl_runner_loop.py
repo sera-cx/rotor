@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
+from rotor.mm.exchange.errors import SeraError
 from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
 from rotor.price_reference import ReferenceTooStale, ReferenceUnavailable
@@ -116,6 +117,7 @@ class _FakeClient:
         fill_first_xsgd_bid: bool = False,
         cancel_ok: bool = True,
         fill_status: str = "settled",
+        reject_asks: bool = False,
     ) -> None:
         self.markets_by_symbol = {
             "XSGD/USDC": _market("XSGD/USDC", "XSGD", "USDC"),
@@ -132,6 +134,8 @@ class _FakeClient:
         self.standalone_places: list[dict] = []
         self.fill_order_ids: set[str] = set()
         self.fill_status = fill_status
+        # Asks spend base tokens; a wallet funded only with USDC cannot back them.
+        self.reject_asks = reject_asks
         self._batch_count = 0
         self._order_count = 0
         self._uuid_int = 100
@@ -196,6 +200,9 @@ class _FakeClient:
         price: Decimal,
         expiration: int,
     ) -> OrderRecord:
+        if self.reject_asks and side == "ask":
+            self.events.append(("rejected", market, side))
+            raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
         self._order_count += 1
         self._uuid_int += 1
         order_id = f"solo-{self._order_count}"
@@ -451,6 +458,30 @@ def test_run_places_a_vl_batch_whose_legs_each_use_the_whole_budget(monkeypatch)
     assert [
         (leg["market"], leg["side"]) for leg in client.batch_places[0]["legs"]
     ] == [("XSGD/USDC", "bid"), ("EURC/USDC", "bid")]
+
+
+def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):
+    # Earn funds only USDC, so Sera rejects every ask (they spend XSGD/EURC the
+    # wallet does not hold). The USDC bid batch must still go out every tick.
+    client = _FakeClient(reject_asks=True)
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _stop_after_sleeps(monkeypatch, 2)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    assert len(client.batch_places) == 2
+    assert {leg["side"] for batch in client.batch_places for leg in batch["legs"]} == {"bid"}
+    assert len([event for event in client.events if event[0] == "rejected"]) == 4
+    # The second tick cancelled and replaced the first tick's bids as usual.
+    assert ("cancel_vl", "batch-1") in client.events
+    assert len(client.active_orders) == 2
 
 
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):

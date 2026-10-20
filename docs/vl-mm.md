@@ -124,7 +124,9 @@ stale pair instead.
 Pairs are isolated within a tick: if one pair's reference is unavailable or past
 its carry limit, or its quote fails market minimums, only that pair is skipped —
 the other configured pairs still quote. A tick is fully skipped only when no pair
-produces a quote.
+produces a quote. Placement is isolated the same way: an order or VL batch that
+Sera rejects (for example an ask whose base token the wallet does not hold) is
+logged and skipped, and the tick's other orders still go out.
 
 ## Dry Run
 

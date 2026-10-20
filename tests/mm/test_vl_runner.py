@@ -387,17 +387,29 @@ def test_placement_records_every_order_with_its_side_price_and_expiry():
     ]
 
 
-def test_orders_a_failed_tick_cancels_are_still_recorded_for_settlement():
-    # The VL batch is placed, then the standalone ask fails and the tick cancels
-    # the batch; it may already have filled, so it must still be settled.
+def test_a_rejected_order_does_not_take_down_the_rest_of_the_tick():
+    # The VL batch is placed, then Sera rejects the standalone ask. The batch
+    # stays live, tracked and recorded for settlement; nothing is cancelled.
     store = vr.StateStore(":memory:")
     client = _PlacingClient(fail_standalone=True)
 
     placed = _place_groups(client, _groups(), LOG, state=store)
 
-    assert placed == []
-    assert client.cancelled == ["batch-1"]
+    assert [placement.vl_batch_id for placement in placed] == ["batch-1"]
+    assert client.cancelled == []
     assert [row.order_id for row in store.load_unsettled()] == ["leg-0", "leg-1"]
+
+
+def test_a_rejected_vl_batch_does_not_stop_the_standalone_orders():
+    class Client(_PlacingClient):
+        def place_vl_batch(self, legs):
+            raise vr.errors.SeraError("INSUFFICIENT_EQUITY", "not enough USDC", 400)
+
+    store = vr.StateStore(":memory:")
+    placed = _place_groups(Client(), _groups(), LOG, state=store)
+
+    assert [placement.kind for placement in placed] == ["standalone"]
+    assert [row.order_id for row in store.load_unsettled()] == ["solo-1"]
 
 
 def test_vl_batch_with_mismatched_ids_attributes_no_fills():

@@ -910,7 +910,8 @@ def run(
                     continue
 
             # Phase 7: place exactly the fresh quote set. Every placed order is
-            # recorded for settlement as soon as Sera accepts it.
+            # recorded for settlement as soon as Sera accepts it; an order or VL
+            # batch Sera rejects is skipped and the rest still go out.
             placed = _place_groups(client, groups, log, state=state)
             if placed:
                 live = placed
@@ -1295,15 +1296,18 @@ def _place_groups(
     *,
     state: StateStore | None = None,
 ) -> list[LivePlacement]:
-    """Place grouped intents and return local live-placement records.
+    """Place grouped intents and return the placements Sera accepted.
 
-    With `state`, each placement's orders are recorded for fill settlement as
-    soon as Sera accepts them, including any a later failure cancels.
+    Each VL batch and each standalone order is placed on its own. One that Sera
+    rejects (an unfunded order, an inactive market, a rate limit) is logged and
+    skipped; the rest still go out and are tracked. With `state`, each accepted
+    placement's orders are recorded for fill settlement as soon as Sera accepts
+    them.
     """
     placed: list[LivePlacement] = []
-    try:
-        for spent_token, intents, use_vl in groups:
-            if use_vl:
+    for spent_token, intents, use_vl in groups:
+        if use_vl:
+            try:
                 # VL batches submit sibling legs that share one spent-token budget.
                 result = client.place_vl_batch([
                     VLLeg(
@@ -1315,69 +1319,75 @@ def _place_groups(
                     )
                     for i in intents
                 ])
-                # Convert Sera's batch response into local cancellation/fill state.
-                placement = _placement_from_vl_result(
-                    spent_token, result, intents)
-                placed.append(placement)
-                if state is not None:
-                    state.add_unsettled(_unsettled_orders(placement))
-                log.debug(
-                    "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
-                    result.vl_batch_id,
+            except Exception as exc:
+                log.error(
+                    "could not place VL batch spent=%s legs=%d: %s",
                     spent_token,
-                    len(result.records),
-                    len(result.amendments),
-                    len(result.cancelled),
-                    len(result.fills),
+                    len(intents),
+                    exc,
                 )
-            else:
-                for intent in intents:
-                    # Singletons and unbudgeted groups place as ordinary orders.
-                    record = client.place_order_previewed(
-                        intent.market,
-                        intent.side,
-                        intent.qty_base,
-                        intent.price,
-                        intent.expiration,
-                    )
-                    placement = LivePlacement(
-                        kind="standalone",
-                        spent_token=intent.spent_token,
-                        orders=[_live_from_record(
-                            intent.market,
-                            intent.side,
-                            record,
-                            qty_base=intent.qty_base,
-                        )],
-                        placed_at=time.time(),
-                        # Track the source intent so this order's fills can be
-                        # counted at its price once they settle.
-                        intent_by_order_id={record.order_id: intent},
-                    )
-                    placed.append(placement)
-                    if state is not None:
-                        state.add_unsettled(_unsettled_orders(placement))
-                    # Reason helps operators understand why VL was not used.
-                    reason = (
-                        "singleton"
-                        if len(intents) < client.vl_batch_min else "unbudgeted"
-                    )
-                    log.debug(
-                        "placed standalone %s %s side=%s spent=%s reason=%s",
-                        intent.market,
-                        record.order_id,
-                        intent.side,
-                        intent.spent_token,
-                        reason,
-                    )
-    except Exception as exc:
-        # Any failure aborts the whole tick; partial placements are cancelled so
-        # exposure does not remain half-updated.
-        log.error("placement failed: %s", exc)
-        if placed:
-            log.warning("cancelling partial VL tick placements")
-            _cancel_placements(client, placed, log)
-        return []
+                continue
+            # Convert Sera's batch response into local cancellation/fill state.
+            placement = _placement_from_vl_result(spent_token, result, intents)
+            placed.append(placement)
+            if state is not None:
+                state.add_unsettled(_unsettled_orders(placement))
+            log.debug(
+                "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
+                result.vl_batch_id,
+                spent_token,
+                len(result.records),
+                len(result.amendments),
+                len(result.cancelled),
+                len(result.fills),
+            )
+            continue
+        for intent in intents:
+            try:
+                # Singletons and unbudgeted groups place as ordinary orders.
+                record = client.place_order_previewed(
+                    intent.market,
+                    intent.side,
+                    intent.qty_base,
+                    intent.price,
+                    intent.expiration,
+                )
+            except Exception as exc:
+                log.error(
+                    "could not place %s %s spent=%s: %s",
+                    intent.market,
+                    intent.side,
+                    intent.spent_token,
+                    exc,
+                )
+                continue
+            placement = LivePlacement(
+                kind="standalone",
+                spent_token=intent.spent_token,
+                orders=[_live_from_record(
+                    intent.market,
+                    intent.side,
+                    record,
+                    qty_base=intent.qty_base,
+                )],
+                placed_at=time.time(),
+                # Track the source intent so this order's fills can be counted
+                # at its price once they settle.
+                intent_by_order_id={record.order_id: intent},
+            )
+            placed.append(placement)
+            if state is not None:
+                state.add_unsettled(_unsettled_orders(placement))
+            # Reason helps operators understand why VL was not used.
+            reason = "singleton" if len(intents) < client.vl_batch_min else "unbudgeted"
+            log.debug(
+                "placed standalone %s %s side=%s spent=%s reason=%s",
+                intent.market,
+                record.order_id,
+                intent.side,
+                intent.spent_token,
+                reason,
+            )
     return placed
 
 
