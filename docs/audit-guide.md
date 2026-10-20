@@ -71,6 +71,10 @@ Positions and return orders:
 - Each tick reads the fills of every ledger order and every live order once.
   Quoting adds the visible (not `failed`/`reverted`) fills of unsettled orders
   on top of the stored positions; only settled fills are ever stored.
+- An order whose fills cannot be read (an error, or a row rotor cannot parse)
+  is never settled that tick, and its market is not quoted that tick; other
+  markets are. After 12 ticks in a row it is reported as an error (and through
+  Telegram when enabled).
 - The breakeven is the order's limit price, which fills meet or beat.
 - A return bid is never above the position's fill price and an ask never below
   it; bids round down and asks round up, so grid rounding cannot cross it.
@@ -91,6 +95,8 @@ Live order lifecycle:
   retained as history. Positions persist until returned.
 - Each live cadence replaces the tracked quote set; old placements are cancelled
   before fresh placements.
+- If the newest tracked order clears the cancel-cooldown guard within 60 seconds,
+  the tick waits for it; otherwise the tick is skipped.
 - Cancel cooldowns keep local tracking for later retry, but an order Sera reports
   as gone (404 / not-found / already-cancelled / already-filled) is dropped so a
   stuck cancel cannot wedge quoting until restart.
@@ -118,6 +124,11 @@ Sera signing and API:
 - `uuid_int` packing rejects out-of-range executor and leg values.
 - Cancel signatures use the packed order id or VL batch id expected by Sera.
 - Order fills are paginated, so a high-fill order's quantity is not undercounted.
+- API-key requests are paced to Sera's documented per-wallet limits (reads
+  10/s, trades 5/s, cancels 2/s). A rate-limit 429 is retried (twice, honouring
+  Retry-After); a 503 is retried only for requests safe to repeat (GETs,
+  cancels, previews, single-order placement, which Sera dedupes on order_id),
+  never for a VL batch. A cancel-cooldown 429 is never retried.
 - API keys stay in headers; private keys, bearer tokens, signatures, and API
   secrets must not appear in logs.
 

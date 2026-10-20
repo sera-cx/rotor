@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
-from rotor.mm.exchange.errors import SeraError
+from rotor.mm.exchange.errors import SeraError, SeraRateLimit
 from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
 from rotor.price_reference import ReferenceTooStale, ReferenceUnavailable
@@ -136,6 +136,9 @@ class _FakeClient:
         self.fill_status = fill_status
         # Asks spend base tokens; a wallet funded only with USDC cannot back them.
         self.reject_asks = reject_asks
+        # Fill reads for this market's orders fail (rate-limited) on these ticks.
+        self.unreadable_market: str | None = None
+        self.unreadable_ticks: range = range(0)
         self._batch_count = 0
         self._order_count = 0
         self._uuid_int = 100
@@ -218,8 +221,18 @@ class _FakeClient:
         self.events.append(("place_order", order_id, market, side))
         return OrderRecord(order_id, self._uuid_int)
 
+    def market_of(self, order_id: str) -> str | None:
+        rows = [leg for batch in self.batch_places for leg in batch["legs"]]
+        return next(
+            (row["market"] for row in rows + self.standalone_places if row["order_id"] == order_id),
+            None,
+        )
+
     def get_order_fills(self, order_id: str) -> list[dict]:
         self.events.append(("fills", order_id))
+        tick = len([event for event in self.events if event[0] == "expiration"])
+        if tick in self.unreadable_ticks and self.market_of(order_id) == self.unreadable_market:
+            raise SeraRateLimit("RATE_LIMITED", "slow down", 429)
         if order_id in self.fill_order_ids:
             # Like Sera, every call lists all of the order's fills so far.
             return [{"quantity": "5", "price": "1.0", "settlement_status": self.fill_status}]
@@ -495,6 +508,85 @@ def test_run_keeps_quoting_when_a_price_rise_pushes_a_bid_over_budget(monkeypatc
         (Decimal("10"), Decimal("0.9950")),
         (Decimal("9.95"), Decimal("1.0049")),
     ]
+
+
+def _markets_quoted_per_tick(client: _FakeClient) -> list[set[str]]:
+    ticks: list[set[str]] = []
+    batches = {batch["batch_id"]: batch["legs"] for batch in client.batch_places}
+    for event in client.events:
+        if event[0] == "expiration":
+            ticks.append(set())
+        elif event[0] == "place_vl":
+            ticks[-1].update(leg["market"] for leg in batches[event[1]])
+        elif event[0] == "place_order":
+            ticks[-1].add(event[2])
+    return ticks
+
+
+def test_run_skips_only_the_market_whose_fills_could_not_be_read(monkeypatch):
+    client = _FakeClient()
+    client.unreadable_market = "XSGD/USDC"
+    client.unreadable_ticks = range(2, 3)
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _stop_after_sleeps(monkeypatch, 3)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    # Tick 2 cannot read XSGD's fills, so only XSGD sits that tick out.
+    assert _markets_quoted_per_tick(client) == [
+        {"XSGD/USDC", "EURC/USDC"},
+        {"EURC/USDC"},
+        {"XSGD/USDC", "EURC/USDC"},
+    ]
+
+
+def test_run_alerts_once_when_an_orders_fills_stay_unreadable(monkeypatch):
+    client = _FakeClient()
+    client.unreadable_market = "XSGD/USDC"
+    client.unreadable_ticks = range(2, 100)
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _stop_after_sleeps(monkeypatch, vr.READ_FAILURE_ALERT_TICKS + 3)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        log_level="ERROR",
+        telegram=True,
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    assert len(notifier.containing("XSGD/USDC not quoting")) == 1
+    # EURC kept quoting on every tick throughout.
+    assert all("EURC/USDC" in tick for tick in _markets_quoted_per_tick(client))
+
+
+def test_run_waits_a_few_seconds_for_the_cancel_guard_instead_of_skipping(monkeypatch, tmp_path):
+    # The next tick starts 2 s before the newest order clears the 300 s guard:
+    # it waits and requotes. One starting 200 s early still skips.
+    for first_step, ticks_placed in ((298.0, 2), (100.0, 1)):
+        client = _FakeClient()
+        source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+        _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+        _fake_clock(monkeypatch, steps=[first_step, 1.0])
+
+        assert vr.run(
+            config_path="vl.toml",
+            min_requote_seconds=300.0,
+            log_level="ERROR",
+            state_path=tmp_path / f"state-{ticks_placed}.sqlite",
+        ) == 0
+        assert len(client.batch_places) == ticks_placed
 
 
 def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):

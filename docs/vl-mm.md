@@ -48,7 +48,13 @@ sees it; only settled fills are stored. `failed` and `reverted` fills count as
 nothing. The order's limit price stands in for the fill price: fills happen at
 that price or better (on Sera a maker receives exactly its limit), so the
 breakeven is never optimistic. A fill that lands between a tick's fill read and
-its cancel is seen one tick later.
+its cancel is seen one tick later. If an order's fills cannot be read in a tick,
+that order is not settled and its market sits the tick out while the others
+quote; rotor reports it as an error if that lasts 12 ticks.
+
+Requests to Sera are paced to its documented per-wallet limits (10 reads, 5
+order placements and 2 cancels per second), and rate-limited or briefly failing
+requests are retried, so a tick for 8 pairs takes about 10 seconds.
 
 Positions do not see deposits, withdrawals, or trades outside this rotor's own
 orders, orders placed by an older rotor version, or fills on a VL batch whose

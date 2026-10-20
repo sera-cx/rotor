@@ -105,6 +105,8 @@ def _make_client(
     )
     c._http.close()
     c._http = httpx.Client(transport=httpx.MockTransport(handler))
+    # Pacing and retry waits are tested separately; don't sleep in tests.
+    c._sleep = lambda _seconds: None
     return c
 
 
@@ -882,3 +884,92 @@ def test_local_struct_passes_the_preview_mismatch_guard():
     record = client.place_order_previewed(
         "MYRC/USDC", "ask", Decimal("5"), Decimal("2"), 1800000000)
     assert record.order_id
+
+
+# ---------------------------------------------------------------------------
+# Pacing and retries
+# ---------------------------------------------------------------------------
+
+def _scripted_client(replies: list[tuple[int, dict, dict]]):
+    """A client whose requests get `replies` in order, on a fake clock."""
+    sent: list[str] = []
+    queue = list(replies)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(f"{request.method} {request.url.path.replace('/api/v1', '')}")
+        status, payload, headers = queue.pop(0) if queue else (200, {}, {})
+        return httpx.Response(status, json=payload, headers=headers)
+
+    client = SeraClient(
+        owner_address=OWNER,
+        signer=_stub_signer,
+        api_key="testkey",
+        api_secret="testsecret",
+        base_url="https://api.sera.cx/api/v1",
+    )
+    client._http.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    clock = [100.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    client._monotonic = lambda: clock[0]
+    client._sleep = sleep
+    return client, sent, sleeps
+
+
+RATE_LIMITED = (429, {"detail": {"error_code": "RATE_LIMITED", "detail": "slow down"}}, {"Retry-After": "2"})
+SERVER_ERROR = (503, {"detail": "Service temporarily unavailable; please retry"}, {"Retry-After": "1"})
+
+
+def test_api_key_requests_are_spaced_to_seras_per_wallet_limits():
+    client, sent, sleeps = _scripted_client([])
+
+    client._request("GET", "/fills/a")
+    client._request("GET", "/fills/b")
+    client._request("GET", "/config", authed=False)
+    for _ in range(3):
+        client._request("POST", "/orders/cancel", json_body={})
+
+    # Reads 10/s, cancels 2/s; the public /config call is not paced.
+    assert sleeps == pytest.approx([0.1, 0.5, 0.5])
+    assert len(sent) == 6
+
+
+def test_a_rate_limited_request_is_retried_after_retry_after():
+    client, sent, sleeps = _scripted_client([RATE_LIMITED, (200, {"items": []}, {})])
+
+    assert client._request("POST", "/orders/vl/batch", json_body={}) == {"items": []}
+    assert sent == ["POST /orders/vl/batch", "POST /orders/vl/batch"]
+    assert 2.0 in sleeps
+
+
+def test_a_cancel_cooldown_is_not_retried():
+    cooldown = (429, {"detail": {"error_code": errors_mod.CANCEL_COOLDOWN, "detail": "wait"}}, {})
+    client, sent, _ = _scripted_client([cooldown])
+
+    with pytest.raises(errors_mod.SeraCancelCooldown):
+        client._request("POST", "/orders/cancel", json_body={})
+    assert len(sent) == 1
+
+
+def test_a_server_error_is_retried_only_where_repeating_is_harmless():
+    client, sent, _ = _scripted_client([SERVER_ERROR, (200, {"items": []}, {}), SERVER_ERROR])
+
+    assert client._request("GET", "/fills/a") == {"items": []}
+    # A VL batch may already have been placed when the error came back.
+    with pytest.raises(errors_mod.SeraError) as raised:
+        client._request("POST", "/orders/vl/batch", json_body={})
+    assert raised.value.status_code == 503
+    assert sent == ["GET /fills/a", "GET /fills/a", "POST /orders/vl/batch"]
+
+
+def test_retries_give_up_after_two():
+    client, sent, _ = _scripted_client([RATE_LIMITED] * 5)
+
+    with pytest.raises(errors_mod.SeraRateLimit):
+        client._request("GET", "/fills/a")
+    assert len(sent) == 3

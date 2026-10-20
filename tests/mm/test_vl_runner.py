@@ -272,7 +272,7 @@ def _fill(quantity: str, status: str | None = "settled") -> dict:
 def _positions(client, store, server_now):
     """One tick's fill read: settle what is final, return positions for quoting."""
     unsettled = store.load_unsettled()
-    fills = vr._read_fills(client, [order.order_id for order in unsettled])
+    fills, _failed = vr._read_fills(client, [order.order_id for order in unsettled])
     return vr._positions_for_quoting(
         store, unsettled, fills, server_now=server_now, log=LOG)
 
@@ -334,16 +334,43 @@ def test_failed_and_reverted_fills_count_as_nothing():
     assert store.load_unsettled() == []
 
 
-def test_unknown_orders_have_no_fills_but_other_errors_propagate():
+def test_unknown_orders_have_no_fills_and_unreadable_ones_are_reported():
     client = _FillsClient()
 
-    client.error = errors.SeraError("CONFLICT", "try again", 409)
-    with pytest.raises(errors.SeraError):
-        vr._read_fills(client, ["a"])
-
     client.error = errors.SeraError("NOT_FOUND", "no such order", 404)
-    assert vr._read_fills(client, ["a", "b", "a"]) == {"a": [], "b": []}
-    assert client.calls == ["a", "a", "b"]
+    assert vr._read_fills(client, ["a", "b", "a"]) == ({"a": [], "b": []}, {})
+    assert client.calls == ["a", "b"]
+
+    client.error = errors.SeraRateLimit("RATE_LIMITED", "slow down", 429)
+    fills, failed = vr._read_fills(client, ["a"])
+    assert fills == {}
+    assert list(failed) == ["a"] and isinstance(failed["a"], errors.SeraRateLimit)
+
+
+def test_a_row_rotor_cannot_parse_makes_its_order_unreadable():
+    client = _FillsClient({"good": [_fill("5")], "bad": [{"quantity": "five"}]})
+
+    fills, failed = vr._read_fills(client, ["good", "bad"])
+
+    assert fills == {"good": [_fill("5")]}
+    assert list(failed) == ["bad"]
+
+
+def test_an_unreadable_order_is_never_settled_as_unfilled():
+    # Expired and past grace, but its fills could not be read this tick: it
+    # stays in the ledger rather than settle as zero fills.
+    store = vr.StateStore(":memory:")
+    store.add_unsettled([_unsettled()])
+    client = _FillsClient()
+    client.error = errors.SeraError(None, "Service temporarily unavailable", 503)
+
+    assert _positions(client, store, 5000) == {}
+    assert [row.order_id for row in store.load_unsettled()] == ["o-1"]
+
+    client.error = None
+    client.fills = {"o-1": [_fill("40")]}
+    assert _positions(client, store, 5300) == SOLD_40
+    assert store.load_unsettled() == []
 
 
 def test_opposite_fills_net_to_flat_for_quoting_before_they_are_stored():

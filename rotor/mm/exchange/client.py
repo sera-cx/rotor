@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,6 +17,16 @@ from rotor.mm.exchange import eip712, errors
 
 # Hosts for which an http:// base URL is tolerated (local dev/mocks only).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
+# Sera's documented per-wallet limits for API-key requests, in requests per second.
+RATE_LIMITS = {"read": 10.0, "trade": 5.0, "cancel": 2.0}
+# A rate-limited (429) or server-error (503) reply is retried this many times.
+MAX_RETRIES = 2
+# The longest Retry-After wait honoured before a retry, in seconds.
+MAX_RETRY_WAIT_S = 5.0
+# POSTs that are safe to repeat after a server error: Sera dedupes an order on
+# its client-chosen order_id, and a repeated cancel or preview changes nothing.
+# A VL batch is not here: Sera does not document deduping a whole batch.
+_REPEATABLE_POSTS = {"/orders", "/orders/preview", "/orders/cancel", "/orders/vl/cancel"}
 
 
 @dataclass(frozen=True)
@@ -185,6 +196,11 @@ class SeraClient:
         _require_secure_base_url(self.base_url)
         # A single httpx client keeps connection behavior consistent.
         self._http = httpx.Client(timeout=timeout)
+        # Next free request slot per rate-limit group (monotonic seconds).
+        self._next_slot: dict[str, float] = {}
+        # Swappable so tests can run without real waits.
+        self._sleep = time.sleep
+        self._monotonic = time.monotonic
         # Use caller logger when provided; otherwise fall back to module logger.
         self._log = log or logging.getLogger(__name__)
 
@@ -757,6 +773,14 @@ class SeraClient:
         _assert_amount_close("fromAmount", order.get("fromAmount"), expected_from)
         _assert_amount_close("toAmount", order.get("toAmount"), expected_to)
 
+    def _pace(self, group: str) -> None:
+        """Wait until a request in `group` stays within Sera's per-wallet limit."""
+        now = self._monotonic()
+        slot = max(now, self._next_slot.get(group, now))
+        self._next_slot[group] = slot + 1.0 / RATE_LIMITS[group]
+        if slot > now:
+            self._sleep(slot - now)
+
     def _request(
         self,
         method: str,
@@ -780,16 +804,27 @@ class SeraClient:
             # API transport while avoiding whitespace churn.
             headers["Content-Type"] = "application/json"
             kwargs["content"] = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
-        # Delegate retries/timeouts to the configured httpx client behavior.
-        response = self._http.request(method, url, headers=headers, **kwargs)
-        if response.status_code not in expect_status:
+        # API-key requests count against Sera's per-wallet limits; public ones
+        # are throttled at Sera's edge instead.
+        group = _rate_group(method, path) if authed else None
+        for attempt in range(MAX_RETRIES + 1):
+            if group is not None:
+                self._pace(group)
+            response = self._http.request(method, url, headers=headers, **kwargs)
+            if response.status_code in expect_status:
+                break
             try:
                 # Prefer structured errors when the server returns JSON.
                 body = response.json()
             except Exception:
                 # Preserve text bodies in the same envelope shape.
                 body = {"detail": response.text}
-            raise errors.from_response(response.status_code, body)
+            error = errors.from_response(response.status_code, body)
+            if attempt == MAX_RETRIES or not _retryable(error, method, path):
+                raise error
+            wait = _retry_wait(response, attempt)
+            self._log.debug("retrying %s %s in %.1fs after %s", method, path, wait, error)
+            self._sleep(wait)
         # Empty success responses normalize to an empty dict for callers.
         if response.status_code == 204 or not response.content:
             return {}
@@ -932,6 +967,32 @@ def _coerce_int(value: Any) -> int:
             return int(text, 16)
         return int(text, 10)
     return int(value)
+
+
+def _rate_group(method: str, path: str) -> str:
+    """Return the Sera rate-limit group an API-key request counts against."""
+    if method == "GET":
+        return "read"
+    return "cancel" if path.endswith("/cancel") else "trade"
+
+
+def _retryable(error: errors.SeraError, method: str, path: str) -> bool:
+    """Return whether a failed request is safe and useful to send again."""
+    if isinstance(error, errors.SeraRateLimit):
+        # Rejected by the rate limiter before Sera acted on it.
+        return True
+    # A server error may come after Sera acted, so only repeat requests whose
+    # repetition is harmless.
+    return error.status_code == 503 and (method == "GET" or path in _REPEATABLE_POSTS)
+
+
+def _retry_wait(response: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before a retry: Retry-After if given, else backoff."""
+    try:
+        wait = float(response.headers.get("Retry-After", ""))
+    except ValueError:
+        wait = float(2**attempt)
+    return min(max(wait, 0.0), MAX_RETRY_WAIT_S)
 
 
 def _require_secure_base_url(base_url: str) -> None:

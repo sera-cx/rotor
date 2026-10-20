@@ -72,6 +72,12 @@ STALE_REMINDER_SECONDS = 6 * 60 * 60.0
 # An order's fills are counted this long after it expires, so a match made just
 # before expiry has time to show up in its fill list.
 SETTLE_GRACE_SECONDS = 60.0
+# An order whose fills cannot be read this many ticks in a row (about an hour at
+# the default cadence) is reported as an error instead of only a warning.
+READ_FAILURE_ALERT_TICKS = 12
+# When the cancel-cooldown guard clears within this many seconds, the tick waits
+# for it instead of being skipped.
+MAX_GUARD_WAIT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -734,6 +740,8 @@ def run(
         state.replace_active(live)
 
     restart_after_update = False
+    # order id -> consecutive ticks its fills could not be read.
+    read_failures: dict[str, int] = {}
     # Stall watchdog: alert the operator (once per window) when the loop has not
     # placed a fresh quote set for a while because every tick is skipping
     # (stale prices, fill-poll failures, a stuck cancel). The hourly heartbeat
@@ -792,15 +800,20 @@ def run(
             # Phase 1: read the fills of every order rotor accounts for: its live
             # quotes and every placed order not yet settled. Fully filled live
             # orders stop being tracked, and positions are brought up to date.
-            # A failure skips the tick rather than quote on missing fills.
+            # A market with an order whose fills could not be read is not quoted
+            # this tick, rather than quoted on missing fills; other markets are.
             positions: dict[str, Position] = {}
+            unreadable: set[str] = set()
             if not dry_run:
                 try:
                     unsettled = [] if state is None else state.load_unsettled()
-                    fills = _read_fills(client, [
+                    fills, failed = _read_fills(client, [
                         *(order.order_id for order in unsettled),
                         *(order.order_id for placement in live for order in placement.orders),
                     ])
+                    unreadable = _markets_of(failed, unsettled, live)
+                    read_failures = _report_read_failures(
+                        failed, unsettled, live, read_failures, log=log, notifier=notifier)
                     live = _prune_fully_filled_placements(
                         live, _filled_quantities(fills), log)
                     if state is not None:
@@ -831,6 +844,7 @@ def run(
                     expiration=tick_expiration,
                     log=log,
                     refs=tick_refs,
+                    skip=unreadable,
                 )
             except Exception as exc:
                 log.warning("skip tick: %s", exc)
@@ -882,21 +896,26 @@ def run(
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
-            # Phase 5: local cancel-cooldown guard. With the default 305s cadence
-            # this normally passes, but it protects restarts and manually-shortened
-            # poll intervals.
+            # Phase 5: local cancel-cooldown guard. Orders are placed one after
+            # another, so at the default 305s cadence the newest can still be a
+            # few seconds short of the guard; wait for it then. A longer wait
+            # (restarts, shortened poll intervals) skips the tick instead.
             live_orders = [
                 order for placement in live for order in placement.orders]
             if live_orders and not all_requote_safe(live_orders, min_requote_seconds):
-                oldest_ready = min(
-                    order.placed_at + min_requote_seconds for order in live_orders
+                wait_s = (
+                    max(order.placed_at for order in live_orders)
+                    + min_requote_seconds - time.time()
                 )
-                wait_s = max(0.0, oldest_ready - time.time())
-                log.debug("skip tick: waiting %.1fs for cancel cooldown guard", wait_s)
-                if once:
-                    return 0
-                sleep_remaining(tick_started, poll_seconds, stop)
-                continue
+                if wait_s > MAX_GUARD_WAIT_SECONDS:
+                    log.debug("skip tick: cancel cooldown guard clears in %.1fs", wait_s)
+                    if once:
+                        return 0
+                    sleep_remaining(tick_started, poll_seconds, stop)
+                    continue
+                log.debug("waiting %.1fs for the cancel cooldown guard", wait_s)
+                if stop.wait(wait_s):
+                    continue
 
             # Phase 6: cancel-first. Clear all resting placements before placing
             # fresh ones so the new quotes cannot self-match (STP_BLOCKED) the
@@ -1117,8 +1136,9 @@ def _build_tick_intents(
     log: logging.Logger,
     refs: TickReferences | None = None,
     now: float | None = None,
+    skip: set[str] | frozenset[str] = frozenset(),
 ) -> list[OrderIntent]:
-    """Build all order intents for one loop tick.
+    """Build all order intents for one loop tick, leaving out `skip` markets.
 
     Each pair is isolated: an unavailable reference, a rate past its carry
     limit, or a quote that fails market minimums skips only that pair, so one
@@ -1128,6 +1148,8 @@ def _build_tick_intents(
     now = time.time() if now is None else now
     out: list[OrderIntent] = []
     for runtime in runtimes:
+        if runtime.config.market in skip:
+            continue
         try:
             out.extend(
                 _intents_for_runtime(
@@ -1698,17 +1720,83 @@ def _load_live_placements(
     return out
 
 
-def _read_fills(client: SeraClient, order_ids: list[str]) -> dict[str, list[dict]]:
-    """Fetch each order's fills once. An order Sera does not know has none."""
-    out: dict[str, list[dict]] = {}
+def _read_fills(
+    client: SeraClient, order_ids: list[str]
+) -> tuple[dict[str, list[dict]], dict[str, Exception]]:
+    """Fetch each order's fills once, returning the fills and any failures.
+
+    An order Sera does not know has no fills. An order whose fills cannot be
+    read, or include a row rotor cannot parse, is returned with its error
+    instead, so a bad read affects only that order's market.
+    """
+    fills: dict[str, list[dict]] = {}
+    failed: dict[str, Exception] = {}
     for order_id in dict.fromkeys(order_ids):
         try:
-            out[order_id] = client.get_order_fills(order_id)
+            rows = client.get_order_fills(order_id)
+            for row in rows:
+                _filled_base_qty(row)
         except errors.SeraError as exc:
-            if exc.status_code != 404:
-                raise
-            out[order_id] = []
-    return out
+            if exc.status_code == 404:
+                fills[order_id] = []
+            else:
+                failed[order_id] = exc
+            continue
+        except Exception as exc:
+            failed[order_id] = exc
+            continue
+        fills[order_id] = rows
+    return fills, failed
+
+
+def _markets_of(
+    order_ids: dict[str, Exception] | set[str],
+    unsettled: list[UnsettledOrder],
+    live: list[LivePlacement],
+) -> set[str]:
+    """Return the markets of the given ledger or live orders."""
+    market_of = {order.order_id: order.market for order in unsettled}
+    for placement in live:
+        for order in placement.orders:
+            market_of.setdefault(order.order_id, order.market)
+    return {market_of[order_id] for order_id in order_ids if market_of.get(order_id)}
+
+
+def _report_read_failures(
+    failed: dict[str, Exception],
+    unsettled: list[UnsettledOrder],
+    live: list[LivePlacement],
+    previous: dict[str, int],
+    *,
+    log: logging.Logger,
+    notifier: TelegramNotifier | None,
+) -> dict[str, int]:
+    """Log this tick's unreadable orders and return their consecutive counts.
+
+    Each tick logs one warning per affected market. A market whose orders stay
+    unreadable for READ_FAILURE_ALERT_TICKS ticks in a row is reported once as
+    an error (and through Telegram when enabled), since it will not quote until
+    those fills can be read.
+    """
+    counts = {order_id: previous.get(order_id, 0) + 1 for order_id in failed}
+    by_market: dict[str, list[str]] = {}
+    for order_id in failed:
+        market = next(iter(_markets_of({order_id}, unsettled, live)), "?")
+        by_market.setdefault(market, []).append(order_id)
+    for market, order_ids in sorted(by_market.items()):
+        error = failed[order_ids[0]]
+        log.warning(
+            "could not read fills for %s order(s) %s; not quoting it this tick: %s",
+            market, ",".join(order_ids), error,
+        )
+        if max(counts[order_id] for order_id in order_ids) == READ_FAILURE_ALERT_TICKS:
+            log.error(
+                "%s fills unreadable for %d ticks in a row; it is not quoting",
+                market, READ_FAILURE_ALERT_TICKS,
+            )
+            if notifier is not None:
+                notifier.notify_error(f"{market} not quoting", error)
+    return counts
 
 
 def _filled_quantities(fills: dict[str, list[dict]]) -> dict[str, Decimal]:
@@ -1756,7 +1844,10 @@ def _positions_for_quoting(
     """
     in_flight: list[tuple[UnsettledOrder, Decimal]] = []
     for order in unsettled:
-        rows = fills.get(order.order_id, [])
+        if order.order_id not in fills:
+            # Unreadable this tick: settle nothing (its market is not quoted).
+            continue
+        rows = fills[order.order_id]
         settled = _settled_fill_qty(rows)
         if settled is None or server_now < order.expiration + SETTLE_GRACE_SECONDS:
             in_flight.append((order, _visible_fill_qty(rows)))
