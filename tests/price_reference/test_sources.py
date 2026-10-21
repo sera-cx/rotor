@@ -23,6 +23,17 @@ def test_market_to_iso_pair_defaults():
     assert market_to_iso_pair("myrt_usdt") == ("MYR", "USD")
 
 
+def test_every_earn_majors_token_has_a_built_in_currency():
+    # Earn's default basket, in both orientations Sera may list a pair.
+    expected = {
+        "EURC": "EUR", "JPYC": "JPY", "TGBP": "GBP", "AXCNH": "CNH",
+        "AUDD": "AUD", "CADC": "CAD", "VCHF": "CHF", "XSGD": "SGD",
+    }
+    for token, iso in expected.items():
+        assert market_to_iso_pair(f"{token}/USDC") == (iso, "USD")
+        assert market_to_iso_pair(f"USDT/{token}") == ("USD", iso)
+
+
 def _wise_quote_response(options):
     return {
         "rate": 0.78,

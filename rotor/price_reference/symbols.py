@@ -2,20 +2,38 @@
 
 from __future__ import annotations
 
-# Built-in mappings cover the token symbols the simple FX market maker expects
-# to see most often.
+# Every stablecoin the Earn setup offers, by the fiat currency it tracks, plus
+# the plain ISO codes. AXCNH tracks offshore yuan (CNH), not onshore CNY: a
+# source without CNH skips the pair rather than quote off a different rate.
+_TOKENS_BY_ISO: dict[str, tuple[str, ...]] = {
+    "USD": ("USDC", "USDT", "USD"),
+    "AED": ("AEDZ", "AED"),
+    "ARS": ("WARS", "ARS"),
+    "AUD": ("AUDD", "AUDF", "AUDM", "AUDX", "AUD"),
+    "BRL": ("BRLV", "BRZ", "BRL"),
+    "CAD": ("CADC", "QCAD", "CAD"),
+    "CHF": ("CHFAU", "VCHF", "CHF"),
+    "CLP": ("WCLP", "CLP"),
+    "CNH": ("AXCNH", "CNH"),
+    "COP": ("WCOP", "COP"),
+    "EUR": (
+        "EUR0", "EURAU", "EURC", "EURE", "EURI", "EUROP", "EURQ", "EURR", "EURS",
+        "EURT", "VEUR", "EUR",
+    ),
+    "GBP": ("TGBP", "GBP"),
+    "IDR": ("IDRT", "IDR"),
+    "JPY": ("JPYC", "JPY"),
+    "MXN": ("MXNB", "MXNT", "MXN"),
+    "MYR": ("MYRC", "MYRT", "MYR"),
+    "NGN": ("CNGN", "NGN"),
+    "NZD": ("NZDD", "NZD"),
+    "PEN": ("WPEN", "PEN"),
+    "SGD": ("XSGD", "SGD"),
+    "TRY": ("ITRY", "TRYB", "TRY"),
+    "ZAR": ("ZARP", "ZAR"),
+}
 DEFAULT_TOKEN_TO_ISO: dict[str, str] = {
-    "USDC": "USD",
-    "USDT": "USD",
-    "USD": "USD",
-    "XSGD": "SGD",
-    "SGD": "SGD",
-    "MYRC": "MYR",
-    "MYRT": "MYR",
-    "MYR": "MYR",
-    "EURC": "EUR",
-    "EURT": "EUR",
-    "EUR": "EUR",
+    token: iso for iso, tokens in _TOKENS_BY_ISO.items() for token in tokens
 }
 
 

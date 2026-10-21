@@ -676,6 +676,8 @@ def run(
         log.error("Sera bootstrap failed: %s", exc)
         return 1
 
+    # market -> why that configured pair is not quoted.
+    skipped: dict[str, str] = {}
     try:
         # Convert static pair config into runtime objects with market metadata,
         # algos, price oracles, and ISO symbols.
@@ -685,6 +687,7 @@ def run(
             max_reference_age_s=max_reference_age_s,
             carry_stale=not halt_on_stale_reference,
             log=log,
+            skipped=skipped,
         )
         # Ensure at least one configured budget can actually be spent by a pair.
         _validate_budget_reachability(config, runtimes)
@@ -692,7 +695,6 @@ def run(
         log.error("VL boot config failed: %s", exc)
         return 1
     markets = {rt.config.market for rt in runtimes}
-    unlisted = [pair.market for pair in config.pairs if pair.market not in markets]
 
     notifier = TelegramNotifier(log=log) if telegram else None
     if notifier is not None:
@@ -701,10 +703,11 @@ def run(
             f"budgets={','.join(sorted(config.budget_tokens))}"
             f"{' (dry-run)' if dry_run else ''}"
         )
-        if unlisted:
+        if skipped:
             notifier.send_raw(
-                f"⚠️ Not quoting {', '.join(unlisted)}: not listed on Sera. "
-                "The other pairs are quoting; see the log for details.",
+                "⚠️ Not quoting "
+                + "; ".join(f"{market} ({why})" for market, why in skipped.items())
+                + ". The other pairs are quoting.",
                 important=True,
             )
 
@@ -1038,13 +1041,16 @@ def _build_runtimes(
     max_reference_age_s: float | None,
     carry_stale: bool = True,
     log: logging.Logger | None = None,
+    skipped: dict[str, str] | None = None,
 ) -> list[PairRuntime]:
-    """Build runtime objects for every configured pair Sera lists.
+    """Build runtime objects for every configured pair rotor can quote.
 
-    A configured market Sera does not list (delisted, or configured in the
-    other orientation) is skipped with a warning so the other pairs still
-    quote. Raises only when Sera lists none of them.
+    A pair whose market Sera does not list (delisted, or configured in the other
+    orientation) or whose token has no currency mapping is skipped with a
+    warning, and its reason recorded in `skipped`, so the other pairs still
+    quote. Raises only when no pair is left.
     """
+    skipped = {} if skipped is None else skipped
     log = log or logging.getLogger("rotor.mm.vl")
     # Token-to-ISO mapping is loaded once and reused for all configured pairs.
     token_to_iso = load_token_to_iso()
@@ -1054,13 +1060,16 @@ def _build_runtimes(
     for pair in config.pairs:
         info = client.markets_by_symbol.get(pair.market)
         if info is None:
-            log.warning(
-                "not quoting %s: %s", pair.market,
-                _unlisted_reason(pair.market, client.markets_by_symbol),
-            )
+            skipped[pair.market] = _unlisted_reason(pair.market, client.markets_by_symbol)
+            log.warning("not quoting %s: %s", pair.market, skipped[pair.market])
             continue
         # Reference providers work in ISO symbols, not Sera token symbols.
-        iso_base, iso_quote = market_to_iso_pair(pair.market, token_to_iso)
+        try:
+            iso_base, iso_quote = market_to_iso_pair(pair.market, token_to_iso)
+        except ValueError as exc:
+            skipped[pair.market] = str(exc)
+            log.warning("not quoting %s: %s", pair.market, exc)
+            continue
         # Construct each provider adapter once per price_source.
         if pair.price_source not in source_cache:
             source_cache[pair.price_source] = load_price_reference_source(pair.price_source)
@@ -1084,8 +1093,8 @@ def _build_runtimes(
         )
     if not runtimes:
         raise ValueError(
-            "Sera lists none of the configured markets "
-            f"(available={sorted(client.markets_by_symbol)})"
+            "no configured pair can be quoted: "
+            + "; ".join(f"{market} ({why})" for market, why in skipped.items())
         )
     return runtimes
 

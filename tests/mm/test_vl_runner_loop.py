@@ -638,8 +638,25 @@ def test_run_skips_a_market_sera_does_not_list_and_alerts(monkeypatch, caplog):
         "not quoting USDC/EURC: Sera lists this pair as EURC/USDC; configure it that way"
         in caplog.text
     )
-    alerts = notifier.containing("Not quoting JPYC/USDC, USDC/EURC: not listed on Sera")
-    assert alerts == [(alerts[0][0], True)]
+    alerts = notifier.containing("Not quoting JPYC/USDC (Sera does not list this market)")
+    assert len(alerts) == 1 and alerts[0][1] is True
+    assert "USDC/EURC (Sera lists this pair as EURC/USDC" in alerts[0][0]
+
+
+def test_run_skips_a_pair_whose_token_has_no_currency_mapping(monkeypatch, caplog):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    # The operator's mapping leaves EURC out (the built-in map is replaced here).
+    monkeypatch.setattr(vr, "market_to_iso_pair", lambda market, mapping: (
+        ("SGD", "USD") if market == "XSGD/USDC"
+        else (_ for _ in ()).throw(ValueError("no ISO mapping for token 'EURC'"))
+    ))
+    _stop_after_sleeps(monkeypatch, 1)
+
+    assert vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:") == 0
+    assert {row["market"] for row in client.standalone_places} == {"XSGD/USDC"}
+    assert "not quoting EURC/USDC: no ISO mapping for token 'EURC'" in caplog.text
 
 
 def test_run_refuses_to_start_when_sera_lists_none_of_the_markets(monkeypatch, caplog):
@@ -649,7 +666,7 @@ def test_run_refuses_to_start_when_sera_lists_none_of_the_markets(monkeypatch, c
     _stop_after_sleeps(monkeypatch, 1)
 
     assert vr.run(config_path="vl.toml", state_path=":memory:") == 1
-    assert "Sera lists none of the configured markets" in caplog.text
+    assert "no configured pair can be quoted: JPYC/USDC (Sera does not list" in caplog.text
     assert client.batch_places == [] and client.standalone_places == []
 
 
