@@ -659,6 +659,24 @@ class SeraClient:
         """Return a signed-payload expiration derived from Sera server time."""
         return self.get_server_time() + int(ttl_seconds)
 
+    def get_vault_balances(self) -> dict[str, Decimal]:
+        """Return each token's vault total (available + frozen) by symbol, in token units.
+
+        Orders spend vault funds, so this is what can back them. Frozen funds
+        count because they are mostly held by rotor's own resting orders, which
+        each tick cancels and replaces. Tokens with no balance are omitted.
+        """
+        body = self._request(
+            "GET", "/balances", params={"owner_address": self.owner_address})
+        out: dict[str, Decimal] = {}
+        for row in body.get("balances") or []:
+            symbol = str(row.get("symbol") or "").upper()
+            if symbol:
+                out[symbol] = (
+                    Decimal(str(row["vault_total"])) / (Decimal(10) ** int(row["decimals"]))
+                )
+        return out
+
     def get_open_orders(self, status: str = "pending") -> list[dict]:
         """List current open orders for this wallet."""
         # Authenticated endpoint scoped by owner address and status.

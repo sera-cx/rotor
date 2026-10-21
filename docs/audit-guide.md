@@ -144,8 +144,10 @@ VL behavior:
   each standalone order counts in full, and batches and standalone orders on one
   token add up. A tick is rejected when that exceeds the token's budget.
 - Before that check, any single order that would spend more than its token's
-  budget is trimmed to fit (size rounded down), or dropped if trimming takes it
-  below the market minimum, so ordinary price drift cannot fail the tick.
+  budget, or than the vault holds of that token (from one `GET /balances` per
+  tick), is trimmed to fit (size rounded down), or dropped if trimming takes it
+  below the market minimum. An order on a token the vault does not hold is not
+  sent. If balances cannot be read, budgets alone apply.
 - Oversized same-spent-token groups are split into chunks of at most Sera's batch
   maximum, so one large group cannot fail every tick.
 - Sera remains the authoritative shared-budget enforcer.

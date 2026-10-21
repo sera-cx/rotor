@@ -205,7 +205,8 @@ def test_an_order_the_price_pushed_over_budget_is_trimmed_to_fit():
     under = _intent("EURC/USDC", "bid", "USDC", price="0.995", qty="1000")
     unbudgeted = _intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="5000")
 
-    out = vr._within_budgets([over, under, unbudgeted], _market(), _vl_config(), LOG)
+    out = vr._within_limits(
+        [over, under, unbudgeted], _market(), BUDGETS, None, LOG)
 
     # 1,000 / 0.995 = 1,005.0251..., rounded down to the 0.01 size step.
     assert out[0].qty_base == Decimal("1005.02")
@@ -217,7 +218,7 @@ def test_an_ask_spending_a_budgeted_token_is_trimmed_to_the_budget():
     # On a USDC-base market the ask is what spends USDC.
     ask = _intent("USDC/AUDD", "ask", "USDC", price="1.52", qty="1200")
 
-    out = vr._within_budgets([ask], _market(), _vl_config(), LOG)
+    out = vr._within_limits([ask], _market(), BUDGETS, None, LOG)
 
     assert out[0].qty_base == Decimal("1000")
 
@@ -225,11 +226,46 @@ def test_an_ask_spending_a_budgeted_token_is_trimmed_to_the_budget():
 def test_an_order_too_small_after_trimming_is_dropped(caplog):
     bid = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="100")
 
-    out = vr._within_budgets(
-        [bid], _market(min_bid_quote="1"), _vl_config(budget="0.5"), LOG)
+    out = vr._within_limits(
+        [bid], _market(min_bid_quote="1"), {"USDC": Decimal("0.5")}, None, LOG)
 
     assert out == []
     assert "XSGD/USDC bid dropped: trimmed to its USDC budget it is too small" in caplog.text
+
+
+BUDGETS = {"USDC": Decimal("1000")}
+
+
+def test_spend_limit_is_the_lower_of_budget_and_vault_balance():
+    funds = {"USDC": Decimal("600"), "EURC": Decimal("50")}
+
+    assert vr._spend_limit("USDC", BUDGETS, funds) == (Decimal("600"), "balance")
+    assert vr._spend_limit("USDC", BUDGETS, {"USDC": Decimal("5000")}) == (Decimal("1000"), "budget")
+    assert vr._spend_limit("EURC", BUDGETS, funds) == (Decimal("50"), "balance")
+    # A token the wallet does not hold cannot be spent at all.
+    assert vr._spend_limit("XSGD", BUDGETS, funds) == (Decimal("0"), "balance")
+    # Without balances, budgets alone apply and unbudgeted tokens are unlimited.
+    assert vr._spend_limit("USDC", BUDGETS, None) == (Decimal("1000"), "budget")
+    assert vr._spend_limit("XSGD", BUDGETS, None) is None
+
+
+def test_orders_are_fitted_to_what_the_wallet_holds(caplog):
+    caplog.set_level(logging.DEBUG)
+    bid = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="1000")
+    unheld_ask = _intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="1000")
+    held_ask = _intent("EURC/USDC", "ask", "EURC", price="1.005", qty="1000")
+    funds = {"USDC": Decimal("600"), "EURC": Decimal("50")}
+
+    out = vr._within_limits([bid, unheld_ask, held_ask], _market(), BUDGETS, funds, LOG)
+
+    # 600 / 0.995 = 603.01..., rounded down; the unheld XSGD ask is left out
+    # quietly; the EURC ask shrinks to the 50 EURC held.
+    assert [(i.market, i.side, i.qty_base) for i in out] == [
+        ("XSGD/USDC", "bid", Decimal("603.01")),
+        ("EURC/USDC", "ask", Decimal("50")),
+    ]
+    assert "XSGD/USDC ask left out: the wallet holds no XSGD" in caplog.text
+    assert "WARNING" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

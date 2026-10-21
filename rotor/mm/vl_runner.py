@@ -815,7 +815,9 @@ def run(
             # this tick, rather than quoted on missing fills; other markets are.
             positions: dict[str, Position] = {}
             unreadable: set[str] = set()
+            funds: dict[str, Decimal] | None = None
             if not dry_run:
+                funds = _read_funds(client, log)
                 try:
                     unsettled = [] if state is None else state.load_unsettled()
                     fills, failed = _read_fills(client, [
@@ -856,6 +858,7 @@ def run(
                     log=log,
                     refs=tick_refs,
                     skip=unreadable,
+                    funds=funds,
                 )
             except Exception as exc:
                 log.warning("skip tick: %s", exc)
@@ -1175,6 +1178,7 @@ def _build_tick_intents(
     refs: TickReferences | None = None,
     now: float | None = None,
     skip: set[str] | frozenset[str] = frozenset(),
+    funds: dict[str, Decimal] | None = None,
 ) -> list[OrderIntent]:
     """Build all order intents for one loop tick, leaving out `skip` markets.
 
@@ -1184,6 +1188,7 @@ def _build_tick_intents(
     When `refs` is given it records what each pair quoted on or why it skipped.
     """
     now = time.time() if now is None else now
+    budgets = {budget.token: budget.amount for budget in config.budgets}
     out: list[OrderIntent] = []
     for runtime in runtimes:
         if runtime.config.market in skip:
@@ -1198,6 +1203,8 @@ def _build_tick_intents(
                     log=log,
                     refs=refs,
                     now=now,
+                    budgets=budgets,
+                    funds=funds,
                 )
             )
         except Exception as exc:
@@ -1216,6 +1223,8 @@ def _intents_for_runtime(
     log: logging.Logger,
     refs: TickReferences | None = None,
     now: float,
+    budgets: dict[str, Decimal],
+    funds: dict[str, Decimal] | None,
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
     # Fetch a fresh reference for this pair, priced for the worked base size so
@@ -1245,7 +1254,7 @@ def _intents_for_runtime(
     if position is not None:
         intents = _with_return_order(
             intents, runtime, position, config, now=now, log=log)
-    intents = _within_budgets(intents, runtime.info, config, log)
+    intents = _within_limits(intents, runtime.info, budgets, funds, log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
     return intents
@@ -1288,28 +1297,68 @@ def _intents_from_quote(
     return out
 
 
-def _within_budgets(
+def _read_funds(client: SeraClient, log: logging.Logger) -> dict[str, Decimal] | None:
+    """Read the wallet's vault balances, or None (budgets only) if that fails."""
+    try:
+        return client.get_vault_balances()
+    except Exception as exc:
+        log.warning("could not read vault balances; sizing to budgets only: %s", exc)
+        return None
+
+
+def _spend_limit(
+    token: str,
+    budgets: dict[str, Decimal],
+    funds: dict[str, Decimal] | None,
+) -> tuple[Decimal, str] | None:
+    """Most one order may spend of `token`, and what sets it; None if unlimited.
+
+    A budgeted token is capped by its budget. When the wallet's vault balances
+    are known, every token is also capped by what the vault holds, so a token
+    the wallet does not hold has a limit of zero.
+    """
+    budget = budgets.get(token)
+    if funds is None:
+        return None if budget is None else (budget, "budget")
+    held = funds.get(token, Decimal("0"))
+    if budget is not None and budget <= held:
+        return budget, "budget"
+    return held, "balance"
+
+
+def _within_limits(
     intents: list[OrderIntent],
     info,
-    config: VLConfig,
+    budgets: dict[str, Decimal],
+    funds: dict[str, Decimal] | None,
     log: logging.Logger,
 ) -> list[OrderIntent]:
-    """Trim any order that would spend more than its token's budget.
+    """Fit each order to what it may spend: its token's budget and vault balance.
 
     Sizes are fixed in base tokens, so a bid's quote spend rises with the price.
-    An order the price has pushed over its budget is cut to what the budget
-    buys, rounded down to the market's size step, instead of failing the tick's
-    budget check. One that trimming takes below the market minimum is dropped.
+    An order over its limit is cut to what the limit buys, rounded down to the
+    market's size step, instead of failing the tick's budget check or being
+    rejected by Sera. An order on a token the wallet does not hold is left out,
+    and one that trimming takes below the market minimum is dropped.
     """
-    budgets = {budget.token: budget.amount for budget in config.budgets}
     out: list[OrderIntent] = []
     for intent in intents:
-        budget = budgets.get(intent.spent_token)
-        if budget is None or _intent_spend_amount(intent) <= budget:
+        cap = _spend_limit(intent.spent_token, budgets, funds)
+        if cap is None:
             out.append(intent)
             continue
+        limit, source = cap
+        if _intent_spend_amount(intent) <= limit:
+            out.append(intent)
+            continue
+        if limit <= 0:
+            log.debug(
+                "%s %s left out: the wallet holds no %s",
+                intent.market, intent.side, intent.spent_token,
+            )
+            continue
         # A bid spends quote tokens (qty x price); an ask spends base tokens (qty).
-        qty = _quantize_qty(info, budget if intent.side == "ask" else budget / intent.price)
+        qty = _quantize_qty(info, limit if intent.side == "ask" else limit / intent.price)
         try:
             _validate_minimums(
                 info,
@@ -1319,20 +1368,14 @@ def _within_budgets(
             )
         except ValueError as exc:
             log.warning(
-                "%s %s dropped: trimmed to its %s budget it is too small (%s)",
-                intent.market,
-                intent.side,
-                intent.spent_token,
-                exc,
+                "%s %s dropped: trimmed to its %s %s it is too small (%s)",
+                intent.market, intent.side, intent.spent_token, source, exc,
             )
             continue
         log.debug(
-            "%s %s trimmed from %s to %s to fit the %s budget",
-            intent.market,
-            intent.side,
-            fmt(intent.qty_base),
-            fmt(qty),
-            intent.spent_token,
+            "%s %s trimmed from %s to %s to fit the %s %s",
+            intent.market, intent.side, fmt(intent.qty_base), fmt(qty),
+            intent.spent_token, source,
         )
         out.append(replace(intent, qty_base=qty))
     return out

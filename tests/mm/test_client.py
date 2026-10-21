@@ -973,3 +973,17 @@ def test_retries_give_up_after_two():
     with pytest.raises(errors_mod.SeraRateLimit):
         client._request("GET", "/fills/a")
     assert len(sent) == 3
+
+
+def test_vault_balances_are_totals_in_token_units():
+    routes = _build_mock_routes({"GET /balances": {"owner_address": OWNER, "balances": [
+        {"symbol": "USDC", "decimals": 6, "wallet_balance": "9000000",
+         "vault_available": "400000000", "vault_frozen": "100500000", "vault_total": "500500000"},
+        {"symbol": "myrc", "decimals": 18, "vault_total": "2500000000000000000"},
+    ]}})
+    captured: list[dict] = []
+    client = _make_client(routes, captured)
+
+    # Wallet (non-vault) funds cannot back orders and are not counted.
+    assert client.get_vault_balances() == {"USDC": Decimal("500.5"), "MYRC": Decimal("2.5")}
+    assert captured[-1]["query"] == {"owner_address": OWNER}

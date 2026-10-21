@@ -136,6 +136,8 @@ class _FakeClient:
         self.fill_status = fill_status
         # Asks spend base tokens; a wallet funded only with USDC cannot back them.
         self.reject_asks = reject_asks
+        # Vault balances by symbol; None means GET /balances fails.
+        self.balances: dict[str, Decimal] | None = None
         # Fill reads for this market's orders fail (rate-limited) on these ticks.
         self.unreadable_market: str | None = None
         self.unreadable_ticks: range = range(0)
@@ -220,6 +222,12 @@ class _FakeClient:
         })
         self.events.append(("place_order", order_id, market, side))
         return OrderRecord(order_id, self._uuid_int)
+
+    def get_vault_balances(self) -> dict[str, Decimal]:
+        self.events.append(("balances",))
+        if self.balances is None:
+            raise RuntimeError("balances unavailable")
+        return dict(self.balances)
 
     def market_of(self, order_id: str) -> str | None:
         rows = [leg for batch in self.batch_places for leg in batch["legs"]]
@@ -587,6 +595,29 @@ def test_run_waits_a_few_seconds_for_the_cancel_guard_instead_of_skipping(monkey
             state_path=tmp_path / f"state-{ticks_placed}.sqlite",
         ) == 0
         assert len(client.batch_places) == ticks_placed
+
+
+def test_run_does_not_send_orders_the_wallet_cannot_fund(monkeypatch, caplog):
+    # Earn funds only USDC: the asks spend XSGD/EURC the vault does not hold.
+    # With balances known they are not sent at all, so Sera has nothing to
+    # reject and nothing is logged at WARNING or above.
+    client = _FakeClient(reject_asks=True)
+    client.balances = {"USDC": Decimal("100000")}
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _stop_after_sleeps(monkeypatch, 2)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    assert len(client.batch_places) == 2
+    assert client.standalone_places == []
+    assert not [event for event in client.events if event[0] == "rejected"]
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
 
 
 def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):

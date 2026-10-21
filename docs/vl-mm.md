@@ -99,6 +99,11 @@ Rules:
   the whole budget. Sizes are fixed in base tokens, so a rising price raises a
   bid's spend; an order that would spend more than its budget is trimmed to fit
   (and dropped if trimming takes it below the market minimum).
+- Each tick also reads the wallet's vault balances (one `GET /balances`), and no
+  order may spend more of a token than the vault holds. An order on a token the
+  vault does not hold is not sent at all: with only USDC funded, rotor quotes
+  bids on `X/USDC` and no asks until a fill leaves it holding `X`. If the
+  balances cannot be read, budgets alone apply.
 - Markets cannot be duplicated, including inverse duplicates.
 - Sera lists each pair in one orientation (e.g. `USDC/EURC`, not `EURC/USDC`);
   use the symbol `GET /markets` returns. A configured market Sera does not list
