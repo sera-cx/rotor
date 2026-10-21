@@ -684,6 +684,7 @@ def run(
             client,
             max_reference_age_s=max_reference_age_s,
             carry_stale=not halt_on_stale_reference,
+            log=log,
         )
         # Ensure at least one configured budget can actually be spent by a pair.
         _validate_budget_reachability(config, runtimes)
@@ -691,6 +692,7 @@ def run(
         log.error("VL boot config failed: %s", exc)
         return 1
     markets = {rt.config.market for rt in runtimes}
+    unlisted = [pair.market for pair in config.pairs if pair.market not in markets]
 
     notifier = TelegramNotifier(log=log) if telegram else None
     if notifier is not None:
@@ -699,6 +701,12 @@ def run(
             f"budgets={','.join(sorted(config.budget_tokens))}"
             f"{' (dry-run)' if dry_run else ''}"
         )
+        if unlisted:
+            notifier.send_raw(
+                f"⚠️ Not quoting {', '.join(unlisted)}: not listed on Sera. "
+                "The other pairs are quoting; see the log for details.",
+                important=True,
+            )
 
     updater = (
         DailyGitUpdater(interval_seconds=update_interval_seconds)
@@ -1029,21 +1037,28 @@ def _build_runtimes(
     *,
     max_reference_age_s: float | None,
     carry_stale: bool = True,
+    log: logging.Logger | None = None,
 ) -> list[PairRuntime]:
-    """Build runtime objects for every configured pair."""
+    """Build runtime objects for every configured pair Sera lists.
+
+    A configured market Sera does not list (delisted, or configured in the
+    other orientation) is skipped with a warning so the other pairs still
+    quote. Raises only when Sera lists none of them.
+    """
+    log = log or logging.getLogger("rotor.mm.vl")
     # Token-to-ISO mapping is loaded once and reused for all configured pairs.
     token_to_iso = load_token_to_iso()
     # Reuse one source adapter per provider name to avoid duplicate HTTP clients.
     source_cache = {}
     runtimes: list[PairRuntime] = []
     for pair in config.pairs:
-        # Each configured market must be present in Sera's bootstrapped cache.
         info = client.markets_by_symbol.get(pair.market)
         if info is None:
-            raise ValueError(
-                f"Sera market {pair.market} not available "
-                f"(available={sorted(client.markets_by_symbol)})"
+            log.warning(
+                "not quoting %s: %s", pair.market,
+                _unlisted_reason(pair.market, client.markets_by_symbol),
             )
+            continue
         # Reference providers work in ISO symbols, not Sera token symbols.
         iso_base, iso_quote = market_to_iso_pair(pair.market, token_to_iso)
         # Construct each provider adapter once per price_source.
@@ -1067,7 +1082,21 @@ def _build_runtimes(
                 iso_quote=iso_quote,
             )
         )
+    if not runtimes:
+        raise ValueError(
+            "Sera lists none of the configured markets "
+            f"(available={sorted(client.markets_by_symbol)})"
+        )
     return runtimes
+
+
+def _unlisted_reason(market: str, markets_by_symbol: dict) -> str:
+    """Explain why a configured market is not quoted, hinting at its inverse."""
+    base, quote = market.split("/", 1)
+    inverse = f"{quote}/{base}"
+    if inverse in markets_by_symbol:
+        return f"Sera lists this pair as {inverse}; configure it that way"
+    return "Sera does not list this market"
 
 
 def _validate_budget_reachability(config: VLConfig, runtimes: list[PairRuntime]) -> None:

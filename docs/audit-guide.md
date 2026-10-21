@@ -136,6 +136,8 @@ VL behavior:
 
 - Intents are grouped by spent token.
 - VL is used only for budgeted groups meeting Sera's batch minimum.
+- A configured market Sera does not list at boot is skipped with a warning and
+  (with `--telegram`) an important alert; boot fails only if Sera lists none.
 - Singleton or unbudgeted groups use standalone placement.
 - Local budget checks count spend the way Sera locks it: a VL batch counts as
   its largest leg (siblings share one budget and only one can fill at a time),

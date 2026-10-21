@@ -613,6 +613,46 @@ def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):
     assert len(client.active_orders) == 2
 
 
+def test_run_skips_a_market_sera_does_not_list_and_alerts(monkeypatch, caplog):
+    # JPYC/USDC is not listed (delisted, say) and EURC is configured in the
+    # opposite orientation: both are skipped, XSGD/USDC still quotes.
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
+    config = _config(pairs=[_pair("XSGD/USDC"), _pair("JPYC/USDC"), _pair("USDC/EURC")])
+    _wire_runner(monkeypatch, config=config, client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _stop_after_sleeps(monkeypatch, 1)
+
+    result = vr.run(
+        config_path="vl.toml",
+        min_requote_seconds=0.0,
+        telegram=True,
+        state_path=":memory:",
+    )
+
+    assert result == 0
+    assert {row["market"] for row in client.standalone_places} == {"XSGD/USDC"}
+    assert "not quoting JPYC/USDC: Sera does not list this market" in caplog.text
+    assert (
+        "not quoting USDC/EURC: Sera lists this pair as EURC/USDC; configure it that way"
+        in caplog.text
+    )
+    alerts = notifier.containing("Not quoting JPYC/USDC, USDC/EURC: not listed on Sera")
+    assert alerts == [(alerts[0][0], True)]
+
+
+def test_run_refuses_to_start_when_sera_lists_none_of_the_markets(monkeypatch, caplog):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
+    _wire_runner(monkeypatch, config=_config(pairs=[_pair("JPYC/USDC")]), client=client, source=source)
+    _stop_after_sleeps(monkeypatch, 1)
+
+    assert vr.run(config_path="vl.toml", state_path=":memory:") == 1
+    assert "Sera lists none of the configured markets" in caplog.text
+    assert client.batch_places == [] and client.standalone_places == []
+
+
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):
     client = _FakeClient()
     source = _SequencedSource(

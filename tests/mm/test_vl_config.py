@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
-from rotor.mm.vl_config import parse_vl_config
+# vl_config's TOML parser: tomllib on Python 3.11+, tomli on 3.10.
+from rotor.mm.vl_config import parse_vl_config, tomllib
 
 
 def _config(**overrides):
@@ -120,3 +123,20 @@ def test_parse_vl_config_pair_overrides_inherit_global_defaults():
 
     pair = cfg.pairs[0]
     assert pair.fixed_bps == Decimal("9")
+
+
+def test_a_global_setting_written_inside_a_budget_table_is_rejected():
+    # In TOML, fixed_bps after the [[budget]] header belongs to that budget.
+    with pytest.raises(ValueError, match="unknown key.*fixed_bps.*must come before"):
+        parse_vl_config(_config(budget=[{"token": "USDC", "amount": "5000", "fixed_bps": "50"}]))
+
+
+@pytest.mark.parametrize("doc", ["README.md", "docs/vl-mm.md"])
+def test_the_documented_example_config_sets_what_it_shows(doc):
+    text = (Path(__file__).resolve().parents[2] / doc).read_text()
+    example = re.search(r"```toml\n(.*?)```", text, re.S).group(1)
+    cfg = parse_vl_config(tomllib.loads(example))
+
+    assert cfg.fixed_bps == Decimal("50")
+    assert cfg.return_bps == Decimal("2")
+    assert [pair.fixed_bps for pair in cfg.pairs] == [Decimal("50"), Decimal("40")]

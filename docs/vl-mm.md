@@ -65,13 +65,15 @@ every position.
 ## Config
 
 ```toml
-[[budget]]
-token = "USDC"
-amount = "5000"
-
+# Global settings go before the first [[...]] table: TOML puts any key that
+# follows a table header inside that table.
 fixed_bps = "50"
 return_bps = "2"
 return_window_hours = "48"
+
+[[budget]]
+token = "USDC"
+amount = "5000"
 
 [[pair]]
 market = "XSGD/USDC"
@@ -87,6 +89,9 @@ fixed_bps = "40"
 
 Rules:
 
+- Global settings (`fixed_bps`, `return_bps`, `return_window_hours`) go above
+  the first table; a `[[budget]]` holds only `token` and `amount`, and any other
+  key there is rejected.
 - At least one `[[budget]]` is required. A budget caps what one token's orders
   can spend, counted the way Sera locks it: a VL batch counts as its largest leg,
   because its legs share one budget and only one can fill at a time; each
@@ -95,6 +100,10 @@ Rules:
   bid's spend; an order that would spend more than its budget is trimmed to fit
   (and dropped if trimming takes it below the market minimum).
 - Markets cannot be duplicated, including inverse duplicates.
+- Sera lists each pair in one orientation (e.g. `USDC/EURC`, not `EURC/USDC`);
+  use the symbol `GET /markets` returns. A configured market Sera does not list
+  is skipped with a warning (and a Telegram alert with `--telegram`) while the
+  other pairs quote; rotor refuses to start only if Sera lists none of them.
 - `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `wise` needs
   `WISE_API_TOKEN` and `fed` (the official FRED API) needs a free `FRED_API_KEY`;
   `ecb`, `bnm`, and `mas` are keyless.

@@ -40,12 +40,14 @@ override `.env`, and `.env` overrides `rotor/secret.py`.
 ## VL Config
 
 ```toml
+# Global settings go before the first [[...]] table: TOML puts any key that
+# follows a table header inside that table.
+fixed_bps = "50"
+return_bps = "2"
+
 [[budget]]
 token = "USDC"
 amount = "5000"
-
-fixed_bps = "50"
-return_bps = "2"
 
 [[pair]]
 market = "XSGD/USDC"

@@ -117,6 +117,14 @@ def _parse_budgets(value, *, source: str) -> list[BudgetConfig]:
     out: list[BudgetConfig] = []
     seen: set[str] = set()
     for i, row in enumerate(rows):
+        # A global key written after the [[budget]] header lands in this table
+        # (TOML scoping) and would otherwise be silently ignored.
+        extra = sorted(set(row) - {"token", "amount"})
+        if extra:
+            raise ValueError(
+                f"{source}: [[budget]] #{i + 1} has unknown key(s) {', '.join(extra)}; "
+                "global settings must come before the first [[budget]] or [[pair]]"
+            )
         # Token symbols are case-insensitive externally but stored uppercase.
         token = str(row.get("token", "")).strip().upper()
         if not token:
