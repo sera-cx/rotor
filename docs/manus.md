@@ -51,8 +51,15 @@ long-running loop. Each invocation:
 4. exits (`0` placed/ok, non-zero = could not requote this run — the next fire
    retries).
 
-Because state is recovered from Sera each run, losing the local
-`.rotor_state.sqlite` between sandbox sessions is harmless.
+Startup failures share an hourly budget across fires: at most 3 fires per clock
+hour try to start, and after the third failure the rest of that hour's fires
+exit 1 at once without contacting Sera. With `--telegram`, the hour's first and
+third failed startup alert, and so does the first start that succeeds after them.
+
+Keep `.rotor_state.sqlite` on persistent storage. Open orders are recovered from
+Sera on each fire, but the file is the only record of positions held for return
+and of fills still to be counted (and of the startup budget); losing it forgets
+them, and rotor goes back to quoting both sides normally.
 
 ### The scheduled command
 

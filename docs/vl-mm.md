@@ -162,6 +162,18 @@ poetry run rotor mm vl \
 Dry run fetches Sera market metadata and reference prices, builds quotes, and
 prints only logs. It does not sign, place, or cancel orders.
 
+## Startup
+
+Startup loads the config, bootstraps Sera, and builds the pairs. A temporary
+failure (a network error, a Sera server error or rate limit, or Sera reporting
+it is not ready) is retried after 30 and then 60 seconds. At most 3 startup
+attempts run per clock hour; after the third failure rotor waits for the next
+hour (a `--once` fire just exits). The count is kept in `<state>.boot.json`, so
+restarts and scheduled fires share it. Any other failure (a bad config, a wrong
+contract or token, no quotable pair, a locked state file) stops rotor at once.
+With `--telegram`, the hour's first and third failure and the start that
+follows them each send an alert.
+
 ## Live Run
 
 ```bash

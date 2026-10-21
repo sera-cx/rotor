@@ -84,6 +84,10 @@ Positions and return orders:
 
 Live order lifecycle:
 
+- Startup retries only temporary failures (network errors, Sera 5xx/429, a
+  degraded `/health`), at most 3 attempts per clock hour counted in
+  `<state>.boot.json`, then waits for the next hour; other failures stop at
+  once. The Telegram notifier exists before any startup step, so failures alert.
 - Dry-run never signs, places, or cancels.
 - Live mode unlocks the wallet before any signing path.
 - Rotor reattaches configured open orders on startup when possible.

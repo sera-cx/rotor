@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import json
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
+
+import httpx
 
 try:  # pragma: no cover - POSIX-only single-instance lock.
     import fcntl
@@ -78,6 +81,11 @@ READ_FAILURE_ALERT_TICKS = 12
 # When the cancel-cooldown guard clears within this many seconds, the tick waits
 # for it instead of being skipped.
 MAX_GUARD_WAIT_SECONDS = 60.0
+# Startup attempts allowed per clock hour; after that rotor waits for the next
+# hour. The count is kept beside the state file so restarts share it.
+BOOT_ATTEMPTS_PER_HOUR = 3
+# Seconds to wait before the 2nd and 3rd startup attempt within an hour.
+BOOT_RETRY_WAITS = (30.0, 60.0)
 
 
 @dataclass(frozen=True)
@@ -657,46 +665,84 @@ def run(
         format="%(levelname).1s %(message)s",
     )
     log = logging.getLogger("rotor.mm.vl")
-    try:
-        # Load and validate TOML into typed strategy config.
-        config = load_vl_config(config_path)
-    except Exception as exc:
-        log.error("VL config failed: %s", exc)
-        return 1
-
-    try:
-        # Build the Sera client (dry-run uses a signer that must never be
-        # invoked); construction also rejects a non-TLS base URL. Bootstrap then
-        # loads signing domain, executor id, and markets; config limits refresh
-        # VL batch min/max.
-        client = build_client(dry_run=dry_run, log=log)
-        client.bootstrap()
-        client.get_config_limits()
-    except Exception as exc:
-        log.error("Sera bootstrap failed: %s", exc)
-        return 1
-
-    # market -> why that configured pair is not quoted.
-    skipped: dict[str, str] = {}
-    try:
-        # Convert static pair config into runtime objects with market metadata,
-        # algos, price oracles, and ISO symbols.
-        runtimes = _build_runtimes(
-            config,
-            client,
-            max_reference_age_s=max_reference_age_s,
-            carry_stale=not halt_on_stale_reference,
-            log=log,
-            skipped=skipped,
-        )
-        # Ensure at least one configured budget can actually be spent by a pair.
-        _validate_budget_reachability(config, runtimes)
-    except Exception as exc:
-        log.error("VL boot config failed: %s", exc)
-        return 1
+    # Created first so a failed startup can alert and its waits can be stopped.
+    notifier = TelegramNotifier(log=log) if telegram else None
+    stop = StopFlag()
+    stop.install()
+    budget = BootBudget(
+        None if dry_run else _boot_budget_path(state_path or _state_path()))
+    # Startup: load the config, bootstrap Sera, and build the pairs. Temporary
+    # failures (network, Sera 5xx/429, a degraded /health) are retried, at most
+    # BOOT_ATTEMPTS_PER_HOUR attempts per clock hour; then rotor waits for the
+    # next hour. Anything else (config, a wrong contract or token, no quotable
+    # pair) stops rotor at once. Every attempt counts toward the hour.
+    while True:
+        if budget.exhausted():
+            resume = _fmt_utc(budget.next_hour())
+            log.error(
+                "startup failed %d times this hour; next attempt at %s",
+                budget.failures_this_hour(), resume,
+            )
+            if once:
+                return 1
+            if stop.wait(budget.next_hour() - time.time()):
+                return 1
+            budget.start_new_hour()
+            continue
+        try:
+            config, client, runtimes, skipped = _start(
+                config_path,
+                dry_run=dry_run,
+                max_reference_age_s=max_reference_age_s,
+                carry_stale=not halt_on_stale_reference,
+                log=log,
+            )
+            break
+        except Exception as exc:
+            failures = budget.record_failure()
+            temporary = _is_temporary(exc)
+            retrying = temporary and not once and failures < BOOT_ATTEMPTS_PER_HOUR
+            log.error(
+                "startup failed (attempt %d of %d this hour%s): %s",
+                failures, BOOT_ATTEMPTS_PER_HOUR,
+                f"; retrying in {BOOT_RETRY_WAITS[failures - 1]:.0f}s" if retrying else "",
+                exc,
+            )
+            # Alert on the hour's first failure and when the hour's attempts run
+            # out, not on every attempt.
+            if notifier is not None and (failures == 1 or failures >= BOOT_ATTEMPTS_PER_HOUR):
+                notifier.notify_error(
+                    f"rotor could not start (attempt {failures} of "
+                    f"{BOOT_ATTEMPTS_PER_HOUR} this hour"
+                    + (f"; next attempt at {_fmt_utc(budget.next_hour())})"
+                       if failures >= BOOT_ATTEMPTS_PER_HOUR and temporary else ")"),
+                    exc,
+                )
+            if not temporary or once:
+                return 1
+            if retrying and stop.wait(BOOT_RETRY_WAITS[failures - 1]):
+                return 1
     markets = {rt.config.market for rt in runtimes}
 
-    notifier = TelegramNotifier(log=log) if telegram else None
+    updater = (
+        DailyGitUpdater(interval_seconds=update_interval_seconds)
+        if auto_update
+        else None
+    )
+    try:
+        state = None if dry_run else StateStore(state_path or _state_path())
+    except Exception as exc:
+        budget.record_failure()
+        log.error("state store failed: %s", exc)
+        if notifier is not None:
+            notifier.notify_error("rotor could not open its state file", exc)
+        return 1
+    if budget.failures_this_hour() and notifier is not None:
+        notifier.send_raw(
+            f"✅ rotor started after {budget.failures_this_hour()} failed attempt(s)",
+            important=True,
+        )
+    budget.clear()
     if notifier is not None:
         notifier.notify_startup(
             f"VL mm started pairs={len(runtimes)} "
@@ -710,23 +756,8 @@ def run(
                 + ". The other pairs are quoting.",
                 important=True,
             )
-
-    updater = (
-        DailyGitUpdater(interval_seconds=update_interval_seconds)
-        if auto_update
-        else None
-    )
-    try:
-        state = None if dry_run else StateStore(state_path or _state_path())
-    except Exception as exc:
-        log.error("state store failed: %s", exc)
-        return 1
     # Throttled warnings while pairs quote on carried-forward daily rates.
     stale_alerts = StaleReferenceAlerts(runtimes, state=state)
-
-    # Signal handlers flip the flag so finally cleanup can run.
-    stop = StopFlag()
-    stop.install()
     # Reattach to any orders already resting on Sera for the configured markets
     # so a restart does not orphan or duplicate live quotes. In dry-run we never
     # touch live state.
@@ -999,6 +1030,113 @@ def run(
             log.error("auto-update restart failed: %s", exc)
             return 1
     return 0
+
+
+def _start(
+    config_path: str | Path,
+    *,
+    dry_run: bool,
+    max_reference_age_s: float | None,
+    carry_stale: bool,
+    log: logging.Logger,
+) -> tuple[VLConfig, SeraClient, list[PairRuntime], dict[str, str]]:
+    """One startup attempt: load the config, bootstrap Sera, and build the pairs."""
+    config = load_vl_config(config_path)
+    # Construction rejects a non-TLS base URL; bootstrap loads the signing
+    # domain, executor id, and markets; config limits refresh VL batch sizes.
+    client = build_client(dry_run=dry_run, log=log)
+    try:
+        client.bootstrap()
+        client.get_config_limits()
+        # market -> why that configured pair is not quoted.
+        skipped: dict[str, str] = {}
+        runtimes = _build_runtimes(
+            config,
+            client,
+            max_reference_age_s=max_reference_age_s,
+            carry_stale=carry_stale,
+            log=log,
+            skipped=skipped,
+        )
+        # Ensure at least one configured budget can actually be spent by a pair.
+        _validate_budget_reachability(config, runtimes)
+    except Exception:
+        with contextlib.suppress(Exception):
+            client.close()
+        raise
+    return config, client, runtimes, skipped
+
+
+def _is_temporary(exc: Exception) -> bool:
+    """Return whether a startup failure may clear on its own (worth retrying)."""
+    if isinstance(exc, httpx.TransportError | errors.SeraUnavailable):
+        return True
+    return isinstance(exc, errors.SeraError) and (
+        exc.status_code == 429 or exc.status_code >= 500)
+
+
+class BootBudget:
+    """Failed startup attempts in the current clock hour, kept in a small file.
+
+    The file lets `--once` fires and supervisor restarts share one hourly
+    budget. Without a path (dry-run, in-memory state) the count lives only in
+    this process. A file that cannot be read or written counts as empty.
+    """
+
+    def __init__(self, path: str | None) -> None:
+        self.path = path
+        self._hour, self._failures = -1, 0
+        if path is not None:
+            with contextlib.suppress(OSError, ValueError, TypeError, KeyError):
+                saved = json.loads(Path(path).read_text())
+                self._hour, self._failures = int(saved["hour"]), int(saved["failures"])
+
+    @staticmethod
+    def _current_hour() -> int:
+        return int(time.time() // 3600)
+
+    def failures_this_hour(self) -> int:
+        return self._failures if self._hour == self._current_hour() else 0
+
+    def exhausted(self) -> bool:
+        return self.failures_this_hour() >= BOOT_ATTEMPTS_PER_HOUR
+
+    def next_hour(self) -> float:
+        """POSIX time at which the next clock hour starts."""
+        return (self._current_hour() + 1) * 3600.0
+
+    def record_failure(self) -> int:
+        """Count a failed attempt and return the hour's total so far."""
+        self._failures = self.failures_this_hour() + 1
+        self._hour = self._current_hour()
+        self._save()
+        return self._failures
+
+    def start_new_hour(self) -> None:
+        """Begin a fresh count after waiting out an exhausted hour."""
+        self._hour, self._failures = self._current_hour(), 0
+        self._save()
+
+    def clear(self) -> None:
+        """Forget all failures once rotor has started."""
+        self._hour, self._failures = -1, 0
+        if self.path is not None:
+            with contextlib.suppress(OSError):
+                Path(self.path).unlink(missing_ok=True)
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        with contextlib.suppress(OSError):
+            Path(self.path).write_text(
+                json.dumps({"hour": self._hour, "failures": self._failures}))
+
+
+def _boot_budget_path(state_path: str | Path) -> str | None:
+    """The startup-attempt file beside the state file, or None for in-memory state."""
+    if str(state_path) == ":memory:":
+        return None
+    return str(Path(state_path).expanduser()) + ".boot.json"
 
 
 def _state_path() -> str:

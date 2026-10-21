@@ -752,10 +752,12 @@ def _parse_healthy_executor_id(health: Any) -> int:
         raise RuntimeError(f"GET /health returned invalid body: {health!r}")
 
     status = str(health.get("status") or "").lower()
+    # Not-ready states are temporary on Sera's side; callers may retry them.
     if status and status != "healthy":
-        raise RuntimeError(f"GET /health is not healthy: {health!r}")
+        raise errors.SeraUnavailable(f"GET /health is not healthy: {health!r}")
     if health.get("signature_ready") is False:
-        raise RuntimeError(f"GET /health reports signature verification is not ready: {health!r}")
+        raise errors.SeraUnavailable(
+            f"GET /health reports signature verification is not ready: {health!r}")
 
     raw_executor = health.get("executor_id")
     if raw_executor is None:
@@ -776,7 +778,7 @@ def _parse_healthy_executor_id(health: Any) -> int:
                 f"GET /health returned invalid relayer_executor_id: {health!r}"
             ) from exc
         if relayer_executor_id != executor_id:
-            raise RuntimeError(f"GET /health executor drift: {health!r}")
+            raise errors.SeraUnavailable(f"GET /health executor drift: {health!r}")
 
     return executor_id
 

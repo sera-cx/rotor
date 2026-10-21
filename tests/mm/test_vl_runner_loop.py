@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
-from rotor.mm.exchange.errors import SeraError, SeraRateLimit
+from rotor.mm.exchange.errors import SeraError, SeraRateLimit, SeraUnavailable
 from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
 from rotor.price_reference import ReferenceTooStale, ReferenceUnavailable
@@ -136,6 +136,8 @@ class _FakeClient:
         self.fill_status = fill_status
         # Asks spend base tokens; a wallet funded only with USDC cannot back them.
         self.reject_asks = reject_asks
+        # Raised by bootstrap() in order, one per call, until the list is empty.
+        self.bootstrap_errors: list[Exception] = []
         # Vault balances by symbol; None means GET /balances fails.
         self.balances: dict[str, Decimal] | None = None
         # Fill reads for this market's orders fail (rate-limited) on these ticks.
@@ -147,6 +149,8 @@ class _FakeClient:
 
     def bootstrap(self) -> None:
         self.events.append(("bootstrap",))
+        if self.bootstrap_errors:
+            raise self.bootstrap_errors.pop(0)
 
     def get_config_limits(self) -> None:
         self.events.append(("limits",))
@@ -699,6 +703,115 @@ def test_run_refuses_to_start_when_sera_lists_none_of_the_markets(monkeypatch, c
     assert vr.run(config_path="vl.toml", state_path=":memory:") == 1
     assert "no configured pair can be quoted: JPYC/USDC (Sera does not list" in caplog.text
     assert client.batch_places == [] and client.standalone_places == []
+
+
+SERA_DOWN = SeraError(None, "Service temporarily unavailable; please retry", 503)
+
+
+class _RecordingStop(_StopFlag):
+    """Stop flag that records waits and stops the run when asked to wait long."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float] = []
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        if timeout > 120:
+            self.requested = True
+        return self.requested
+
+
+def _boots(client: _FakeClient) -> int:
+    return len([event for event in client.events if event[0] == "bootstrap"])
+
+
+def test_run_retries_a_temporary_startup_failure_and_reports_recovery(monkeypatch, tmp_path):
+    client = _FakeClient()
+    client.bootstrap_errors = [SERA_DOWN, SeraUnavailable("GET /health is not healthy")]
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _stop_after_sleeps(monkeypatch, 1)
+    state_path = tmp_path / "state.sqlite"
+
+    result = vr.run(
+        config_path="vl.toml", min_requote_seconds=0.0, telegram=True, state_path=state_path)
+
+    assert result == 0
+    assert _boots(client) == 3
+    # One alert for the hour's first failure (not the second), one on recovery.
+    assert len(notifier.containing("rotor could not start (attempt 1 of 3 this hour)")) == 1
+    assert notifier.containing("attempt 2 of 3") == []
+    assert len(notifier.containing("rotor started after 2 failed attempt(s)")) == 1
+    assert len(client.batch_places) == 1
+    assert not (tmp_path / "state.sqlite.boot.json").exists()
+
+
+def test_run_waits_for_the_next_hour_after_three_failed_startups(monkeypatch, tmp_path):
+    clock = {"now": T0 + 600.0}
+    client = _FakeClient()
+    client.bootstrap_errors = [SERA_DOWN] * 10
+    notifier = _RecordingNotifier()
+    stop = _RecordingStop()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=_SequencedSource({}))
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+
+    result = vr.run(config_path="vl.toml", telegram=True, state_path=tmp_path / "state.sqlite")
+
+    assert result == 1
+    assert _boots(client) == 3
+    # 30 s and 60 s between attempts, then until the top of the next hour.
+    assert stop.waits == [30.0, 60.0, 3000.0]
+    errors = [text for text, _ in notifier.messages if "rotor could not start" in text]
+    assert len(errors) == 2
+    assert "attempt 3 of 3 this hour; next attempt at" in errors[1]
+
+
+def test_fire_once_runs_share_the_hourly_startup_budget(monkeypatch, tmp_path):
+    clock = {"now": T0 + 600.0}
+    client = _FakeClient()
+    client.bootstrap_errors = [SERA_DOWN] * 10
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+
+    def fire() -> int:
+        return vr.run(config_path="vl.toml", once=True, telegram=True,
+                      state_path=tmp_path / "state.sqlite")
+
+    assert [fire() for _ in range(4)] == [1, 1, 1, 1]
+    # The fourth fire in the hour does not contact Sera; only the first and the
+    # third (the hour's last attempt) alert.
+    assert _boots(client) == 3
+    assert len([t for t, _ in notifier.messages if "rotor could not start" in t]) == 2
+
+    clock["now"] += 3600.0
+    client.bootstrap_errors = []
+    assert fire() == 0
+    assert _boots(client) == 4
+
+
+def test_run_does_not_retry_a_startup_failure_retrying_cannot_fix(monkeypatch, tmp_path):
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    stop = _RecordingStop()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=_SequencedSource({}))
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+    monkeypatch.setattr(vr, "load_vl_config", lambda _path: (_ for _ in ()).throw(
+        ValueError("vl.toml: return_bps must be > 0")))
+
+    assert vr.run(config_path="vl.toml", telegram=True, state_path=tmp_path / "state.sqlite") == 1
+    assert stop.waits == []
+    assert _boots(client) == 0
+    assert len(notifier.containing("return_bps must be > 0")) == 1
 
 
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):

@@ -55,6 +55,10 @@ class SeraRateLimit(SeraError):
     """429 rate-limit response that is not a cancel-cooldown response."""
 
 
+class SeraUnavailable(RuntimeError):
+    """Sera reports it is not ready to trade yet (a degraded GET /health)."""
+
+
 def from_response(status_code: int, body: dict) -> SeraError:
     """Build a typed error from a parsed 4xx response body.
 
