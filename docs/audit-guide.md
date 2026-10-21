@@ -123,6 +123,11 @@ Sera signing and API:
 - Bootstrap refuses a `/config` that names any contract other than the known
   Sera contract for mainnet (chain 1) or Sepolia (chain 11155111); an unknown
   chain is allowed with a warning.
+- On mainnet, bootstrap also refuses `/markets` metadata that disagrees with
+  `rotor/mm/exchange/known_tokens.py`: a market symbol that does not match its
+  two tokens, a pinned symbol at another address or decimals, or a pinned
+  address under another symbol. Tokens listed after the pin are accepted as
+  reported.
 - `SERA_BASE_URL` must be `https://` (rejected otherwise, except `localhost`).
 - Integer typed-data fields are coerced before signing (decimal and hex strings;
   array-typed fields left for `eth-account`).

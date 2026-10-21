@@ -12,6 +12,7 @@ import pytest
 from rotor.mm.exchange import eip712
 from rotor.mm.exchange import errors as errors_mod
 from rotor.mm.exchange.client import SeraClient, VLLeg
+from rotor.mm.exchange.known_tokens import KNOWN_TOKENS
 
 USDC = {
     "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
@@ -774,3 +775,64 @@ def test_bootstrap_warns_on_a_network_it_does_not_know(caplog):
     client.bootstrap()
 
     assert "chain 31337 is not a known Sera network" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Mainnet token metadata is checked against the pinned list
+# ---------------------------------------------------------------------------
+
+MAINNET_SERA = "0xB5C50C5D5f038404F85970b7f5B7259C4AC0E198"
+
+
+def _mainnet_market(base: str, quote: str, **overrides) -> dict:
+    tokens = KNOWN_TOKENS[1]
+    row = {
+        "symbol": f"{base}/{quote}",
+        "base_symbol": base,
+        "quote_symbol": quote,
+        "base_address": tokens.get(base, ("0x" + "77" * 20, 6))[0],
+        "quote_address": tokens[quote][0],
+        "base_decimals": tokens.get(base, ("", 6))[1],
+        "quote_decimals": tokens[quote][1],
+        "tick_precision": 6,
+        "quantity_precision": 2,
+    }
+    row.update(overrides)
+    return row
+
+
+def _mainnet_client(*markets: dict) -> SeraClient:
+    routes = _build_mock_routes(_config_route(1, MAINNET_SERA))
+    routes["GET /markets"] = {"markets": list(markets)}
+    return _make_client(routes)
+
+
+def test_bootstrap_accepts_genuine_mainnet_token_metadata():
+    client = _mainnet_client(_mainnet_market("XSGD", "USDC"), _mainnet_market("NEWT", "USDC"))
+
+    client.bootstrap()
+
+    # A token Sera lists later (not pinned) is accepted as reported.
+    assert set(client.markets_by_symbol) == {"XSGD/USDC", "NEWT/USDC"}
+
+
+@pytest.mark.parametrize(
+    ("market", "match"),
+    [
+        # XSGD/USDC whose base is really IDRT: bids priced for SGD would buy IDRT.
+        (lambda: _mainnet_market("XSGD", "USDC", base_address=_mainnet_market("IDRT", "USDC")["base_address"]),
+         "lists XSGD at 0x"),
+        # The same swap behind a name rotor does not pin.
+        (lambda: _mainnet_market("XSGDX", "USDC", base_address=_mainnet_market("IDRT", "USDC")["base_address"]),
+         "lists IDRT's address 0x"),
+        # A market symbol that does not match its own tokens.
+        (lambda: _mainnet_market("IDRT", "USDC", symbol="XSGD/USDC"), "lists XSGD/USDC with tokens IDRT/USDC"),
+        # Right address, wrong decimals.
+        (lambda: _mainnet_market("XSGD", "USDC", base_decimals=18), "lists XSGD at .* with 18 decimals"),
+    ],
+)
+def test_bootstrap_refuses_mainnet_token_metadata_that_disagrees_with_the_pins(market, match):
+    client = _mainnet_client(market())
+
+    with pytest.raises(RuntimeError, match=match):
+        client.bootstrap()

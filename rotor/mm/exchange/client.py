@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from rotor.mm.exchange import eip712, errors
+from rotor.mm.exchange.known_tokens import KNOWN_TOKENS
 
 # Hosts for which an http:// base URL is tolerated (local dev/mocks only).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
@@ -302,6 +303,7 @@ class SeraClient:
             )
             # Cache by exact Sera symbol for fast lookup during quoting.
             self.markets_by_symbol[info.symbol] = info
+        _check_market_tokens(self.markets_by_symbol, int(domain["chainId"]))
 
         # Log only public boot metadata; no secrets or signatures appear here.
         self._log.info(
@@ -812,6 +814,43 @@ def _coerce_int(value: Any) -> int:
             return int(text, 16)
         return int(text, 10)
     return int(value)
+
+
+def _check_market_tokens(markets: dict[str, MarketInfo], chain_id: int) -> None:
+    """Refuse market metadata that disagrees with the tokens pinned for this chain.
+
+    Rotor signs orders for the token addresses and decimals GET /markets gives.
+    A wrong or hostile endpoint could otherwise swap one listed token for
+    another, so each market's symbol must match its two tokens, a pinned symbol
+    must have its pinned address and decimals, and a pinned address must not
+    appear under another symbol. Tokens not pinned are accepted as reported.
+    """
+    known = KNOWN_TOKENS.get(chain_id)
+    if known is None:
+        return
+    symbol_of = {address: symbol for symbol, (address, _) in known.items()}
+    for info in markets.values():
+        if info.symbol.upper() != f"{info.base_symbol}/{info.quote_symbol}".upper():
+            raise RuntimeError(
+                f"GET /markets lists {info.symbol} with tokens "
+                f"{info.base_symbol}/{info.quote_symbol}; check SERA_BASE_URL"
+            )
+        for symbol, address, decimals in (
+            (info.base_symbol, info.base_address, info.base_decimals),
+            (info.quote_symbol, info.quote_address, info.quote_decimals),
+        ):
+            symbol, address = symbol.upper(), address.lower()
+            pinned = known.get(symbol)
+            if pinned is not None and pinned != (address, decimals):
+                raise RuntimeError(
+                    f"GET /markets lists {symbol} at {address} with {decimals} decimals, "
+                    f"not {pinned[0]} with {pinned[1]}; check SERA_BASE_URL"
+                )
+            if symbol_of.get(address, symbol) != symbol:
+                raise RuntimeError(
+                    f"GET /markets lists {symbol_of[address]}'s address {address} as "
+                    f"{symbol}; check SERA_BASE_URL"
+                )
 
 
 def _rate_group(method: str, path: str) -> str:

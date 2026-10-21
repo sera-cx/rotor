@@ -182,7 +182,8 @@ lock on `<state>.lock` at startup and refuses to start if another process holds
 it (set `ROTOR_STATE_PATH` to run a second instance on different state). Before
 signing, Rotor builds every order itself and signs only that, never a struct a
 server returns, and it refuses to start if `GET /config` names a contract other
-than Sera's for mainnet or Sepolia. With
+than Sera's for mainnet or Sepolia, or if `GET /markets` gives a mainnet token
+an address or decimals other than the ones rotor pins. With
 `--telegram`, a throttled alert fires if quoting stalls (no successful placement)
 for several cadences, so a silent stall is not masked by the hourly heartbeat.
 
