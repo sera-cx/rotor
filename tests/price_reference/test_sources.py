@@ -192,6 +192,36 @@ def test_fed_h10_source_crosses_rates_through_usd():
     assert seen["file_type"] == "json"
 
 
+def test_fed_h10_source_reads_each_series_the_way_it_quotes():
+    # The H.10 release quotes GBP, AUD, NZD and EUR as U.S. dollars per unit
+    # (DEXUS<cc>) and the rest as units per U.S. dollar (DEX<cc>US).
+    payloads = {
+        "DEXUSUK": "1.2700", "DEXUSAL": "0.6600", "DEXUSNZ": "0.6000",
+        "DEXJPUS": "150.00", "DEXSZUS": "0.8000",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        value = payloads[request.url.params["series_id"]]
+        return httpx.Response(200, json={"observations": [{"date": "2026-06-02", "value": value}]})
+
+    src = FedH10RateSource(api_key="k", http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    def rate(base: str, quote: str) -> Decimal:
+        # Crossing through USD divides twice; compare to 20 places.
+        return round(src.quote(base, quote).rate, 20)
+
+    assert rate("GBP", "USD") == Decimal("1.27")
+    assert rate("AUD", "USD") == Decimal("0.66")
+    assert rate("NZD", "USD") == Decimal("0.6")
+    assert rate("JPY", "USD") == round(Decimal("1") / Decimal("150"), 20)
+    assert rate("GBP", "CHF") == Decimal("1.016")
+
+
+def test_fed_h10_source_rejects_a_series_it_cannot_orient():
+    with pytest.raises(ValueError, match="cannot tell which way FRED series 'GBPUSD' quotes"):
+        FedH10RateSource(series_by_currency={"GBP": "GBPUSD"})
+
+
 def test_fed_h10_source_requires_api_key():
     src = FedH10RateSource()  # no api_key configured
 

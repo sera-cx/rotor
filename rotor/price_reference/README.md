@@ -27,7 +27,12 @@ Available sources:
 - `fed`: Federal Reserve H.10 rates via the official FRED API
   (`api.stlouisfed.org/fred/series/observations`), crossed through USD. Needs a
   free `FRED_API_KEY` (the legacy `fredgraph.csv` scrape endpoint is fronted by
-  Akamai Bot Manager and unreliable from servers).
+  Akamai Bot Manager and unreliable from servers). Built-in series cover AUD,
+  BRL, CAD, CHF, EUR, GBP, JPY, MXN, MYR, NZD, SGD, and ZAR. Which way a series
+  quotes is read from its FRED id: `DEXUS<cc>` is U.S. dollars per unit (AUD,
+  EUR, GBP, NZD in the H.10 release) and `DEX<cc>US` is units per U.S. dollar;
+  a series named neither way is rejected at startup. `FED_H10_SERIES_JSON`
+  replaces the built-in list.
 - `bnm`: Bank Negara Malaysia OpenAPI exchange rates, crossed through MYR. Keyless.
 - `mas`: MAS/data.gov.sg exchange rates, crossed through SGD. Keyless. The default
   resource covers USD; add resource ids for more currencies when needed.

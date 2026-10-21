@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
@@ -235,9 +236,11 @@ class FedH10RateSource:
     endpoint is fronted by Akamai Bot Manager and tarpits/resets headless
     clients, so it is not used.
 
-    The adapter crosses through USD. Series orientation differs by currency:
-    most supported currencies are quoted as currency-per-USD, while EUR is
-    quoted as USD-per-EUR, so values are normalized before crossing.
+    The adapter crosses through USD. Each series' id says which way it quotes,
+    following the H.10 release: ``DEXUS<cc>`` is U.S. dollars per currency unit
+    (the release's asterisked currencies: AUD, EUR, GBP, NZD) and ``DEX<cc>US``
+    is currency units per U.S. dollar (all others). A series named neither way
+    is rejected when the source is built, rather than guessed.
     """
 
     name = "fed"
@@ -245,12 +248,21 @@ class FedH10RateSource:
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
     DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
+    # Every H.10 currency a token maps to (rotor.price_reference.symbols).
     DEFAULT_SERIES = {
+        "AUD": "DEXUSAL",
+        "BRL": "DEXBZUS",
+        "CAD": "DEXCAUS",
+        "CHF": "DEXSZUS",
         "EUR": "DEXUSEU",
+        "GBP": "DEXUSUK",
+        "JPY": "DEXJPUS",
+        "MXN": "DEXMXUS",
         "MYR": "DEXMAUS",
+        "NZD": "DEXUSNZ",
         "SGD": "DEXSIUS",
+        "ZAR": "DEXSFUS",
     }
-    USD_PER_CURRENCY_SERIES = {"EUR"}
 
     def __init__(
         self,
@@ -279,6 +291,11 @@ class FedH10RateSource:
         self.series_by_currency = {
             key.upper(): value
             for key, value in configured.items()
+        }
+        # Checked here so a misnamed series fails at startup, not mid-quote.
+        self._usd_per_unit = {
+            currency: _fred_quotes_usd_per_unit(series)
+            for currency, series in self.series_by_currency.items()
         }
         self._http = http or httpx.Client(timeout=timeout)
 
@@ -325,9 +342,21 @@ class FedH10RateSource:
         response.raise_for_status()
         date, raw_rate = _parse_fred_observations(response.json(), series)
         rate = _positive_decimal(raw_rate)
-        if currency in self.USD_PER_CURRENCY_SERIES:
+        if self._usd_per_unit[currency]:
             rate = Decimal("1") / rate
         return rate, {"currency": currency, "series": series, "date": date, "rate": raw_rate}
+
+
+def _fred_quotes_usd_per_unit(series: str) -> bool:
+    """Return whether an H.10 FRED series quotes U.S. dollars per currency unit."""
+    if re.fullmatch(r"DEXUS[A-Z]{2}", series):
+        return True
+    if re.fullmatch(r"DEX[A-Z]{2}US", series):
+        return False
+    raise ValueError(
+        f"cannot tell which way FRED series {series!r} quotes; H.10 series are "
+        "named DEXUS<cc> (U.S. dollars per unit) or DEX<cc>US (units per U.S. dollar)"
+    )
 
 
 class BnmRateSource:
