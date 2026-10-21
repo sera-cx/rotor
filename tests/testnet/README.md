@@ -9,7 +9,7 @@ Read-only public checks:
 ROTOR_RUN_TESTNET=1 poetry run pytest -q tests/testnet
 ```
 
-Optional preview check, still non-placing:
+Optional signing-parity check against testnet's preview endpoint, still non-placing:
 
 ```bash
 ROTOR_RUN_TESTNET=1 \

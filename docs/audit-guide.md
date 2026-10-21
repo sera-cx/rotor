@@ -115,9 +115,14 @@ Live order lifecycle:
 Sera signing and API:
 
 - `client.bootstrap()` loads the EIP-712 domain before signing.
-- Order placement signs Sera's preview-normalized payload, not a local guess, but
-  first verifies the preview's `user`, `recipient`, token pair, and amounts
-  against the intended order and refuses to sign a mismatch.
+- Every order is built locally by `eip712.build_order_struct` and signed as
+  `eip712.ORDER_TYPES`; rotor never signs a struct or type schema a server
+  returns. Fee, recipient, and initial deposit are always zero, and expiration
+  and uuid are rotor's own. Golden vectors from testnet's preview endpoint
+  prove the local struct is the one the server verifies.
+- Bootstrap refuses a `/config` that names any contract other than the known
+  Sera contract for mainnet (chain 1) or Sepolia (chain 11155111); an unknown
+  chain is allowed with a warning.
 - `SERA_BASE_URL` must be `https://` (rejected otherwise, except `localhost`).
 - Integer typed-data fields are coerced before signing (decimal and hex strings;
   array-typed fields left for `eth-account`).
@@ -127,7 +132,7 @@ Sera signing and API:
 - API-key requests are paced to Sera's documented per-wallet limits (reads
   10/s, trades 5/s, cancels 2/s). A rate-limit 429 is retried (twice, honouring
   Retry-After); a 503 is retried only for requests safe to repeat (GETs,
-  cancels, previews, single-order placement, which Sera dedupes on order_id),
+  cancels, single-order placement, which Sera dedupes on order_id),
   never for a VL batch. A cancel-cooldown 429 is never retried.
 - API keys stay in headers; private keys, bearer tokens, signatures, and API
   secrets must not appear in logs.
@@ -211,13 +216,14 @@ Highest-signal files:
 - `tests/mm/test_positions.py`: position netting and the return-order price.
 - `tests/mm/test_vl_runner.py`: fill settlement statuses and exactly-once
   counting, return-order sizing, and ledger recording on placement.
-- `tests/mm/test_client.py`: Sera preview/sign/place/cancel behavior.
+- `tests/mm/test_client.py`: local order building and signing, contract
+  pinning, placement, cancel, pacing, and retry behavior.
 - `tests/mm/test_eip712.py`: EIP-712 schema and packed UUID layout.
 - `tests/security/test_key.py`: private-key loading, signing, and lock behavior.
 - `tests/notifications/test_telegram.py`: Telegram degradation and routing.
 - `tests/test_updater.py`: autonomous Git update safety.
 - `tests/testnet/test_sera_integration.py`: real Sera testnet public read,
-  preview, authenticated read boundaries, and explicitly gated two-wallet
+  signing parity with testnet's preview, authenticated read boundaries, and explicitly gated two-wallet
   maker/taker fill flow using VL placement.
 - `tests/testnet/test_vl_runner_scenarios.py`: explicitly gated live runner
   fill/return requote scenarios using maker and taker wallets.

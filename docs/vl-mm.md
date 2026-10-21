@@ -180,8 +180,9 @@ live placements.
 Only one instance may use a given state file at a time: Rotor takes an exclusive
 lock on `<state>.lock` at startup and refuses to start if another process holds
 it (set `ROTOR_STATE_PATH` to run a second instance on different state). Before
-signing, Rotor also checks each previewed order's owner, recipient, token pair,
-and amount against what it intended, and refuses to sign a mismatch. With
+signing, Rotor builds every order itself and signs only that, never a struct a
+server returns, and it refuses to start if `GET /config` names a contract other
+than Sera's for mainnet or Sepolia. With
 `--telegram`, a throttled alert fires if quoting stalls (no successful placement)
 for several cadences, so a silent stall is not masked by the hourly heartbeat.
 

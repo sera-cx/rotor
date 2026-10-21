@@ -128,7 +128,7 @@ def _order_inputs() -> tuple[str, str, Decimal, Decimal]:
     if not (market and qty and price):
         pytest.skip(
             "set ROTOR_TESTNET_MARKET, ROTOR_TESTNET_QTY_BASE, and "
-            "ROTOR_TESTNET_PRICE for order-preview checks"
+            "ROTOR_TESTNET_PRICE for the signing-parity check"
         )
     return (
         market.upper().replace("_", "/"),
@@ -200,7 +200,10 @@ def test_testnet_server_time_returns_recent_unix_timestamp():
     assert server_time < int(time.time()) + 24 * 60 * 60
 
 
-def test_testnet_preview_order_returns_canonical_eip712_payload():
+def test_testnet_preview_returns_the_struct_rotor_builds_locally():
+    # Rotor signs only orders it builds itself. Testnet still exposes
+    # POST /orders/preview, so ask it for the same order and require the
+    # server's canonical struct to equal rotor's, field for field. Non-placing.
     owner = _owner_address(required=True)
     market, side, qty_base, price = _order_inputs()
     client = _client(owner_address=owner)
@@ -209,15 +212,14 @@ def test_testnet_preview_order_returns_canonical_eip712_payload():
         pytest.skip(f"{market} is not available on configured Sera testnet")
 
     expiration = client.expiration_from_server_time(600)
-    preview = client.preview_order(market, side, qty_base, price, expiration)
+    order = client.build_order(market, side, qty_base, price, expiration)
+    body = client._request(
+        "POST", "/orders/preview", json_body=order.wire, authed=False, expect_status=(200, 201))
 
-    assert preview.order_id
-    assert preview.uuid_int > 0
-    assert Decimal(preview.amount) > 0
-    assert Decimal(preview.price) > 0
-    assert preview.eip712_order
-    assert preview.eip712_types
-    assert "signature" not in preview.wire
+    assert "signature" not in order.wire
+    assert {key: str(value).lower() for key, value in body["eip712_order"].items()} == {
+        key: str(value).lower() for key, value in order.struct.items()
+    }
 
 
 def test_testnet_authenticated_open_orders_read():
@@ -330,7 +332,7 @@ def test_testnet_two_wallet_vl_maker_taker_fill_flow():
         assert maker_result.records
         assert maker_result.vl_batch_id
 
-        taker_record = taker.place_order_previewed(
+        taker_record = taker.place_order(
             target_market,
             taker_side,
             taker_qty,

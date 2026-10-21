@@ -55,16 +55,6 @@ class SeraRateLimit(SeraError):
     """429 rate-limit response that is not a cancel-cooldown response."""
 
 
-class SeraPreviewMismatch(RuntimeError):
-    """A `/orders/preview` response does not match the order Rotor intended.
-
-    Raised before signing when the server-returned EIP-712 struct would
-    authorize a different owner, recipient, token pair, or amount than the
-    locally-built intent — the guard against a compromised/MITM'd server
-    coaxing the maker wallet into signing a fund-draining order.
-    """
-
-
 def from_response(status_code: int, body: dict) -> SeraError:
     """Build a typed error from a parsed 4xx response body.
 

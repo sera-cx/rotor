@@ -1501,7 +1501,7 @@ def _place_groups(
         for intent in intents:
             try:
                 # Singletons and unbudgeted groups place as ordinary orders.
-                record = client.place_order_previewed(
+                record = client.place_order(
                     intent.market,
                     intent.side,
                     intent.qty_base,

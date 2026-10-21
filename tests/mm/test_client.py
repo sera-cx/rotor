@@ -31,13 +31,13 @@ def _build_mock_routes(extra: dict[str, Any] | None = None) -> dict:
     base = {
         "GET /config": {
             "chain_id": 11155111,
-            "sera_address": "0xd0fc92d8ef9be26d7288fca1d6458f675e72b83a",
+            "sera_address": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
             "limits": {"vl_batch": {"min": 2, "max": 50}},
             "eip712_domain": {
                 "name": "Sera",
                 "version": "1",
                 "chainId": 11155111,
-                "verifyingContract": "0xd0fc92d8ef9be26d7288fca1d6458f675e72b83a",
+                "verifyingContract": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
             },
         },
         "GET /health": {
@@ -128,139 +128,8 @@ def test_bootstrap_populates_market_cache():
     ]
 
 
-def test_preview_order_sends_unsigned_unauthed_wire():
-    routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {"uuid": "42"},
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-    })
-    captured: list[dict] = []
-    client = _make_client(routes, captured)
-    client.bootstrap()
-
-    preview = client.preview_order("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
-
-    post = [r for r in captured if r["method"] == "POST"][-1]
-    assert post["path"].endswith("/orders/preview")
-    assert "signature" not in post["body"]
-    assert post["headers"].get("authorization") is None
-    assert preview.amount == "100.00"
-    assert preview.price == "0.250000"
-
-
-@pytest.mark.parametrize(
-    "preview_body",
-    [
-        {
-            "normalized_price": "0.250000",
-            "eip712_order": {"uuid": "42"},
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-        {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {"uuid": "42"},
-        },
-        {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {},
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-    ],
-)
-def test_preview_order_requires_canonical_response(preview_body):
-    client = _make_client(_build_mock_routes({"POST /orders/preview": preview_body}))
-    client.bootstrap()
-
-    with pytest.raises(RuntimeError, match="POST /orders/preview"):
-        client.preview_order("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
-
-
-def test_place_order_previewed_signs_normalized_payload():
-    signed: list[dict] = []
-
-    def signer(domain, types, message):
-        signed.append({"domain": domain, "types": types, "message": message})
-        return SIG_FIXED
-
-    routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {
-                "user": OWNER,
-                "expiration": "999",
-                "feeBps": "0",
-                "recipient": "0x0000000000000000000000000000000000000000",
-                "fromToken": USDC["address"],
-                "toToken": MYRC["address"],
-                "fromAmount": "25000000",
-                "toAmount": str(100 * 10**18),
-                "initialDepositAmount": "0",
-                "uuid": "42",
-            },
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-        "POST /orders": (201, {"order_id": "server-id"}),
-    })
-    captured: list[dict] = []
-    client = _make_client(routes, captured, signer=signer)
-    client.bootstrap()
-
-    rec = client.place_order_previewed("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
-
-    assert rec.order_id == "server-id"
-    assert signed == [{
-        "domain": {
-            "name": "Sera",
-            "version": "1",
-            "chainId": 11155111,
-            "verifyingContract": "0xd0fc92d8ef9be26d7288fca1d6458f675e72b83a",
-        },
-        "types": eip712.ORDER_TYPES,
-        "message": {
-            "user": OWNER,
-            "expiration": 999,
-            "feeBps": 0,
-            "recipient": "0x0000000000000000000000000000000000000000",
-            "fromToken": USDC["address"],
-            "toToken": MYRC["address"],
-            "fromAmount": 25000000,
-            "toAmount": 100 * 10**18,
-            "initialDepositAmount": 0,
-            "uuid": 42,
-        },
-    }]
-    post = [r for r in captured if r["method"] == "POST"][-1]
-    assert post["body"]["amount"] == "100.00"
-    assert post["body"]["price"] == "0.250000"
-    assert post["body"]["signature"] == SIG_FIXED
-    assert post["headers"]["authorization"] == "Bearer testkey:testsecret"
-
-
 def test_place_order_4xx_raises_typed_sera_error():
     routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {
-                "user": OWNER,
-                "expiration": "999",
-                "feeBps": "0",
-                "recipient": "0x0000000000000000000000000000000000000000",
-                "fromToken": USDC["address"],
-                "toToken": MYRC["address"],
-                "fromAmount": "25000000",
-                "toAmount": str(100 * 10**18),
-                "initialDepositAmount": "0",
-                "uuid": "42",
-            },
-            "eip712_types": eip712.ORDER_TYPES,
-        },
         "POST /orders": (400, {
             "detail": {"detail": "self-trade prevented", "error_code": "STP_BLOCKED"},
         }),
@@ -268,7 +137,7 @@ def test_place_order_4xx_raises_typed_sera_error():
     client = _make_client(routes)
     client.bootstrap()
     with pytest.raises(errors_mod.SeraError) as ei:
-        client.place_order_previewed("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
+        client.place_order("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
     assert ei.value.error_code == "STP_BLOCKED"
     assert ei.value.status_code == 400
 
@@ -313,92 +182,8 @@ def test_cancel_order_200_returns_true():
     }]
 
 
-def test_place_vl_batch_previews_each_leg_and_posts_signed_batch():
-    routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {
-                "user": OWNER,
-                "expiration": "999",
-                "feeBps": "0",
-                "recipient": "0x0000000000000000000000000000000000000000",
-                "fromToken": USDC["address"],
-                "toToken": MYRC["address"],
-                "fromAmount": "25000000",
-                "toAmount": str(100 * 10**18),
-                "initialDepositAmount": "0",
-                "uuid": "42",
-            },
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-        "POST /orders/vl/batch": (201, {
-            "order_ids": ["leg-0", "leg-1"],
-            "amendments": [{
-                "order_id": "leg-1",
-                "original_amount": "100.00",
-                "actual_amount": "80.00",
-                "reason": "budget_clip",
-            }],
-            "cancelled": [],
-            "fills": [{"order_id": "leg-0", "trades": [{"quantity": "1"}]}],
-            "vl_group": {
-                "primary_id": "leg-0",
-                "max_budget": "25",
-                "budget_consumed": "1",
-                "spent_token": "USDC",
-            },
-        }),
-    })
-    captured: list[dict] = []
-    client = _make_client(routes, captured)
-    client.bootstrap()
-
-    result = client.place_vl_batch([
-        VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
-        VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
-    ])
-
-    previews = [r for r in captured if r["path"].endswith("/orders/preview")]
-    assert len(previews) == 2
-    uuid0 = int(previews[0]["body"]["uuid_int"])
-    uuid1 = int(previews[1]["body"]["uuid_int"])
-    assert uuid0 & 0xFFF == 0
-    assert uuid1 & 0xFFF == 1
-    assert (uuid0 >> 12) & ((1 << 112) - 1) == (uuid1 >> 12) & ((1 << 112) - 1)
-
-    post = [r for r in captured if r["path"].endswith("/orders/vl/batch")][-1]
-    assert len(post["body"]["orders"]) == 2
-    assert post["body"]["orders"][0]["signature"] == SIG_FIXED
-    assert post["body"]["orders"][0]["amount"] == "100.00"
-    assert post["headers"]["authorization"] == "Bearer testkey:testsecret"
-    assert result.vl_batch_id == "leg-0"
-    assert result.order_ids == ["leg-0", "leg-1"]
-    assert result.records[1].order_id == "leg-1"
-    assert result.amendments[0].actual_amount == "80.00"
-    assert result.vl_group is not None
-    assert result.vl_group.spent_token == "USDC"
-
-
 def test_place_vl_batch_tracks_batch_on_mismatched_order_id_count(caplog):
     routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": {
-                "user": OWNER,
-                "expiration": "999",
-                "feeBps": "0",
-                "recipient": "0x0000000000000000000000000000000000000000",
-                "fromToken": USDC["address"],
-                "toToken": MYRC["address"],
-                "fromAmount": "25000000",
-                "toAmount": str(100 * 10**18),
-                "initialDepositAmount": "0",
-                "uuid": "42",
-            },
-            "eip712_types": eip712.ORDER_TYPES,
-        },
         "POST /orders/vl/batch": (201, {"order_ids": ["leg-0"]}),
     })
     client = _make_client(routes)
@@ -508,7 +293,7 @@ def test_bootstrap_uses_domain_fallback_when_config_omits_eip712_domain():
     routes = _build_mock_routes({
         "GET /config": {
             "chain_id": 11155111,
-            "sera_address": "0xd0fc92d8ef9be26d7288fca1d6458f675e72b83a",
+            "sera_address": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
             "limits": {"vl_batch": {"min": 3, "max": 5}},
         },
     })
@@ -520,7 +305,7 @@ def test_bootstrap_uses_domain_fallback_when_config_omits_eip712_domain():
         "name": "Sera",
         "version": "1",
         "chainId": 11155111,
-        "verifyingContract": "0xd0fc92d8ef9be26d7288fca1d6458f675e72b83a",
+        "verifyingContract": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
     }
     assert client.vl_batch_min == 3
     assert client.vl_batch_max == 5
@@ -570,7 +355,7 @@ def test_get_config_limits_refreshes_vl_limits():
     routes = _build_mock_routes({
         "GET /config": {
             "chain_id": 11155111,
-            "sera_address": "0xd0fc92d8ef9be26d7288fca1d6458f675e72b83a",
+            "sera_address": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
             "limits": {"vl_batch": {"min": 4, "max": 9}},
         },
     })
@@ -660,52 +445,6 @@ def _good_order(**overrides):
     }
     order.update(overrides)
     return order
-
-
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        ({"recipient": "0x000000000000000000000000000000000000dead"}, "recipient"),
-        ({"user": "0x000000000000000000000000000000000000beef"}, "user"),
-        ({"fromToken": MYRC["address"]}, "fromToken"),
-        ({"toToken": USDC["address"]}, "toToken"),
-        ({"fromAmount": str(25000000 * 10)}, "fromAmount"),
-        ({"toAmount": "1"}, "toAmount"),
-    ],
-)
-def test_place_order_rejects_preview_that_does_not_match_intent(overrides, match):
-    routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": _good_order(**overrides),
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-        "POST /orders": (201, {"order_id": "server-id"}),
-    })
-    client = _make_client(routes)
-    client.bootstrap()
-
-    with pytest.raises(errors_mod.SeraPreviewMismatch, match=match):
-        client.place_order_previewed("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
-
-
-def test_place_order_accepts_matching_preview_with_rounding_slack():
-    # fromAmount off by a couple of base units (rounding) must still be accepted.
-    routes = _build_mock_routes({
-        "POST /orders/preview": {
-            "normalized_amount": "100.00",
-            "normalized_price": "0.250000",
-            "eip712_order": _good_order(fromAmount="25000001"),
-            "eip712_types": eip712.ORDER_TYPES,
-        },
-        "POST /orders": (201, {"order_id": "server-id"}),
-    })
-    client = _make_client(routes)
-    client.bootstrap()
-
-    rec = client.place_order_previewed("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
-    assert rec.order_id == "server-id"
 
 
 def test_client_requires_https_base_url():
@@ -798,92 +537,6 @@ def test_non_json_error_response_becomes_typed_error():
         client._request("GET", "/anything")
     assert ei.value.status_code == 500
     assert ei.value.payload == {"detail": "upstream down"}
-
-
-# ---------------------------------------------------------------------------
-# Preview-free placement (mainnet deployments)
-#
-# Mainnet deployments do not expose POST /orders/preview. Rotor
-# must detect that once and then derive the canonical struct locally rather
-# than failing every order.
-# ---------------------------------------------------------------------------
-
-
-def _routes_without_preview() -> dict:
-    """Mock routes for a deployment that has no preview endpoint."""
-    routes = _build_mock_routes()
-    # FastAPI answers a POST to a path it only knows for other methods with
-    # 405; a wholly unknown path gives 404. Cover the 405 shape here.
-    routes["POST /orders/preview"] = (405, {"detail": "Method Not Allowed"})
-    return routes
-
-
-def test_preview_falls_back_to_local_struct_when_endpoint_absent():
-    """A 405 from preview latches local struct building instead of raising."""
-    captured: list[dict] = []
-    client = _make_client(_routes_without_preview(), captured)
-    client.bootstrap()
-
-    preview = client.preview_order(
-        "MYRC/USDC", "bid", Decimal("1000"), Decimal("1.25"), 1800000000,
-    )
-
-    # The deployment is now known to lack preview.
-    assert client.preview_supported is False
-    # A locally derived struct still carries everything placement needs.
-    order = preview.eip712_order
-    assert order["user"] == OWNER.lower()
-    assert order["fromToken"] == USDC["address"].lower()   # bid spends quote
-    assert order["toToken"] == MYRC["address"].lower()
-    assert order["fromAmount"] == 1250 * 10**6             # 1000 * 1.25, 6dp
-    assert order["toAmount"] == 1000 * 10**18              # 1000 base, 18dp
-    assert preview.eip712_types == eip712.ORDER_TYPES
-
-
-def test_preview_not_retried_after_endpoint_known_absent():
-    """Once latched, later orders skip the doomed preview round trip."""
-    captured: list[dict] = []
-    client = _make_client(_routes_without_preview(), captured)
-    client.bootstrap()
-
-    client.preview_order(
-        "MYRC/USDC", "bid", Decimal("1"), Decimal("1"), 1800000000)
-    first = sum(1 for c in captured if c["path"].endswith("/orders/preview"))
-    client.preview_order(
-        "MYRC/USDC", "ask", Decimal("2"), Decimal("3"), 1800000000)
-    second = sum(1 for c in captured if c["path"].endswith("/orders/preview"))
-
-    # Exactly one probe total, not one per order.
-    assert first == 1
-    assert second == 1
-
-
-def test_preview_error_other_than_missing_endpoint_still_raises():
-    """A 422 rejection is about this order and must not be swallowed."""
-    routes = _build_mock_routes()
-    routes["POST /orders/preview"] = (422, {"detail": "Invalid request"})
-    client = _make_client(routes)
-    client.bootstrap()
-
-    with pytest.raises(errors_mod.SeraError):
-        client.preview_order(
-            "MYRC/USDC", "bid", Decimal("1000"), Decimal("1.25"), 1800000000)
-    # A per-order rejection says nothing about endpoint availability.
-    assert client.preview_supported is not False
-
-
-def test_local_struct_passes_the_preview_mismatch_guard():
-    """Locally built orders satisfy the same anti-tamper check as server ones."""
-    routes = _routes_without_preview()
-    routes["POST /orders"] = (201, {"order_id": "server-id"})
-    client = _make_client(routes)
-    client.bootstrap()
-
-    # place_order_previewed runs _assert_preview_matches on whatever struct it
-    # is handed; a locally derived one must pass that guard unchanged.
-    record = client.place_order_previewed(
-        "MYRC/USDC", "ask", Decimal("5"), Decimal("2"), 1800000000)
-    assert record.order_id
 
 
 # ---------------------------------------------------------------------------
@@ -987,3 +640,137 @@ def test_vault_balances_are_totals_in_token_units():
     # Wallet (non-vault) funds cannot back orders and are not counted.
     assert client.get_vault_balances() == {"USDC": Decimal("500.5"), "MYRC": Decimal("2.5")}
     assert captured[-1]["query"] == {"owner_address": OWNER}
+
+
+# ---------------------------------------------------------------------------
+# Orders are built and signed locally; the signing contract is pinned
+# ---------------------------------------------------------------------------
+
+SEPOLIA_SERA = "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e"
+
+
+def test_place_order_signs_a_locally_built_order_and_never_previews():
+    signed: list[dict] = []
+
+    def signer(domain, types, message):
+        signed.append({"domain": domain, "types": types, "message": message})
+        return SIG_FIXED
+
+    routes = _build_mock_routes({"POST /orders": (201, {"order_id": "server-id"})})
+    captured: list[dict] = []
+    client = _make_client(routes, captured, signer=signer)
+    client.bootstrap()
+
+    rec = client.place_order("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999)
+
+    posts = [r for r in captured if r["method"] == "POST"]
+    assert [r["path"].replace("/api/v1", "") for r in posts] == ["/orders"]
+    body = posts[0]["body"]
+    assert rec.order_id == "server-id"
+    # Every signed field is rotor's own: Sera's Order type, no fee, no
+    # recipient, no deposit, rotor's expiration and uuid, exact amounts.
+    assert signed == [{
+        "domain": client.eip712_domain,
+        "types": eip712.ORDER_TYPES,
+        "message": {
+            "user": OWNER,
+            "expiration": 999,
+            "feeBps": 0,
+            "recipient": "0x0000000000000000000000000000000000000000",
+            "fromToken": USDC["address"],
+            "toToken": MYRC["address"],
+            "fromAmount": 25000000,
+            "toAmount": 100 * 10**18,
+            "initialDepositAmount": 0,
+            "uuid": int(body["uuid_int"]),
+        },
+    }]
+    assert (body["amount"], body["price"], body["signature"]) == ("100", "0.25", SIG_FIXED)
+    assert posts[0]["headers"]["authorization"] == "Bearer testkey:testsecret"
+
+
+def test_place_vl_batch_builds_and_signs_each_leg_locally():
+    signed: list[dict] = []
+
+    def signer(domain, types, message):
+        signed.append({"types": types, "message": message})
+        return SIG_FIXED
+
+    routes = _build_mock_routes({
+        "POST /orders/vl/batch": (201, {
+            "order_ids": ["leg-0", "leg-1"],
+            "amendments": [{
+                "order_id": "leg-1",
+                "original_amount": "100",
+                "actual_amount": "80.00",
+                "reason": "budget_clip",
+            }],
+            "cancelled": [],
+            "fills": [{"order_id": "leg-0", "trades": [{"quantity": "1"}]}],
+            "vl_group": {
+                "primary_id": "leg-0",
+                "max_budget": "25",
+                "budget_consumed": "1",
+                "spent_token": "USDC",
+            },
+        }),
+    })
+    captured: list[dict] = []
+    client = _make_client(routes, captured, signer=signer)
+    client.bootstrap()
+
+    result = client.place_vl_batch([
+        VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
+        VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
+    ])
+
+    posts = [r for r in captured if r["method"] == "POST"]
+    assert [r["path"].replace("/api/v1", "") for r in posts] == ["/orders/vl/batch"]
+    orders = posts[0]["body"]["orders"]
+    assert [o["signature"] for o in orders] == [SIG_FIXED, SIG_FIXED]
+    assert all(entry["types"] == eip712.ORDER_TYPES for entry in signed)
+    assert [entry["message"]["uuid"] for entry in signed] == [int(o["uuid_int"]) for o in orders]
+    # Both legs share one group and carry their leg index.
+    uuid0, uuid1 = (int(o["uuid_int"]) for o in orders)
+    assert (uuid0 & 0xFFF, uuid1 & 0xFFF) == (0, 1)
+    assert (uuid0 >> 12) & ((1 << 112) - 1) == (uuid1 >> 12) & ((1 << 112) - 1)
+    assert result.vl_batch_id == "leg-0"
+    assert result.records[1].order_id == "leg-1"
+    assert result.amendments[0].actual_amount == "80.00"
+    assert result.vl_group is not None and result.vl_group.spent_token == "USDC"
+
+
+def _config_route(chain_id: int, contract: str) -> dict:
+    return {"GET /config": {
+        "chain_id": chain_id,
+        "sera_address": contract,
+        "eip712_domain": {
+            "name": "Sera", "version": "1", "chainId": chain_id, "verifyingContract": contract,
+        },
+    }}
+
+
+@pytest.mark.parametrize("chain_id", [1, 11155111])
+def test_bootstrap_refuses_another_contract_on_a_known_network(chain_id):
+    client = _make_client(_build_mock_routes(_config_route(chain_id, "0x" + "ab" * 20)))
+
+    with pytest.raises(RuntimeError, match=f"names Sera contract 0x{'ab' * 20} for chain {chain_id}"):
+        client.bootstrap()
+    assert client.eip712_domain is None
+
+
+def test_bootstrap_accepts_the_known_contract_in_any_case():
+    checksummed = "0x83475A1bD98a8DC2DCd507A747e4DC85da241D6e"
+    client = _make_client(_build_mock_routes(_config_route(11155111, checksummed)))
+
+    client.bootstrap()
+
+    assert client.eip712_domain["verifyingContract"].lower() == SEPOLIA_SERA
+
+
+def test_bootstrap_warns_on_a_network_it_does_not_know(caplog):
+    client = _make_client(_build_mock_routes(_config_route(31337, "0x" + "cd" * 20)))
+
+    client.bootstrap()
+
+    assert "chain 31337 is not a known Sera network" in caplog.text

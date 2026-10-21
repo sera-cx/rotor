@@ -170,12 +170,12 @@ def compose_uuid(
 
 
 # ---------------------------------------------------------------------------
-# Canonical Order struct construction (preview-free placement)
+# Canonical Order struct construction
 #
-# Sera's testnet deployment exposes `POST /orders/preview`, which returns the
-# canonical EIP-712 struct the server will verify. The mainnet deployment does
-# NOT expose that endpoint, so against mainnet Rotor must derive the identical
-# struct locally.
+# Rotor signs only orders it builds itself, on every network, never a struct a
+# server hands it. The server rebuilds the struct from the submitted order and
+# recovers the signer, so the local struct must be the one the server derives.
+# Golden vectors captured from testnet's `POST /orders/preview` pin that.
 #
 # Everything below mirrors the server's own struct derivation byte-for-byte. Any divergence produces a struct hash the server will not
 # recover the expected signer from, and the order is rejected. When changing

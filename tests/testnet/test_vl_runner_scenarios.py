@@ -94,7 +94,7 @@ class _RecordingClient:
             )
         return result
 
-    def place_order_previewed(
+    def place_order(
         self,
         market: str,
         side: str,
@@ -102,7 +102,7 @@ class _RecordingClient:
         price: Decimal,
         expiration: int,
     ) -> OrderRecord:
-        record = self.inner.place_order_previewed(
+        record = self.inner.place_order(
             market,
             side,
             qty_base,
@@ -446,7 +446,7 @@ def test_testnet_vl_runner_fill_then_return_requote(
 
     def fill_after_first_tick() -> None:
         maker_order = _first_order(maker, market=target_market, side=maker_side)
-        taker_record = taker.place_order_previewed(
+        taker_record = taker.place_order(
             target_market,
             _opposite_side(maker_side),
             qty_base,

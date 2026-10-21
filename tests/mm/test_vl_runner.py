@@ -452,7 +452,7 @@ class _PlacingClient:
             vl_group=None,
         )
 
-    def place_order_previewed(self, market, side, qty_base, price, expiration):
+    def place_order(self, market, side, qty_base, price, expiration):
         if self.fail_standalone:
             raise RuntimeError("placement rejected")
         return OrderRecord(order_id="solo-1", uuid_int=7)
@@ -534,7 +534,7 @@ def test_standalone_placement_tracks_intent_for_settlement():
     class Client:
         vl_batch_min = 2
 
-        def place_order_previewed(self, market, side, qty_base, price, expiration):
+        def place_order(self, market, side, qty_base, price, expiration):
             return OrderRecord(order_id="solo-1", uuid_int=7)
 
     placements = _place_groups(

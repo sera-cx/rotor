@@ -197,7 +197,7 @@ class _FakeClient:
             vl_group=None,
         )
 
-    def place_order_previewed(
+    def place_order(
         self,
         market: str,
         side: str,

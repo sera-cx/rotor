@@ -141,7 +141,7 @@ def test_place_groups_skips_a_rejected_order_and_places_the_rest(caplog):
     class Client:
         vl_batch_min = 2
 
-        def place_order_previewed(self, market, side, qty_base, price, expiration):
+        def place_order(self, market, side, qty_base, price, expiration):
             calls.append(("place", market))
             if market == "EURC/USDC":
                 raise errors.SeraError("INSUFFICIENT_EQUITY", "not enough EURC", 400)

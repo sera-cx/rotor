@@ -17,6 +17,13 @@ from rotor.mm.exchange import eip712, errors
 
 # Hosts for which an http:// base URL is tolerated (local dev/mocks only).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
+# The Sera contract each known network's signatures must name. A /config that
+# names another contract for one of these chains is refused at bootstrap, so a
+# wrong or hostile SERA_BASE_URL cannot point signatures elsewhere.
+KNOWN_SERA_CONTRACTS = {
+    1: "0xB5C50C5D5f038404F85970b7f5B7259C4AC0E198",  # Ethereum mainnet
+    11155111: "0x83475A1bD98a8DC2DCd507A747e4DC85da241D6e",  # Sepolia testnet
+}
 # Sera's documented per-wallet limits for API-key requests, in requests per second.
 RATE_LIMITS = {"read": 10.0, "trade": 5.0, "cancel": 2.0}
 # A rate-limited (429) or server-error (503) reply is retried this many times.
@@ -24,9 +31,9 @@ MAX_RETRIES = 2
 # The longest Retry-After wait honoured before a retry, in seconds.
 MAX_RETRY_WAIT_S = 5.0
 # POSTs that are safe to repeat after a server error: Sera dedupes an order on
-# its client-chosen order_id, and a repeated cancel or preview changes nothing.
+# its client-chosen order_id, and a repeated cancel changes nothing.
 # A VL batch is not here: Sera does not document deduping a whole batch.
-_REPEATABLE_POSTS = {"/orders", "/orders/preview", "/orders/cancel", "/orders/vl/cancel"}
+_REPEATABLE_POSTS = {"/orders", "/orders/cancel", "/orders/vl/cancel"}
 
 
 @dataclass(frozen=True)
@@ -143,22 +150,16 @@ class VLBatchResult:
 
 
 @dataclass(frozen=True)
-class OrderPreview:
-    """Canonical server preview for a limit order."""
+class SignableOrder:
+    """A limit order rotor built itself: the Order message it signs, and its wire form."""
 
     # UUID string Rotor generated or reused for this order.
     order_id: str
     # Packed identifier derived from the order/group/executor values.
     uuid_int: int
-    # Server-normalized amount string.
-    amount: str
-    # Server-normalized price string.
-    price: str
-    # Canonical message body Sera expects to be signed.
-    eip712_order: dict
-    # Type schema Sera expects for the signature.
-    eip712_types: dict
-    # Wire payload Rotor will submit after attaching a signature.
+    # The EIP-712 Order message (eip712.ORDER_TYPES) rotor signs.
+    struct: dict
+    # Wire payload Rotor submits after attaching a signature.
     wire: dict
 
 
@@ -191,8 +192,8 @@ class SeraClient:
         # Normalize the base URL once so later path joins are simple.
         self.base_url = base_url.rstrip("/")
         # Refuse to sign and submit orders over a non-TLS transport (outside of
-        # localhost dev/mocks): an http:// or MITM'd endpoint could return an
-        # EIP-712 struct that drains the wallet. See `_assert_preview_matches`.
+        # localhost dev/mocks): an http:// or MITM'd endpoint could feed rotor
+        # false market metadata, signing domain, or server time.
         _require_secure_base_url(self.base_url)
         # A single httpx client keeps connection behavior consistent.
         self._http = httpx.Client(timeout=timeout)
@@ -211,11 +212,6 @@ class SeraClient:
         # Server-provided VL batch size limits; defaults are conservative.
         self.vl_batch_min: int = 2
         self.vl_batch_max: int = 50
-        # Whether this deployment exposes `POST /orders/preview`. Testnet does;
-        # mainnet does not. `None` means "not probed yet" — the first preview
-        # attempt resolves it, and a 404/405 flips it to False so every later
-        # order is built locally instead (see `_local_preview`).
-        self.preview_supported: bool | None = None
         # Market metadata cache keyed by Sera symbol.
         self.markets_by_symbol: dict[str, MarketInfo] = {}
 
@@ -256,6 +252,17 @@ class SeraClient:
         # Both fields are mandatory for EIP-712 signature verification.
         if not domain.get("chainId") or not domain.get("verifyingContract"):
             raise RuntimeError(f"GET /config returned incomplete domain: {cfg!r}")
+        expected = KNOWN_SERA_CONTRACTS.get(int(domain["chainId"]))
+        if expected is None:
+            self._log.warning(
+                "chain %s is not a known Sera network; signing for contract %s from GET /config",
+                domain["chainId"], domain["verifyingContract"],
+            )
+        elif str(domain["verifyingContract"]).lower() != expected.lower():
+            raise RuntimeError(
+                f"GET /config names Sera contract {domain['verifyingContract']} for chain "
+                f"{domain['chainId']}, not {expected}; check SERA_BASE_URL"
+            )
         self.eip712_domain = domain
         # VL batch limits are dynamic server config; keep local guards in sync.
         vl_limits = (cfg.get("limits") or {}).get("vl_batch") or {}
@@ -304,7 +311,7 @@ class SeraClient:
             len(self.markets_by_symbol),
         )
 
-    def preview_order(
+    def build_order(
         self,
         market: str,
         side: str,
@@ -315,12 +322,20 @@ class SeraClient:
         order_id: str | None = None,
         leg_id: int = 0,
         group_uuid: str | None = None,
-    ) -> OrderPreview:
-        """Call `POST /orders/preview` for a limit order."""
-        # Resolve market metadata before constructing token-address payloads.
+    ) -> SignableOrder:
+        """Build a limit order's EIP-712 Order message and wire payload locally.
+
+        Rotor never signs a struct the server hands it: every field of the
+        signed message comes from the intended order and the bootstrapped
+        market metadata. `eip712.build_order_struct` mirrors the server's own
+        builder (golden vectors from Sera's preview endpoint prove it), so the
+        server rebuilds the same struct and accepts the signature. The only
+        server-supplied inputs left are the token addresses and decimals from
+        `GET /markets` and the signing domain from `GET /config`, whose
+        contract is pinned for known networks.
+        """
         info = self._market(market)
-        # Callers can provide the order id for VL grouping; standalone orders
-        # generate a fresh UUID.
+        # VL legs pass their order id and group; standalone orders get a fresh UUID.
         final_order_id = order_id or eip712.new_order_id()
         # Sera requires a packed uuid_int for signing and cancel flows.
         uuid_int = eip712.compose_uuid(
@@ -329,92 +344,6 @@ class SeraClient:
             leg_id=leg_id,
             group_uuid=group_uuid,
         )
-        # Build Rotor's initial human-decimal wire payload.
-        wire = _order_preview_wire(
-            owner_address=self.owner_address,
-            side=side,
-            qty_base=qty_base,
-            price=price,
-            base_address=info.base_address,
-            quote_address=info.quote_address,
-            order_id=final_order_id,
-            uuid_int=uuid_int,
-            expiration=expiration,
-        )
-        # Deployments without the preview endpoint (mainnet) build the struct
-        # locally; skip the round trip entirely once that is known.
-        if self.preview_supported is False:
-            return self._local_preview(info, side, qty_base, price, expiration,
-                                       final_order_id, uuid_int, wire)
-        # Preview lets Sera normalize amount/price and return the canonical
-        # EIP-712 struct that must be signed.
-        try:
-            body = self._request(
-                "POST",
-                "/orders/preview",
-                json_body=wire,
-                authed=False,
-                expect_status=(200, 201),
-            )
-        except errors.SeraError as exc:
-            # 404/405 means this deployment has no preview endpoint at all — a
-            # deployment property, not an order problem. Latch it and fall back
-            # to deriving the canonical struct locally. Any other status is a
-            # real rejection of this order and must propagate.
-            if getattr(exc, "status_code", None) not in (404, 405):
-                raise
-            self.preview_supported = False
-            self._log.warning(
-                "orders/preview unavailable (HTTP %s); deriving the EIP-712 "
-                "struct locally from GET /markets metadata",
-                getattr(exc, "status_code", "?"),
-            )
-            return self._local_preview(info, side, qty_base, price, expiration,
-                                       final_order_id, uuid_int, wire)
-        # A successful call proves the endpoint exists on this deployment.
-        self.preview_supported = True
-        # The preview contract is mandatory: final placement must sign the
-        # returned EIP-712 message and submit these normalized decimal strings.
-        amount, norm_price, eip712_order, eip712_types = _parse_order_preview(body)
-        # The final wire payload must use normalized amount/price before signing
-        # and placement.
-        final_wire = dict(wire)
-        final_wire["amount"] = amount
-        final_wire["price"] = norm_price
-        return OrderPreview(
-            order_id=final_order_id,
-            uuid_int=uuid_int,
-            amount=amount,
-            price=norm_price,
-            eip712_order=eip712_order,
-            eip712_types=eip712_types,
-            wire=final_wire,
-        )
-
-    def _local_preview(
-        self,
-        info: MarketInfo,
-        side: str,
-        qty_base: Decimal,
-        price: Decimal,
-        expiration: int,
-        order_id: str,
-        uuid_int: int,
-        wire: dict,
-    ) -> OrderPreview:
-        """Derive the canonical order struct without `POST /orders/preview`.
-
-        Used against deployments that do not expose the preview endpoint
-        (mainnet). `eip712.build_order_struct` mirrors the server's own
-        `build_order_struct`, so the struct signed here is the struct the
-        server rebuilds and verifies against.
-
-        Trust note: with preview, the amounts came from the server and
-        `_assert_preview_matches` re-checked them. Here Rotor computes them
-        itself, so the only server-supplied inputs are the token addresses and
-        decimals from `GET /markets` — a narrower surface, but one that still
-        must be trusted to be correct for the pair being traded.
-        """
         struct = eip712.build_order_struct(
             owner_address=self.owner_address,
             side=side,
@@ -427,19 +356,20 @@ class SeraClient:
             uuid_int=uuid_int,
             expiration=expiration,
         )
-        # Without a server round trip the caller's own decimal strings are the
-        # canonical amount/price; the wire payload already carries them.
-        return OrderPreview(
-            order_id=order_id,
+        wire = _order_wire(
+            owner_address=self.owner_address,
+            side=side,
+            qty_base=qty_base,
+            price=price,
+            base_address=info.base_address,
+            quote_address=info.quote_address,
+            order_id=final_order_id,
             uuid_int=uuid_int,
-            amount=str(qty_base),
-            price=str(price),
-            eip712_order=struct,
-            eip712_types=eip712.ORDER_TYPES,
-            wire=dict(wire),
+            expiration=expiration,
         )
+        return SignableOrder(order_id=final_order_id, uuid_int=uuid_int, struct=struct, wire=wire)
 
-    def place_order_previewed(
+    def place_order(
         self,
         market: str,
         side: str,
@@ -447,32 +377,19 @@ class SeraClient:
         price: Decimal,
         expiration: int,
     ) -> OrderRecord:
-        """Preview, sign exactly what Sera returns, then place the order."""
-        # Preview first so the signature covers Sera's canonical normalized data.
-        preview = self.preview_order(market, side, qty_base, price, expiration)
-        if not preview.eip712_order:
-            raise RuntimeError("POST /orders/preview did not return eip712_order")
-        # Refuse to sign a struct whose owner/recipient/token-direction/amounts
-        # disagree with the order we intended (server-compromise / MITM guard).
-        self._assert_preview_matches(self._market(market), side, qty_base, price, preview)
-        # Coerce typed integer fields before passing the message to eth-account.
-        signature = self._sign(
-            preview.eip712_types,
-            _typed_message_for_signing(preview.eip712_types, preview.eip712_order),
-        )
-        # Attach the signature to the normalized preview payload.
-        wire = dict(preview.wire)
-        wire["signature"] = signature
-        # Submit the final signed order to Sera.
+        """Build, sign, and place one limit order."""
+        order = self.build_order(market, side, qty_base, price, expiration)
+        wire = dict(order.wire)
+        wire["signature"] = self._sign_order(order)
         body = self._request("POST", "/orders", json_body=wire, expect_status=(200, 201))
         return OrderRecord(
             # Sera may echo a final order id; otherwise keep the generated id.
-            order_id=body.get("order_id", preview.order_id),
-            uuid_int=preview.uuid_int,
+            order_id=body.get("order_id", order.order_id),
+            uuid_int=order.uuid_int,
         )
 
     def place_vl_batch(self, legs: list[VLLeg]) -> VLBatchResult:
-        """Preview/sign each sibling, then place one VL batch."""
+        """Build and sign each sibling, then place one VL batch."""
         # Enforce server batch-size limits locally before generating signatures.
         if len(legs) < self.vl_batch_min:
             raise ValueError(
@@ -486,39 +403,26 @@ class SeraClient:
         # One UUID anchors the shared VL group; the first leg reuses it as its
         # order id so Sera can identify the primary order.
         group_uuid = eip712.new_order_id()
-        previews: list[OrderPreview] = []
+        orders: list[SignableOrder] = []
         for i, leg in enumerate(legs):
             # Leg 0 is the primary/group id; later legs get independent order ids
             # but share the same group_uuid and carry their leg index.
-            order_id = group_uuid if i == 0 else eip712.new_order_id()
-            preview = self.preview_order(
+            orders.append(self.build_order(
                 leg.market,
                 leg.side,
                 leg.qty_base,
                 leg.price,
                 leg.expiration,
-                order_id=order_id,
+                order_id=group_uuid if i == 0 else eip712.new_order_id(),
                 leg_id=i,
                 group_uuid=group_uuid,
-            )
-            if not preview.eip712_order:
-                raise RuntimeError("POST /orders/preview did not return eip712_order")
-            # Validate each sibling against its intent before it is signed.
-            self._assert_preview_matches(
-                self._market(leg.market), leg.side, leg.qty_base, leg.price, preview)
-            # Store each canonical preview for signing and result reconciliation.
-            previews.append(preview)
+            ))
 
         wires: list[dict] = []
-        for preview in previews:
-            # Each sibling receives its own signature over its own canonical
-            # preview message.
-            signature = self._sign(
-                preview.eip712_types,
-                _typed_message_for_signing(preview.eip712_types, preview.eip712_order),
-            )
-            wire = dict(preview.wire)
-            wire["signature"] = signature
+        for order in orders:
+            # Each sibling carries its own signature over its own Order message.
+            wire = dict(order.wire)
+            wire["signature"] = self._sign_order(order)
             wires.append(wire)
 
         # Submit all signed siblings as one VL batch.
@@ -528,34 +432,34 @@ class SeraClient:
             json_body={"orders": wires},
             expect_status=(200, 201),
         )
-        # Reconcile server-returned order ids with the local previews.
+        # Reconcile server-returned order ids with the locally built orders.
         order_ids = [str(v) for v in body.get("order_ids", [])]
         if not order_ids:
-            order_ids = [p.order_id for p in previews]
+            order_ids = [p.order_id for p in orders]
         # The batch is already live on Sera; resolve a cancelable batch id BEFORE
         # any mismatch handling so a malformed response can never orphan it.
         vl_batch_id = str(
             body.get("vl_batch_id")
             or body.get("batch_id")
             or order_ids[0]
-            or previews[0].order_id
+            or orders[0].order_id
         )
         # A length mismatch breaks positional id->leg tracking, but the whole
         # batch is still cancelable by vl_batch_id. Log loudly and track what we
         # can correlate rather than raising and leaving live orders unmanaged.
-        if len(order_ids) != len(previews):
+        if len(order_ids) != len(orders):
             self._log.error(
                 "POST /orders/vl/batch returned %d order_ids for %d submitted legs; "
                 "tracking batch %s for cancellation",
                 len(order_ids),
-                len(previews),
+                len(orders),
                 vl_batch_id,
             )
         # Pair returned order ids with the uuid_int values computed for signing
         # (positionally, over the safely-correlated prefix on a mismatch).
         records = [
-            OrderRecord(order_id=order_id, uuid_int=preview.uuid_int)
-            for order_id, preview in zip(order_ids, previews, strict=False)
+            OrderRecord(order_id=order_id, uuid_int=order.uuid_int)
+            for order_id, order in zip(order_ids, orders, strict=False)
         ]
         # Parse optional shared-budget state into a typed dataclass.
         vl_group = _parse_vl_group(body.get("vl_group"))
@@ -735,61 +639,12 @@ class SeraClient:
             raise RuntimeError("client not booted; call bootstrap() first")
         return self._signer(self.eip712_domain, types, message)
 
-    def _assert_preview_matches(
-        self,
-        info: MarketInfo,
-        side: str,
-        qty_base: Decimal,
-        price: Decimal,
-        preview: OrderPreview,
-    ) -> None:
-        """Raise if the server's EIP-712 order disagrees with the intended order.
-
-        The maker signs whatever `/orders/preview` returns, so a compromised or
-        MITM'd server could otherwise coax a signature over an order that pays an
-        attacker recipient, swaps tokens, or inflates the spent amount. Identity
-        fields are checked exactly; the signed raw amounts are anchored to the
-        locally-requested `qty_base`/`price` (not the server's own echo) within a
-        tolerance for grid normalization, so consistent server-side inflation is
-        still rejected.
-        """
-        order = preview.eip712_order
-
-        def addr(value: object) -> str:
-            return str(value or "").lower()
-
-        # Owner must be this wallet (owner_address is stored lower-cased).
-        if addr(order.get("user")) != self.owner_address:
-            raise errors.SeraPreviewMismatch(
-                f"preview user {order.get('user')!r} != owner {self.owner_address!r}"
-            )
-        # Settlement must return to the wallet (zero address), never a third party.
-        recipient = addr(order.get("recipient"))
-        if recipient and int(recipient, 16) != 0:
-            raise errors.SeraPreviewMismatch(
-                f"preview recipient is not zero: {order.get('recipient')!r}"
-            )
-
-        base = info.base_address.lower()
-        quote = info.quote_address.lower()
-        is_bid = str(side).lower() in ("bid", "buy")
-        # A bid spends quote to receive base; an ask spends base to receive quote.
-        spend_token, recv_token = (quote, base) if is_bid else (base, quote)
-        if addr(order.get("fromToken")) != spend_token:
-            raise errors.SeraPreviewMismatch(
-                f"preview fromToken {order.get('fromToken')!r} != expected {spend_token!r}"
-            )
-        if addr(order.get("toToken")) != recv_token:
-            raise errors.SeraPreviewMismatch(
-                f"preview toToken {order.get('toToken')!r} != expected {recv_token!r}"
-            )
-
-        # Anchor the signed raw amounts to what Rotor intended to trade.
-        base_raw = qty_base * (Decimal(10) ** info.base_decimals)
-        quote_raw = qty_base * price * (Decimal(10) ** info.quote_decimals)
-        expected_from, expected_to = (quote_raw, base_raw) if is_bid else (base_raw, quote_raw)
-        _assert_amount_close("fromAmount", order.get("fromAmount"), expected_from)
-        _assert_amount_close("toAmount", order.get("toAmount"), expected_to)
+    def _sign_order(self, order: SignableOrder) -> str:
+        """Sign a locally built order as Sera's Order type."""
+        return self._sign(
+            eip712.ORDER_TYPES,
+            _typed_message_for_signing(eip712.ORDER_TYPES, order.struct),
+        )
 
     def _pace(self, group: str) -> None:
         """Wait until a request in `group` stays within Sera's per-wallet limit."""
@@ -855,7 +710,7 @@ class SeraClient:
             return {}
 
 
-def _order_preview_wire(
+def _order_wire(
     *,
     owner_address: str,
     side: str,
@@ -867,8 +722,8 @@ def _order_preview_wire(
     uuid_int: int,
     expiration: int,
 ) -> dict:
-    """Build the unsigned order-preview payload sent to Sera."""
-    # Sera preview accepts human-decimal amount/price strings and token addresses.
+    """Build the unsigned order payload rotor signs and posts to Sera."""
+    # Sera accepts human-decimal amount/price strings and token addresses.
     return {
         # Owner and side identify who trades and direction.
         "owner_address": owner_address,
@@ -882,7 +737,7 @@ def _order_preview_wire(
         # from the side field.
         "from_address": base_address,
         "to_address": quote_address,
-        # Identifiers and expiry are included before preview normalization.
+        # Identifiers and expiry match the signed Order message.
         "order_id": order_id,
         "uuid_int": str(uuid_int),
         "expiration": int(expiration),
@@ -922,34 +777,6 @@ def _parse_healthy_executor_id(health: Any) -> int:
             raise RuntimeError(f"GET /health executor drift: {health!r}")
 
     return executor_id
-
-
-def _parse_order_preview(body: Any) -> tuple[str, str, dict, dict]:
-    """Validate Sera's canonical order-preview response."""
-    if not isinstance(body, dict):
-        raise RuntimeError(f"POST /orders/preview returned invalid body: {body!r}")
-
-    required = ("normalized_amount", "normalized_price", "eip712_order", "eip712_types")
-    missing = [key for key in required if key not in body or body[key] is None]
-    if missing:
-        raise RuntimeError(
-            "POST /orders/preview missing required field(s): "
-            + ", ".join(missing)
-        )
-
-    eip712_order = body["eip712_order"]
-    eip712_types = body["eip712_types"]
-    if not isinstance(eip712_order, dict) or not eip712_order:
-        raise RuntimeError("POST /orders/preview returned invalid eip712_order")
-    if not isinstance(eip712_types, dict) or not eip712_types:
-        raise RuntimeError("POST /orders/preview returned invalid eip712_types")
-
-    return (
-        str(body["normalized_amount"]),
-        str(body["normalized_price"]),
-        dict(eip712_order),
-        dict(eip712_types),
-    )
 
 
 def _typed_message_for_signing(types: dict, message: dict) -> dict:
@@ -1025,23 +852,6 @@ def _require_secure_base_url(base_url: str) -> None:
         "SERA_BASE_URL must use https:// (the maker signs orders against this "
         f"endpoint); got {base_url!r}"
     )
-
-
-def _assert_amount_close(name: str, actual: object, expected: Decimal) -> None:
-    """Raise unless a signed raw amount is within tolerance of the expected raw."""
-    if actual is None:
-        raise errors.SeraPreviewMismatch(f"preview missing {name}")
-    try:
-        actual_dec = Decimal(str(actual))
-    except (ArithmeticError, ValueError) as exc:
-        raise errors.SeraPreviewMismatch(f"preview {name} is not numeric: {actual!r}") from exc
-    # Allow 1% + 2 base units of slack to absorb normalization/rounding while
-    # still rejecting the order-of-magnitude inflation an attacker would need.
-    tolerance = abs(expected) * Decimal("0.01") + Decimal(2)
-    if abs(actual_dec - expected) > tolerance:
-        raise errors.SeraPreviewMismatch(
-            f"preview {name} {actual_dec} differs from expected {expected} beyond tolerance"
-        )
 
 
 def _parse_vl_group(value) -> VLGroup | None:
