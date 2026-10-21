@@ -12,6 +12,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field, replace
@@ -86,6 +87,13 @@ MAX_GUARD_WAIT_SECONDS = 60.0
 BOOT_ATTEMPTS_PER_HOUR = 3
 # Seconds to wait before the 2nd and 3rd startup attempt within an hour.
 BOOT_RETRY_WAITS = (30.0, 60.0)
+# A running rotor re-reads Sera's metadata (config, health, markets) this often,
+# and no sooner than EARLY_REFRESH_SECONDS after the last read when a rejection
+# suggests it went stale. Markets Sera rejects as inactive sit out until then.
+METADATA_REFRESH_SECONDS = 3600.0
+EARLY_REFRESH_SECONDS = 600.0
+# How Sera names an inactive pair when it rejects a VL batch.
+_INACTIVE_PAIR = re.compile(r"Pair (\S+) is not an active trading pair")
 
 
 @dataclass(frozen=True)
@@ -784,6 +792,14 @@ def run(
     restart_after_update = False
     # order id -> consecutive ticks its fills could not be read.
     read_failures: dict[str, int] = {}
+    # Markets Sera rejected as inactive: not quoted until the next metadata
+    # refresh. Each is alerted once, until it places again.
+    inactive: set[str] = set()
+    inactive_alerted: set[str] = set()
+    last_refresh = time.time()
+    next_refresh = last_refresh + METADATA_REFRESH_SECONDS
+    # True while metadata refreshes fail; alerted when it starts and ends.
+    refresh_failing = False
     # Stall watchdog: alert the operator (once per window) when the loop has not
     # placed a fresh quote set for a while because every tick is skipping
     # (stale prices, fill-poll failures, a stuck cancel). The hourly heartbeat
@@ -815,6 +831,40 @@ def run(
                     restart_after_update = True
                     log.warning("auto-update stopping VL loop before restart")
                     break
+            # Re-read Sera's metadata hourly (sooner after a rejection that
+            # suggests it went stale). A failed refresh keeps the last good
+            # metadata and is tried again later; --once runs read it at boot.
+            if not dry_run and not once and time.time() >= next_refresh:
+                try:
+                    runtimes = _refresh_runtimes(
+                        config,
+                        client,
+                        runtimes,
+                        max_reference_age_s=max_reference_age_s,
+                        carry_stale=not halt_on_stale_reference,
+                        log=log,
+                        notifier=notifier,
+                    )
+                    markets = {rt.config.market for rt in runtimes}
+                    inactive.clear()
+                    last_refresh = time.time()
+                    next_refresh = last_refresh + METADATA_REFRESH_SECONDS
+                    if refresh_failing:
+                        refresh_failing = False
+                        log.warning("Sera metadata refresh recovered")
+                        if notifier is not None:
+                            notifier.send_raw("✅ Sera market metadata refreshed again.")
+                except Exception as exc:
+                    log.warning("could not refresh Sera metadata; keeping the last: %s", exc)
+                    next_refresh = time.time() + EARLY_REFRESH_SECONDS
+                    if not refresh_failing:
+                        refresh_failing = True
+                        if notifier is not None:
+                            notifier.notify_error(
+                                "could not refresh Sera market metadata; quoting on the "
+                                "last good metadata and retrying every 10 minutes",
+                                exc,
+                            )
             # Phase 0: if we have no tracked state, try to recover open orders
             # from Sera before quoting again (falls back to prior local state).
             if not dry_run and not live:
@@ -888,7 +938,7 @@ def run(
                     expiration=tick_expiration,
                     log=log,
                     refs=tick_refs,
-                    skip=unreadable,
+                    skip=unreadable | inactive,
                     funds=funds,
                 )
             except Exception as exc:
@@ -978,7 +1028,21 @@ def run(
             # Phase 7: place exactly the fresh quote set. Every placed order is
             # recorded for settlement as soon as Sera accepts it; an order or VL
             # batch Sera rejects is skipped and the rest still go out.
-            placed = _place_groups(client, groups, log, state=state)
+            issues = PlacementIssues()
+            placed = _place_groups(client, groups, log, state=state, issues=issues)
+            for market in sorted(issues.inactive - inactive_alerted):
+                log.error("%s is not active on Sera; not quoting it until the next refresh", market)
+                if notifier is not None:
+                    notifier.send_raw(
+                        f"⚠️ Sera says {market} is not active. Not quoting it until "
+                        "the next market refresh; the other pairs are quoting.",
+                        important=True,
+                    )
+            inactive |= issues.inactive
+            inactive_alerted |= issues.inactive
+            inactive_alerted -= {o.market for p in placed for o in p.orders}
+            if issues.stale_metadata:
+                next_refresh = min(next_refresh, last_refresh + EARLY_REFRESH_SECONDS)
             if placed:
                 live = placed
                 try:
@@ -1032,6 +1096,43 @@ def run(
     return 0
 
 
+def _refresh_runtimes(
+    config: VLConfig,
+    client: SeraClient,
+    runtimes: list[PairRuntime],
+    *,
+    max_reference_age_s: float | None,
+    carry_stale: bool,
+    log: logging.Logger,
+    notifier: TelegramNotifier | None,
+) -> list[PairRuntime]:
+    """Re-read Sera's metadata and rebuild the pairs from it.
+
+    Bootstrap is all-or-nothing and re-applies the contract and token checks;
+    on any failure this raises and the caller keeps the current pairs. Pairs
+    that drop out (unlisted, unmapped) are logged and alerted once here.
+    """
+    client.bootstrap()
+    skipped: dict[str, str] = {}
+    fresh = _build_runtimes(
+        config,
+        client,
+        max_reference_age_s=max_reference_age_s,
+        carry_stale=carry_stale,
+        log=log,
+        skipped=skipped,
+    )
+    dropped = {rt.config.market for rt in runtimes} & set(skipped)
+    if dropped and notifier is not None:
+        notifier.send_raw(
+            "⚠️ No longer quoting "
+            + "; ".join(f"{market} ({skipped[market]})" for market in sorted(dropped))
+            + ". The other pairs are quoting.",
+            important=True,
+        )
+    return fresh
+
+
 def _start(
     config_path: str | Path,
     *,
@@ -1043,11 +1144,10 @@ def _start(
     """One startup attempt: load the config, bootstrap Sera, and build the pairs."""
     config = load_vl_config(config_path)
     # Construction rejects a non-TLS base URL; bootstrap loads the signing
-    # domain, executor id, and markets; config limits refresh VL batch sizes.
+    # domain, VL batch limits, executor id, and markets.
     client = build_client(dry_run=dry_run, log=log)
     try:
         client.bootstrap()
-        client.get_config_limits()
         # market -> why that configured pair is not quoted.
         skipped: dict[str, str] = {}
         runtimes = _build_runtimes(
@@ -1583,106 +1683,182 @@ def _with_return_order(
     return [returning if intent is normal else intent for intent in intents]
 
 
+@dataclass
+class PlacementIssues:
+    """What one tick's placement learned about Sera's markets."""
+
+    # Markets Sera rejected as not active.
+    inactive: set[str] = field(default_factory=set)
+    # Whether a rejection suggests stale grids, minimums, or batch limits.
+    stale_metadata: bool = False
+
+    def note(self, exc: Exception) -> None:
+        if isinstance(exc, errors.SeraError) and (
+            exc.status_code == 422 or exc.error_code == "AMOUNT_BELOW_MIN"
+        ):
+            self.stale_metadata = True
+
+
+def _inactive_market(exc: Exception, intents: list[OrderIntent]) -> str | None:
+    """The market among `intents` that a placement error says is not active."""
+    if not isinstance(exc, errors.SeraError):
+        return None
+    markets = {intent.market for intent in intents}
+    # A single order gets the PAIR_INACTIVE code; a VL batch gets Sera's
+    # message, which names the pair as BASE/QUOTE like rotor's market symbols.
+    if exc.error_code == "PAIR_INACTIVE" and len(markets) == 1:
+        return next(iter(markets))
+    match = _INACTIVE_PAIR.search(exc.detail or "")
+    named = match.group(1).upper() if match else None
+    return next((market for market in markets if market.upper() == named), None)
+
+
 def _place_groups(
     client: SeraClient,
     groups: list[tuple[str, list[OrderIntent], bool]],
     log: logging.Logger,
     *,
     state: StateStore | None = None,
+    issues: PlacementIssues | None = None,
 ) -> list[LivePlacement]:
     """Place grouped intents and return the placements Sera accepted.
 
     Each VL batch and each standalone order is placed on its own. One that Sera
-    rejects (an unfunded order, an inactive market, a rate limit) is logged and
-    skipped; the rest still go out and are tracked. With `state`, each accepted
-    placement's orders are recorded for fill settlement as soon as Sera accepts
-    them.
+    rejects (an unfunded order, a rate limit) is logged and skipped; the rest
+    still go out and are tracked. A VL batch rejected because one of its
+    markets is not active is re-sent without that market. With `state`, each
+    accepted placement's orders are recorded for fill settlement as soon as
+    Sera accepts them. `issues` collects what placement learned.
     """
+    issues = PlacementIssues() if issues is None else issues
     placed: list[LivePlacement] = []
     for spent_token, intents, use_vl in groups:
         if use_vl:
-            try:
-                # VL batches submit sibling legs that share one spent-token budget.
-                result = client.place_vl_batch([
-                    VLLeg(
-                        market=i.market,
-                        side=i.side,
-                        qty_base=i.qty_base,
-                        price=i.price,
-                        expiration=i.expiration,
-                    )
-                    for i in intents
-                ])
-            except Exception as exc:
+            # Whatever the batch had to shed below Sera's minimum goes out alone.
+            intents = _place_vl_batch(
+                client, spent_token, intents, placed, log, state=state, issues=issues)
+        for intent in intents:
+            _place_standalone(client, intent, placed, log, state=state, issues=issues)
+    return placed
+
+
+def _place_vl_batch(
+    client: SeraClient,
+    spent_token: str,
+    intents: list[OrderIntent],
+    placed: list[LivePlacement],
+    log: logging.Logger,
+    *,
+    state: StateStore | None,
+    issues: PlacementIssues,
+) -> list[OrderIntent]:
+    """Place one VL batch, dropping any leg Sera says is on an inactive market.
+
+    Returns the legs left over when dropping takes the batch below Sera's
+    minimum batch size; the caller places those as standalone orders.
+    """
+    legs = list(intents)
+    while len(legs) >= client.vl_batch_min:
+        try:
+            result = client.place_vl_batch([
+                VLLeg(
+                    market=i.market,
+                    side=i.side,
+                    qty_base=i.qty_base,
+                    price=i.price,
+                    expiration=i.expiration,
+                )
+                for i in legs
+            ])
+        except Exception as exc:
+            issues.note(exc)
+            inactive = _inactive_market(exc, legs)
+            if inactive is None:
                 log.error(
                     "could not place VL batch spent=%s legs=%d: %s",
-                    spent_token,
-                    len(intents),
-                    exc,
+                    spent_token, len(legs), exc,
                 )
-                continue
-            # Convert Sera's batch response into local cancellation/fill state.
-            placement = _placement_from_vl_result(spent_token, result, intents)
-            placed.append(placement)
-            if state is not None:
-                state.add_unsettled(_unsettled_orders(placement))
-            log.debug(
-                "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
-                result.vl_batch_id,
-                spent_token,
-                len(result.records),
-                len(result.amendments),
-                len(result.cancelled),
-                len(result.fills),
+                return []
+            issues.inactive.add(inactive)
+            log.warning(
+                "%s is not active on Sera; sending the %s batch without it",
+                inactive, spent_token,
             )
+            legs = [leg for leg in legs if leg.market != inactive]
             continue
-        for intent in intents:
-            try:
-                # Singletons and unbudgeted groups place as ordinary orders.
-                record = client.place_order(
-                    intent.market,
-                    intent.side,
-                    intent.qty_base,
-                    intent.price,
-                    intent.expiration,
-                )
-            except Exception as exc:
-                log.error(
-                    "could not place %s %s spent=%s: %s",
-                    intent.market,
-                    intent.side,
-                    intent.spent_token,
-                    exc,
-                )
-                continue
-            placement = LivePlacement(
-                kind="standalone",
-                spent_token=intent.spent_token,
-                orders=[_live_from_record(
-                    intent.market,
-                    intent.side,
-                    record,
-                    qty_base=intent.qty_base,
-                )],
-                placed_at=time.time(),
-                # Track the source intent so this order's fills can be counted
-                # at its price once they settle.
-                intent_by_order_id={record.order_id: intent},
-            )
-            placed.append(placement)
-            if state is not None:
-                state.add_unsettled(_unsettled_orders(placement))
-            # Reason helps operators understand why VL was not used.
-            reason = "singleton" if len(intents) < client.vl_batch_min else "unbudgeted"
-            log.debug(
-                "placed standalone %s %s side=%s spent=%s reason=%s",
-                intent.market,
-                record.order_id,
-                intent.side,
-                intent.spent_token,
-                reason,
-            )
-    return placed
+        # Convert Sera's batch response into local cancellation/fill state.
+        placement = _placement_from_vl_result(spent_token, result, legs)
+        placed.append(placement)
+        if state is not None:
+            state.add_unsettled(_unsettled_orders(placement))
+        log.debug(
+            "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
+            result.vl_batch_id,
+            spent_token,
+            len(result.records),
+            len(result.amendments),
+            len(result.cancelled),
+            len(result.fills),
+        )
+        return []
+    return legs
+
+
+def _place_standalone(
+    client: SeraClient,
+    intent: OrderIntent,
+    placed: list[LivePlacement],
+    log: logging.Logger,
+    *,
+    state: StateStore | None,
+    issues: PlacementIssues,
+) -> None:
+    """Place one ordinary order, logging and skipping it if Sera rejects it."""
+    try:
+        record = client.place_order(
+            intent.market,
+            intent.side,
+            intent.qty_base,
+            intent.price,
+            intent.expiration,
+        )
+    except Exception as exc:
+        issues.note(exc)
+        inactive = _inactive_market(exc, [intent])
+        if inactive is not None:
+            issues.inactive.add(inactive)
+        log.error(
+            "could not place %s %s spent=%s: %s",
+            intent.market,
+            intent.side,
+            intent.spent_token,
+            exc,
+        )
+        return
+    placement = LivePlacement(
+        kind="standalone",
+        spent_token=intent.spent_token,
+        orders=[_live_from_record(
+            intent.market,
+            intent.side,
+            record,
+            qty_base=intent.qty_base,
+        )],
+        placed_at=time.time(),
+        # Track the source intent so this order's fills can be counted at its
+        # price once they settle.
+        intent_by_order_id={record.order_id: intent},
+    )
+    placed.append(placement)
+    if state is not None:
+        state.add_unsettled(_unsettled_orders(placement))
+    log.debug(
+        "placed standalone %s %s side=%s spent=%s",
+        intent.market,
+        record.order_id,
+        intent.side,
+        intent.spent_token,
+    )
 
 
 def _placement_from_vl_result(

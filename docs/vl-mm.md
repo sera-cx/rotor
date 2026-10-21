@@ -109,6 +109,8 @@ Rules:
   use the symbol `GET /markets` returns. A configured market Sera does not list
   is skipped with a warning (and a Telegram alert with `--telegram`) while the
   other pairs quote; rotor refuses to start only if Sera lists none of them.
+  A running rotor re-checks this hourly (see [Sera Changes While
+  Running](#sera-changes-while-running)).
 - `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `wise` needs
   `WISE_API_TOKEN` and `fed` (the official FRED API) needs a free `FRED_API_KEY`;
   `ecb`, `bnm`, and `mas` are keyless.
@@ -173,6 +175,29 @@ restarts and scheduled fires share it. Any other failure (a bad config, a wrong
 contract or token, no quotable pair, a locked state file) stops rotor at once.
 With `--telegram`, the hour's first and third failure and the start that
 follows them each send an alert.
+
+## Sera Changes While Running
+
+A long-running rotor re-reads Sera's metadata (`GET /config`, `/health`,
+`/markets`) every hour, with the same contract and token checks as startup, and
+rebuilds its pairs and VL batch limits from it. A pair Sera no longer lists stops
+quoting (with an alert); a newly listed configured pair starts. A refresh is all
+or nothing: if any read or check fails, rotor keeps quoting on the last good
+metadata, retries every 10 minutes, and with `--telegram` alerts once when
+refreshes start failing and once when they recover.
+
+Between refreshes:
+
+- When Sera rejects an order or a VL batch leg because its pair is not active,
+  rotor re-sends the rest of the batch without that leg in the same cycle
+  (standalone if fewer legs than Sera's batch minimum remain), then stops
+  quoting that pair until the next refresh. With `--telegram` it alerts once
+  per pair.
+- A rejection that suggests rotor's metadata is out of date (HTTP 422, or an
+  amount below Sera's minimum) brings the next refresh forward to 10 minutes
+  after the last one.
+
+`--once` runs bootstrap fresh every fire, so they need none of this.
 
 ## Live Run
 

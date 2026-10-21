@@ -136,6 +136,9 @@ class _FakeClient:
         self.fill_status = fill_status
         # Asks spend base tokens; a wallet funded only with USDC cannot back them.
         self.reject_asks = reject_asks
+        # Markets Sera rejects orders for as not active (still listed).
+        self.inactive_markets: set[str] = set()
+        self.inactive_rejections: list[str] = []
         # Raised by bootstrap() in order, one per call, until the list is empty.
         self.bootstrap_errors: list[Exception] = []
         # Vault balances by symbol; None means GET /balances fails.
@@ -152,9 +155,6 @@ class _FakeClient:
         if self.bootstrap_errors:
             raise self.bootstrap_errors.pop(0)
 
-    def get_config_limits(self) -> None:
-        self.events.append(("limits",))
-
     def get_open_orders(self) -> list[dict]:
         self.events.append(("open_orders",))
         return list(self.open_orders)
@@ -165,6 +165,12 @@ class _FakeClient:
         return int(time.time()) + order_ttl_seconds
 
     def place_vl_batch(self, legs) -> VLBatchResult:
+        for leg in legs:
+            if leg.market in self.inactive_markets:
+                self.inactive_rejections.append(leg.market)
+                # Sera's VL route relays the matching engine's message, no code.
+                raise SeraError(None, f"Pair {leg.market} is not an active trading "
+                                "pair. See GET /markets for available pairs.", 400)
         self._batch_count += 1
         batch_id = f"batch-{self._batch_count}"
         records: list[OrderRecord] = []
@@ -209,6 +215,9 @@ class _FakeClient:
         price: Decimal,
         expiration: int,
     ) -> OrderRecord:
+        if market in self.inactive_markets:
+            self.inactive_rejections.append(market)
+            raise SeraError("PAIR_INACTIVE", "Invalid request", 400)
         if self.reject_asks and side == "ask":
             self.events.append(("rejected", market, side))
             raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
@@ -812,6 +821,90 @@ def test_run_does_not_retry_a_startup_failure_retrying_cannot_fix(monkeypatch, t
     assert stop.waits == []
     assert _boots(client) == 0
     assert len(notifier.containing("return_bps must be > 0")) == 1
+
+
+def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkeypatch):
+    # XSGD/USDC is deactivated after tick 1 but stays listed. Tick 2's USDC bid
+    # batch is re-sent without it, ticks 2-3 leave it out with one alert, and
+    # the hourly metadata refresh (tick 4) tries it again once Sera reactivates it.
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    clock = _fake_clock(monkeypatch, steps=[305.0, 305.0, 3600.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def deactivate_after_first_tick(started, poll, stop=None):
+        if clock["now"] == T0:
+            client.inactive_markets = {"XSGD/USDC"}
+        if clock["now"] == T0 + 610.0:
+            client.inactive_markets = set()
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", deactivate_after_first_tick)
+
+    result = vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True,
+                    state_path=":memory:")
+
+    assert result == 0
+    assert _markets_quoted_per_tick(client) == [
+        {"XSGD/USDC", "EURC/USDC"},
+        {"EURC/USDC"},
+        {"EURC/USDC"},
+        {"XSGD/USDC", "EURC/USDC"},
+    ]
+    # Sera rejected XSGD/USDC only on tick 2 (the bid batch, then the ask);
+    # tick 3 did not send it.
+    assert client.inactive_rejections == ["XSGD/USDC", "XSGD/USDC"]
+    assert len(notifier.containing("Sera says XSGD/USDC is not active")) == 1
+    # Boot plus the hourly refresh.
+    assert _boots(client) == 2
+
+
+def test_run_refreshes_metadata_early_after_a_rejection_that_suggests_it_is_stale(monkeypatch):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[305.0, 305.0, 1.0])
+
+    def batch_limit_changed(market, side, qty_base, price, expiration):
+        raise SeraError(None, "quantity is not on the market lot grid", 422)
+
+    monkeypatch.setattr(client, "place_order", batch_limit_changed)
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
+
+    # Rejected on tick 1, so the refresh comes 600 s after boot (tick 3), not hourly.
+    assert _boots(client) == 2
+
+
+def test_run_keeps_quoting_through_failed_metadata_refreshes_and_alerts_once(monkeypatch):
+    # Boot succeeds; the hourly refresh (tick 2) and the retry 10 minutes later
+    # (tick 3) fail; the next retry (tick 4) succeeds.
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    clock = _fake_clock(monkeypatch, steps=[3600.0, 600.0, 600.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def refresh_fails_twice(started, poll, stop=None):
+        if clock["now"] == T0:
+            client.bootstrap_errors = [SERA_DOWN, SERA_DOWN]
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", refresh_fails_twice)
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True,
+           state_path=":memory:")
+
+    assert _boots(client) == 4
+    assert len(_markets_quoted_per_tick(client)) == 4
+    assert all(markets == {"XSGD/USDC", "EURC/USDC"} for markets in _markets_quoted_per_tick(client))
+    assert len(notifier.containing("could not refresh Sera market metadata")) == 1
+    assert len(notifier.containing("metadata refreshed again")) == 1
 
 
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):

@@ -557,3 +557,71 @@ def test_standalone_placement_tracks_intent_for_settlement():
             placed_at=placement.orders[0].placed_at,
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Inactive markets
+# ---------------------------------------------------------------------------
+
+def test_inactive_market_is_read_from_either_of_seras_reply_shapes():
+    bid = _intent("XSGD/USDC", "bid", "USDC")
+    other = _intent("EURC/USDC", "bid", "USDC")
+    batch_reply = errors.SeraError(
+        None, "Pair XSGD/USDC is not an active trading pair. See GET /markets.", 400)
+    order_reply = errors.SeraError("PAIR_INACTIVE", "Invalid request", 400)
+
+    assert vr._inactive_market(batch_reply, [bid, other]) == "XSGD/USDC"
+    assert vr._inactive_market(order_reply, [bid]) == "XSGD/USDC"
+    # A pair the batch did not contain, or another error, names nothing.
+    assert vr._inactive_market(batch_reply, [other]) is None
+    assert vr._inactive_market(errors.SeraError("STP_BLOCKED", "x", 400), [bid]) is None
+
+
+class _InactivePairClient(_PlacingClient):
+    """Rejects any VL batch containing an inactive market, as Sera does."""
+
+    def __init__(self, inactive: set[str]) -> None:
+        super().__init__()
+        self.inactive = inactive
+        self.batches: list[list[str]] = []
+        self.standalone: list[str] = []
+
+    def place_vl_batch(self, legs):
+        self.batches.append([leg.market for leg in legs])
+        for leg in legs:
+            if leg.market in self.inactive:
+                raise errors.SeraError(
+                    None, f"Pair {leg.market} is not an active trading pair.", 400)
+        return super().place_vl_batch(legs)
+
+    def place_order(self, market, side, qty_base, price, expiration):
+        self.standalone.append(market)
+        return OrderRecord(order_id=f"solo-{market}", uuid_int=7)
+
+
+def _bids(*markets: str):
+    return ("USDC", [_intent(m, "bid", "USDC", price="0.99") for m in markets], True)
+
+
+def test_a_batch_is_re_sent_without_its_inactive_market():
+    client = _InactivePairClient({"JPYC/USDC"})
+    issues = vr.PlacementIssues()
+
+    placed = _place_groups(client, [_bids("XSGD/USDC", "JPYC/USDC", "EURC/USDC")], LOG, issues=issues)
+
+    assert client.batches == [
+        ["XSGD/USDC", "JPYC/USDC", "EURC/USDC"],
+        ["XSGD/USDC", "EURC/USDC"],
+    ]
+    assert [placement.kind for placement in placed] == ["vl"]
+    assert issues.inactive == {"JPYC/USDC"}
+
+
+def test_legs_left_below_the_batch_minimum_go_out_standalone():
+    client = _InactivePairClient({"JPYC/USDC"})
+
+    placed = _place_groups(client, [_bids("XSGD/USDC", "JPYC/USDC")], LOG)
+
+    assert client.batches == [["XSGD/USDC", "JPYC/USDC"]]
+    assert client.standalone == ["XSGD/USDC"]
+    assert [placement.kind for placement in placed] == ["standalone"]

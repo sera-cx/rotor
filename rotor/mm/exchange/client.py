@@ -228,7 +228,11 @@ class SeraClient:
         self.close()
 
     def bootstrap(self) -> None:
-        """Fetch public config, executor id, and market metadata."""
+        """Fetch public config, executor id, and market metadata.
+
+        All-or-nothing: the client's state changes only once every response has
+        been fetched and checked, so a failed refresh keeps the last good state.
+        """
         # `/config` provides signing-domain data and public limits.
         cfg = self._request("GET", "/config", authed=False)
         # Prefer the full server-provided domain, but tolerate older configs
@@ -264,19 +268,18 @@ class SeraClient:
                 f"GET /config names Sera contract {domain['verifyingContract']} for chain "
                 f"{domain['chainId']}, not {expected}; check SERA_BASE_URL"
             )
-        self.eip712_domain = domain
         # VL batch limits are dynamic server config; keep local guards in sync.
         vl_limits = (cfg.get("limits") or {}).get("vl_batch") or {}
-        self.vl_batch_min = int(vl_limits.get("min", self.vl_batch_min))
-        self.vl_batch_max = int(vl_limits.get("max", self.vl_batch_max))
+        vl_batch_min = int(vl_limits.get("min", self.vl_batch_min))
+        vl_batch_max = int(vl_limits.get("max", self.vl_batch_max))
 
         # `/health` exposes the executor id used in uuid_int packing.
         health = self._request("GET", "/health", authed=False)
-        self.executor_id = _parse_healthy_executor_id(health)
+        executor_id = _parse_healthy_executor_id(health)
 
         # Market metadata drives amount/price grids and signed token addresses.
         markets = self._request("GET", "/markets", authed=False).get("markets", [])
-        self.markets_by_symbol = {}
+        markets_by_symbol: dict[str, MarketInfo] = {}
         for m in markets:
             # Parse each row defensively, defaulting optional precision metadata.
             info = MarketInfo(
@@ -302,8 +305,14 @@ class SeraClient:
                 min_ask_amount=Decimal(str(m.get("min_ask_amount", "0"))),
             )
             # Cache by exact Sera symbol for fast lookup during quoting.
-            self.markets_by_symbol[info.symbol] = info
-        _check_market_tokens(self.markets_by_symbol, int(domain["chainId"]))
+            markets_by_symbol[info.symbol] = info
+        _check_market_tokens(markets_by_symbol, int(domain["chainId"]))
+
+        # Every response checked out: only now replace the client's state.
+        self.eip712_domain = domain
+        self.vl_batch_min, self.vl_batch_max = vl_batch_min, vl_batch_max
+        self.executor_id = executor_id
+        self.markets_by_symbol = markets_by_symbol
 
         # Log only public boot metadata; no secrets or signatures appear here.
         self._log.info(

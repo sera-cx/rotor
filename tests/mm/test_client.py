@@ -290,6 +290,23 @@ def test_get_order_fills_uses_order_path_and_bearer_auth():
     assert get["headers"]["authorization"] == "Bearer testkey:testsecret"
 
 
+def test_a_failed_refresh_keeps_the_last_good_metadata():
+    routes = _build_mock_routes()
+    client = _make_client(routes)
+    client.bootstrap()
+    # The running bot's hourly refresh reads a new batch limit, then a /markets
+    # reply rotor cannot parse. Nothing from that half-read refresh is kept.
+    routes["GET /config"]["limits"] = {"vl_batch": {"min": 3, "max": 5}}
+    routes["GET /markets"] = {"markets": [{"symbol": "MYRC/USDC"}]}
+
+    with pytest.raises(KeyError):
+        client.bootstrap()
+
+    assert (client.vl_batch_min, client.vl_batch_max) == (2, 50)
+    assert set(client.markets_by_symbol) == {"MYRC/USDC"}
+    assert client.markets_by_symbol["MYRC/USDC"].price_step == Decimal("0.000001")
+
+
 def test_bootstrap_uses_domain_fallback_when_config_omits_eip712_domain():
     routes = _build_mock_routes({
         "GET /config": {
