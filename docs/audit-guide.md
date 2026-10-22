@@ -215,11 +215,17 @@ VL behavior:
 Autonomous updates:
 
 - `--auto-update` is disabled by default.
-- The updater only runs `git pull --ff-only`.
-- Dirty worktrees, detached branches, non-Git directories, and pull failures are
-  skipped or logged without stopping the loop.
-- A successful pull stops the loop, runs normal shutdown cleanup, and re-execs
-  the same command.
+- The updater only runs `git pull --ff-only` (plus read-only `rev-parse` and
+  `status`).
+- Changed tracked files, detached branches, non-Git directories, and pull
+  failures skip the update without stopping the loop, logged as warnings and
+  alerted with `--telegram`. Untracked files do not block a pull.
+- Whenever the checkout is at a commit other than the running one, the new code
+  must pass `--check-config` (same argv; imports the runner and loads the config,
+  no network/wallet/state) before a restart; otherwise the old version keeps
+  running and the check is retried next interval.
+- A restart stops the loop, runs normal shutdown cleanup, and re-execs the same
+  command.
 
 Telegram:
 

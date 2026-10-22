@@ -338,12 +338,22 @@ poetry run rotor mm vl \
 ```
 
 Rotor checks the checkout on the first tick and then once per day. It runs
-`git pull --ff-only` only when the directory is a clean Git worktree on a branch.
-Pull failures are logged and the next cadence tick continues normally.
+`git pull --ff-only` only on a branch with no changed tracked files; untracked
+files (your config, state files, `.env`) do not block it. A skipped or failed
+check is logged as a warning and, with `--telegram`, sent as an important alert.
 
-After a successful pull, Rotor stops the current loop, runs normal shutdown
-cleanup, and re-execs the same command so the replacement process loads the new
-code. `--auto-update-interval-seconds` exists for testing/custom deployments.
+Before restarting into new code, Rotor runs it once with the same command plus
+`--check-config`, which loads the runner and your config and touches no network,
+wallet, or state. Only if that passes does Rotor stop the loop, run normal
+shutdown cleanup, and re-exec the same command (with a Telegram notice). If it
+fails (a new dependency needing `poetry install`, or a config the new version
+rejects), Rotor keeps running the old version, alerts with the reason, and
+checks again at the next interval. `--auto-update-interval-seconds` exists for
+testing/custom deployments.
+
+A deployment still on a version from before this check (GitHub `public` at
+517d80f or earlier) sees its own untracked config as local changes and never
+pulls: update it once by hand with `git pull --ff-only`.
 
 ## Real Testnet E2E
 

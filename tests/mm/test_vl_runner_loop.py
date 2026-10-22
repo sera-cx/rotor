@@ -1355,6 +1355,38 @@ def test_run_isolates_failing_pair_and_quotes_healthy_pair(monkeypatch):
     assert {row["market"] for row in client.standalone_places} == {"EURC/USDC"}
 
 
+def test_run_keeps_quoting_and_alerts_when_an_update_cannot_be_used(monkeypatch):
+    # The pulled version fails its start check: no restart, the old version
+    # keeps quoting, and the operator gets an important alert saying why.
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    notifier = _RecordingNotifier()
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+
+    class CannotStart:
+        def __init__(self, *, interval_seconds: float) -> None:
+            pass
+
+        def run_if_due(self, _log):
+            return GitUpdateResult(
+                status="failed",
+                message="pulled aaaa..bbbb, but the new version fails its start check")
+
+    restarts: list[bool] = []
+    monkeypatch.setattr(vr, "DailyGitUpdater", CannotStart)
+    monkeypatch.setattr(vr, "restart_current_process", lambda: restarts.append(True))
+
+    vr.run(config_path="vl.toml", auto_update=True, telegram=True,
+           min_requote_seconds=0.0, state_path=":memory:")
+
+    assert restarts == []
+    assert len(_markets_quoted_per_tick(client)) == 2
+    alerts = notifier.containing("auto-update failed: pulled aaaa..bbbb")
+    assert alerts and all(important for _text, important in alerts)
+
+
 def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch):
     client = _FakeClient(open_orders=[{
         "symbol": "XSGD/USDC",

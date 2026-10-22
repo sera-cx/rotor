@@ -112,9 +112,11 @@ rates return. `wise` never carries a stale quote. Pass
 instead of carrying it, or change a source's limit with
 `<SOURCE>_MAX_CARRY_AGE_S`.
 
-For autonomous source checkouts, add `--auto-update`. Rotor checks once per day,
-runs `git pull --ff-only` only on a clean worktree, stops the current loop after
-a successful pull, runs normal shutdown cleanup, and re-execs the same command.
+For autonomous source checkouts, add `--auto-update`. Rotor checks once per day
+and runs `git pull --ff-only` unless tracked files were changed (untracked files
+such as your config do not block it). It restarts into new code only after that
+code passes `--check-config` with the same command; otherwise it keeps running
+and alerts. A checkout from before this check needs one manual `git pull`.
 
 Logs are intentionally small for lightweight servers. The default log level is
 `WARNING`; per-tick quote and placement traces require `--log-level DEBUG`.

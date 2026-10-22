@@ -1093,7 +1093,19 @@ def run(
                 if update_result is not None and update_result.updated:
                     restart_after_update = True
                     log.warning("auto-update stopping VL loop before restart")
+                    if notifier is not None:
+                        notifier.send_raw(f"🔄 rotor auto-update: {update_result.message}; restarting")
                     break
+                if (
+                    update_result is not None
+                    and update_result.status in ("failed", "skipped")
+                    and notifier is not None
+                ):
+                    # --auto-update was asked for; say so when it is not working.
+                    notifier.send_raw(
+                        f"⚠️ rotor auto-update {update_result.status}: {update_result.message}",
+                        important=True,
+                    )
             # Re-read Sera's metadata hourly (sooner after a rejection that
             # suggests it went stale). A failed refresh keeps the last good
             # metadata and is tried again later; --once runs read it at boot.

@@ -10,6 +10,8 @@ from rotor import __version__
 
 def cmd_mm_vl(args) -> int:
     """Run the TOML-driven multi-pair VL market-maker loop."""
+    if args.check_config:
+        return _check_config(args.config)
     # Live VL mode needs a signer before any order placement.
     if not args.dry_run and not _unlock_wallet():
         return 1
@@ -33,6 +35,19 @@ def cmd_mm_vl(args) -> int:
         update_interval_seconds=args.auto_update_interval_seconds,
         log_level=args.log_level,
     )
+
+
+def _check_config(config_path: str) -> int:
+    """Load the runner and the config, and nothing else (auto-update's start check)."""
+    try:
+        from rotor.mm import vl_runner
+
+        vl_runner.load_vl_config(config_path)
+    except Exception as exc:
+        print(f"config check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print("config ok")
+    return 0
 
 
 def _unlock_wallet() -> bool:
@@ -107,6 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="seconds between auto-update checks (default 86400)")
     p_mm_vl.add_argument("--log-level", default="WARNING",
                          help="logging level (default WARNING)")
+    p_mm_vl.add_argument("--check-config", action="store_true",
+                         help="load the runner and the config, then exit 0 if both are "
+                              "fine (no network, wallet, or state); auto-update runs this "
+                              "on new code before restarting into it")
     # Store the command handler so main() can dispatch after parsing.
     p_mm_vl.set_defaults(func=cmd_mm_vl)
 

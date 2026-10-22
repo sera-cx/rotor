@@ -80,7 +80,9 @@ rotor/secret_local.py
 *.log
 debug.log
 error.log
-.rotor_state.sqlite*
+.rotor_state*
+# The operator's config lives in the checkout (see README); never commit it.
+rotor/vl.config.toml
 
 /.benchmarks/*
 !/.benchmarks/README.md

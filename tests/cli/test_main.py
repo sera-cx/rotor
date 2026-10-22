@@ -109,3 +109,35 @@ def test_mm_simple_is_not_available():
         cli.main(["mm", "simple", "--qty", "1"])
 
     assert ei.value.code == 2
+
+
+_GOOD_CONFIG = """fixed_bps = "50"
+return_bps = "2"
+
+[[budget]]
+token = "USDC"
+amount = "1000"
+
+[[pair]]
+market = "XSGD/USDC"
+price_source = "ecb"
+qty_base = "100"
+"""
+
+
+def test_check_config_loads_the_runner_and_config_without_the_wallet(
+    monkeypatch, tmp_path, capsys,
+):
+    def no_wallet():
+        raise AssertionError("--check-config must not unlock the wallet")
+
+    monkeypatch.setattr(cli, "_unlock_wallet", no_wallet)
+    good = tmp_path / "good.toml"
+    good.write_text(_GOOD_CONFIG)
+    bad = tmp_path / "bad.toml"
+    bad.write_text(_GOOD_CONFIG.replace('price_source = "ecb"', 'price_source = "mas"'))
+
+    assert cli.main(["mm", "vl", "--config", str(good), "--check-config"]) == 0
+    assert "config ok" in capsys.readouterr().out
+    assert cli.main(["mm", "vl", "--config", str(bad), "--check-config"]) == 1
+    assert "'mas' was removed" in capsys.readouterr().err

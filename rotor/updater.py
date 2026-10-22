@@ -41,6 +41,7 @@ class GitUpdateResult:
 
 GitRunner = Callable[[Path, list[str], float], GitCommandResult]
 Puller = Callable[..., GitUpdateResult]
+StartCheck = Callable[[], GitCommandResult]
 
 
 class DailyGitUpdater:
@@ -54,13 +55,23 @@ class DailyGitUpdater:
         remote: str | None = None,
         branch: str | None = None,
         puller: Puller | None = None,
+        running_commit: str | None = None,
+        start_check: StartCheck | None = None,
     ) -> None:
-        """Store updater settings for later ticks."""
+        """Store updater settings for later ticks.
+
+        `running_commit` is the commit this process loaded (read from git when
+        not given). Whenever the checkout is at another commit, the new code
+        must pass `start_check` before rotor restarts into it.
+        """
         self.repo_path = Path(repo_path) if repo_path is not None else default_repo_root()
         self.interval_seconds = max(1.0, float(interval_seconds))
         self.remote = remote
         self.branch = branch
         self._puller = pull_latest if puller is None else puller
+        self.running_commit = (
+            running_commit if running_commit is not None else current_commit(self.repo_path))
+        self._start_check = check_new_version if start_check is None else start_check
         self._next_check_at = 0.0
 
     def run_if_due(
@@ -82,8 +93,43 @@ class DailyGitUpdater:
             )
         except Exception as exc:  # pragma: no cover - defensive guard.
             result = GitUpdateResult(status="failed", message=str(exc))
+        result = self._restart_only_if_it_starts(result)
         log_update_result(log, result)
         return result
+
+    def _restart_only_if_it_starts(self, result: GitUpdateResult) -> GitUpdateResult:
+        """Turn a pulled commit into a restart only if the new code passes its check.
+
+        Compared with the commit this process is running, not only with what
+        this pull changed, so a version that failed its check is checked again
+        at the next interval instead of being forgotten.
+        """
+        head = result.after
+        running = self.running_commit
+        if result.status not in ("updated", "unchanged") or not running or not head:
+            return result
+        if head == running:
+            return result
+        check = self._start_check()
+        span = f"{_short_sha(running)}..{_short_sha(head)}"
+        if check.returncode == 0:
+            return GitUpdateResult(
+                status="updated",
+                message=f"pulled {span}; the new version passed its start check",
+                before=running,
+                after=head,
+                output=result.output,
+            )
+        return GitUpdateResult(
+            status="failed",
+            message=(
+                f"pulled {span}, but the new version fails its start check, so rotor "
+                f"keeps running {_short_sha(running)} (if dependencies changed, run "
+                f"`poetry install`, then restart rotor): {_combined_output(check, limit=300)}"
+            ),
+            before=running,
+            after=head,
+        )
 
 
 def default_repo_root() -> Path:
@@ -114,7 +160,10 @@ def pull_latest(
     if top_level.returncode == 0 and top_level.stdout.strip():
         repo = Path(top_level.stdout.strip())
 
-    dirty = run_git(repo, ["status", "--porcelain"], timeout_seconds)
+    # Only changed tracked files block a pull. Untracked files (the config,
+    # state, and .env that live in the checkout) cannot conflict with a
+    # fast-forward unless it adds the same path, which fails the pull safely.
+    dirty = run_git(repo, ["status", "--porcelain", "--untracked-files=no"], timeout_seconds)
     if dirty.returncode != 0:
         return GitUpdateResult(
             status="failed",
@@ -205,7 +254,37 @@ def log_update_result(log: logging.Logger, result: GitUpdateResult) -> None:
     elif result.status == "unchanged":
         log.debug("auto-update checked: already up to date")
     else:
-        log.debug("auto-update skipped: %s", result.message)
+        # --auto-update was asked for, so a skip means it is not working.
+        log.warning("auto-update skipped: %s", result.message)
+
+
+def current_commit(repo_path: str | Path) -> str | None:
+    """The commit checked out at `repo_path`, or None outside a git checkout."""
+    head = _run_git(Path(repo_path), ["rev-parse", "HEAD"], 30.0)
+    if head.returncode != 0:
+        return None
+    return head.stdout.strip() or None
+
+
+def check_new_version(timeout_seconds: float = 120.0) -> GitCommandResult:
+    """Run the checked-out code with this process's command and `--check-config`.
+
+    The new code must import, accept the same arguments, and load the config;
+    it touches no network, wallet, or state. A failure here keeps the running
+    version instead of restarting into one that cannot start.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, *sys.argv, "--check-config"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return GitCommandResult(returncode=124, stderr="start check timed out")
+    return GitCommandResult(
+        returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
 
 
 def restart_current_process() -> None:
