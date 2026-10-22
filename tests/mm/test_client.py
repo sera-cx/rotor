@@ -187,7 +187,8 @@ def test_place_vl_batch_tracks_batch_on_mismatched_order_id_count(caplog):
     routes = _build_mock_routes({
         "POST /orders/vl/batch": (201, {"order_ids": ["leg-0"]}),
     })
-    client = _make_client(routes)
+    captured: list[dict] = []
+    client = _make_client(routes, captured)
     client.bootstrap()
 
     # The batch is live on Sera; a short order_ids list must NOT orphan it.
@@ -201,10 +202,33 @@ def test_place_vl_batch_tracks_batch_on_mismatched_order_id_count(caplog):
             VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
         ])
 
-    assert result.vl_batch_id == "leg-0"
+    # The batch is named by the id rotor signed for leg 0.
+    leg0 = captured[-1]["body"]["orders"][0]["order_id"]
+    assert result.vl_batch_id == leg0
     assert result.order_ids == ["leg-0"]
     assert [r.order_id for r in result.records] == ["leg-0"]
-    assert "tracking batch leg-0 for cancellation" in caplog.text
+    assert f"tracking batch {leg0} for cancellation" in caplog.text
+
+
+def test_place_vl_batch_reads_a_reply_with_null_fields():
+    routes = _build_mock_routes({
+        "POST /orders/vl/batch": (201, {
+            "order_ids": None,
+            "amendments": [{"order_id": "x", "original_amount": None, "actual_amount": None}],
+        }),
+    })
+    captured: list[dict] = []
+    client = _make_client(routes, captured)
+    client.bootstrap()
+
+    result = client.place_vl_batch([
+        VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
+        VLLeg("MYRC/USDC", "bid", Decimal("100"), Decimal("0.25"), 999),
+    ])
+
+    sent = [order["order_id"] for order in captured[-1]["body"]["orders"]]
+    assert result.order_ids == sent
+    assert result.amendments[0].actual_amount == ""
 
 
 def test_cancel_vl_batch_posts_signed_batch_cancel():
@@ -752,7 +776,7 @@ def test_place_vl_batch_builds_and_signs_each_leg_locally():
     uuid0, uuid1 = (int(o["uuid_int"]) for o in orders)
     assert (uuid0 & 0xFFF, uuid1 & 0xFFF) == (0, 1)
     assert (uuid0 >> 12) & ((1 << 112) - 1) == (uuid1 >> 12) & ((1 << 112) - 1)
-    assert result.vl_batch_id == "leg-0"
+    assert result.vl_batch_id == orders[0]["order_id"]
     assert result.records[1].order_id == "leg-1"
     assert result.amendments[0].actual_amount == "80.00"
     assert result.vl_group is not None and result.vl_group.spent_token == "USDC"

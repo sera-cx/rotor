@@ -60,9 +60,12 @@ Pricing:
 
 Positions and return orders:
 
-- Every placed order is recorded in `unsettled_orders` (side, limit price,
-  signed expiry) as soon as Sera accepts it, including orders a failed tick then
-  cancels.
+- Every order is recorded in `unsettled_orders` (side, limit price, signed
+  expiry) after it is signed and before it is sent, under the ids rotor signed.
+  The row is removed only when Sera refuses the order with a 4xx answer. On any
+  other failure (timeout, dropped connection, 5xx, unreadable reply) it stays,
+  and the placement is tracked as live so the next cycle cancels it. An order
+  Sera never booked has no fills (its fill read is a 404) and settles at zero.
 - An order is settled only after its expiry plus 60 seconds of Sera server time,
   and only when none of its fills is `pending`/`confirming` (or an unknown
   status). Only `settled` fills count; `failed`/`reverted` count as zero.
@@ -102,8 +105,9 @@ Live order lifecycle:
 - If the newest tracked order clears the cancel-cooldown guard within 60 seconds,
   the tick waits for it; otherwise the tick is skipped.
 - Cancel cooldowns keep local tracking for later retry, but an order Sera reports
-  as gone (404 / not-found / already-cancelled / already-filled) is dropped so a
-  stuck cancel cannot wedge quoting until restart.
+  as gone (404, a 400 whose message says "not found", or a not-found /
+  already-cancelled / already-filled code) is dropped so a stuck cancel cannot
+  wedge quoting until restart.
 - VL batch results are reconciled: server-cancelled legs are not tracked, and a
   clipped (amended) leg tracks its accepted size so a full fill at that size
   prunes. A malformed batch response keeps a cancelable `vl_batch_id` rather than
@@ -229,8 +233,9 @@ Highest-signal files:
 
 - `tests/mm/test_vl_runner_loop.py`: multi-tick quote replacement, a fill
   settling into a position and walking the return auction to the fill price,
-  `--once` settlement across runs, tick-error recovery, a market deactivated
-  mid-run, metadata refresh, and auto-update restart.
+  `--once` settlement across runs, tick-error recovery, a placement whose answer
+  was lost, a market deactivated mid-run, metadata refresh, and auto-update
+  restart.
 - `tests/mm/test_positions.py`: position netting and the return-order price.
 - `tests/mm/test_vl_runner.py`: fill settlement statuses and exactly-once
   counting, return-order sizing, and ledger recording on placement.
@@ -255,9 +260,9 @@ Stop and investigate if you find:
 - A path that places or cancels in dry-run mode.
 - A partial placement path that leaves already placed orders unmanaged.
 - A cancel failure path that drops local order tracking.
-- A placed order that never reaches `unsettled_orders`, or that leaves it without
-  its settled fills applied in the same transaction (a fill missed or counted
-  twice).
+- An order sent before it is in `unsettled_orders`, a row removed for anything
+  but a 4xx refusal, or a row that leaves the ledger without its settled fills
+  applied in the same transaction (a fill missed or counted twice).
 - A return order priced through its position's fill price, or sized above the
   normal order it replaces.
 - A stale source quote that still places orders outside the carry rules: a stale

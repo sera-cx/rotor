@@ -8,8 +8,8 @@
 3. Builds one bid and one ask at `fixed_bps` from the mid. A market with an open
    position quotes its return order on that side instead.
 4. Cancels tracked old placements when the local cancel guard permits.
-5. Places the fresh quote set, using VL for eligible same-spent-token groups, and
-   records every placed order for settlement.
+5. Places the fresh quote set, using VL for eligible same-spent-token groups,
+   recording every order for settlement before it is sent.
 
 ## Returning fills
 
@@ -35,8 +35,15 @@ time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
   fill price and clock become size-weighted averages.
 
 Fills are counted from a ledger, not from the resting quote set. Every order
-rotor places is recorded with its side, limit price, and signed expiry, and each
-tick rotor reads the fills of every order in the ledger. Once an order has
+is recorded with its side, limit price, and signed expiry once rotor has signed
+it and before it is sent, and each tick rotor reads the fills of every order in
+the ledger. Rotor picks and signs the order ids itself, so Sera books an order
+under the recorded id or not at all. If Sera refuses the order (a 4xx answer),
+its row is removed. If the answer is lost (a timeout, a dropped connection, a
+server error, a reply rotor cannot read), the row stays, so a fill on an order
+Sera did book is still counted; an order Sera never booked has no fills and
+settles at zero. Rotor also tracks such a placement as live, so the next cycle
+cancels it before quoting; a cancel Sera answers with "not found" drops it. Once an order has
 expired (plus 60 seconds) and none of its fills is still `pending` or
 `confirming`, its `settled` quantity is added to the stored position in the same
 database transaction that removes it from the ledger. Each order is therefore
@@ -57,8 +64,7 @@ order placements and 2 cancels per second), and rate-limited or briefly failing
 requests are retried, so a tick for 8 pairs takes about 10 seconds.
 
 Positions do not see deposits, withdrawals, or trades outside this rotor's own
-orders, orders placed by an older rotor version, or fills on a VL batch whose
-returned order ids did not line up with its legs. A position on a market that is
+orders, or orders placed by an older rotor version. A position on a market that is
 no longer configured is kept but not quoted. Deleting the state file forgets
 every position.
 

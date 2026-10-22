@@ -13,6 +13,8 @@ from rotor.mm.exchange import errors
 from rotor.mm.exchange.client import (
     MarketInfo,
     OrderRecord,
+    SignedOrder,
+    SignedVLBatch,
     VLBatchAmendment,
     VLBatchResult,
     VLCancelledLeg,
@@ -103,10 +105,16 @@ def test_place_groups_uses_vl_batch_and_tracks_intents():
     class Client:
         vl_batch_min = 2
 
-        def place_vl_batch(self, legs):
+        def sign_vl_batch(self, legs):
             assert len(legs) == 2
+            return SignedVLBatch("batch-1", [
+                SignedOrder("leg-1", 101, {}),
+                SignedOrder("leg-2", 102, {}),
+            ])
+
+        def send_vl_batch(self, batch):
             return VLBatchResult(
-                vl_batch_id="batch-1",
+                vl_batch_id=batch.vl_batch_id,
                 order_ids=["leg-1", "leg-2"],
                 records=[
                     OrderRecord("leg-1", 101),
@@ -141,11 +149,15 @@ def test_place_groups_skips_a_rejected_order_and_places_the_rest(caplog):
     class Client:
         vl_batch_min = 2
 
-        def place_order(self, market, side, qty_base, price, expiration):
+        def sign_order(self, market, side, qty_base, price, expiration):
+            return SignedOrder(f"solo-{market}", 1, {"market": market})
+
+        def send_order(self, order):
+            market = order.wire["market"]
             calls.append(("place", market))
             if market == "EURC/USDC":
                 raise errors.SeraError("INSUFFICIENT_EQUITY", "not enough EURC", 400)
-            return OrderRecord(f"solo-{market}", 1)
+            return OrderRecord(order.order_id, order.uuid_int)
 
         def cancel_order(self, order_id, uuid_int):
             calls.append(("cancel", order_id))
@@ -426,6 +438,34 @@ def test_cancel_placements_drops_orders_sera_reports_gone():
     remaining = vr._cancel_placements(Client(), [placement], logging.getLogger("test"))
 
     assert remaining == []
+
+
+def test_cancel_placements_drops_orders_sera_does_not_know():
+    # Sera's actual replies for an order or batch it never booked (a 400 with
+    # the backend's message), as for a placement whose answer was lost.
+    placements = [
+        vr.LivePlacement(
+            kind="standalone",
+            spent_token="USDC",
+            orders=[LiveOrder("bid", "never-booked", 1, 0.0)],
+            placed_at=0.0,
+        ),
+        vr.LivePlacement(
+            kind="vl", spent_token="USDC", orders=[], placed_at=0.0, vl_batch_id="never-sent"),
+    ]
+
+    class Client:
+        def cancel_order(self, order_id, uuid_int):
+            raise errors.from_response(400, {"detail": {
+                "status": "error",
+                "message": f"Order not found for cancellation:0xowner,{order_id}",
+            }})
+
+        def cancel_vl_batch(self, vl_batch_id):
+            raise errors.from_response(400, {"detail": {
+                "status": "error", "message": f"VL batch not found: {vl_batch_id}"}})
+
+    assert vr._cancel_placements(Client(), placements, logging.getLogger("test")) == []
 
 
 def test_cancel_placements_keeps_retryable_failures():

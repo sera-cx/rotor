@@ -5,11 +5,18 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange import errors
-from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
+from rotor.mm.exchange.client import (
+    MarketInfo,
+    OrderRecord,
+    SignedOrder,
+    SignedVLBatch,
+    VLBatchResult,
+)
 from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
 from rotor.mm.vl_runner import (
@@ -437,14 +444,18 @@ class _PlacingClient:
         self.short_ids = short_ids
         self.cancelled: list[str] = []
 
-    def place_vl_batch(self, legs):
-        ids = [f"leg-{i}" for i in range(len(legs))]
+    def sign_vl_batch(self, legs):
+        return SignedVLBatch("batch-1", [
+            SignedOrder(f"leg-{i}", 10 + i, {"leg": leg}) for i, leg in enumerate(legs)
+        ])
+
+    def send_vl_batch(self, batch):
+        records = [OrderRecord(order.order_id, order.uuid_int) for order in batch.orders]
         if self.short_ids:
-            ids = ids[:-1]
-        records = [OrderRecord(order_id, 10 + i) for i, order_id in enumerate(ids)]
+            records = records[:-1]
         return VLBatchResult(
-            vl_batch_id="batch-1",
-            order_ids=ids,
+            vl_batch_id=batch.vl_batch_id,
+            order_ids=[record.order_id for record in records],
             records=records,
             amendments=[],
             cancelled=[],
@@ -452,10 +463,13 @@ class _PlacingClient:
             vl_group=None,
         )
 
-    def place_order(self, market, side, qty_base, price, expiration):
+    def sign_order(self, market, side, qty_base, price, expiration):
+        return SignedOrder("solo-1", 7, {"market": market, "side": side})
+
+    def send_order(self, order):
         if self.fail_standalone:
-            raise RuntimeError("placement rejected")
-        return OrderRecord(order_id="solo-1", uuid_int=7)
+            raise errors.SeraError("INSUFFICIENT_EQUITY", "not enough XSGD", 400)
+        return OrderRecord(order.order_id, order.uuid_int)
 
     def cancel_vl_batch(self, vl_batch_id):
         self.cancelled.append(vl_batch_id)
@@ -503,7 +517,7 @@ def test_a_rejected_order_does_not_take_down_the_rest_of_the_tick():
 
 def test_a_rejected_vl_batch_does_not_stop_the_standalone_orders():
     class Client(_PlacingClient):
-        def place_vl_batch(self, legs):
+        def send_vl_batch(self, batch):
             raise vr.errors.SeraError("INSUFFICIENT_EQUITY", "not enough USDC", 400)
 
     store = vr.StateStore(":memory:")
@@ -513,14 +527,45 @@ def test_a_rejected_vl_batch_does_not_stop_the_standalone_orders():
     assert [row.order_id for row in store.load_unsettled()] == ["solo-1"]
 
 
-def test_vl_batch_with_mismatched_ids_attributes_no_fills():
+def test_vl_batch_with_mismatched_ids_is_tracked_and_every_leg_recorded():
     store = vr.StateStore(":memory:")
 
     placed = _place_groups(_PlacingClient(short_ids=True), _groups()[:1], LOG, state=store)
 
-    # Still tracked so it can be cancelled, but no leg is trusted to a side.
+    # Still tracked so it can be cancelled, but no leg of Sera's short reply is
+    # trusted to a side. The ledger was written from rotor's own signed legs.
     assert [order.order_id for order in placed[0].orders] == ["leg-0"]
-    assert store.load_unsettled() == []
+    assert placed[0].intent_by_order_id == {}
+    assert [row.order_id for row in store.load_unsettled()] == ["leg-0", "leg-1"]
+
+
+@pytest.mark.parametrize("lost", [
+    httpx.ReadTimeout("timed out"),
+    errors.SeraError(None, "Service temporarily unavailable; please retry", 503),
+])
+def test_an_order_without_an_answer_stays_recorded_and_is_tracked_for_cancel(lost):
+    # Sera may have booked these: their rows stay so a fill is counted, and
+    # they are tracked so the next cycle cancels them.
+    class Client(_PlacingClient):
+        def send_vl_batch(self, batch):
+            raise lost
+
+        def send_order(self, order):
+            raise lost
+
+    store = vr.StateStore(":memory:")
+    issues = vr.PlacementIssues()
+
+    placed = _place_groups(Client(), _groups(), LOG, state=store, issues=issues)
+
+    assert placed == []
+    assert [row.order_id for row in store.load_unsettled()] == ["leg-0", "leg-1", "solo-1"]
+    batch, order = issues.unanswered
+    assert (batch.kind, batch.vl_batch_id) == ("vl", "batch-1")
+    assert [(o.order_id, o.uuid_int) for o in batch.orders] == [("leg-0", 10), ("leg-1", 11)]
+    assert order.kind == "standalone"
+    assert [(o.order_id, o.uuid_int, o.market, o.side) for o in order.orders] == [
+        ("solo-1", 7, "XSGD/USDC", "ask")]
 
 
 def test_standalone_placement_tracks_intent_for_settlement():
@@ -531,32 +576,22 @@ def test_standalone_placement_tracks_intent_for_settlement():
     """
     source = _intent("XSGD/USDC", "bid", "USDC", price="0.99", mid="1.00")
 
-    class Client:
-        vl_batch_min = 2
-
-        def place_order(self, market, side, qty_base, price, expiration):
-            return OrderRecord(order_id="solo-1", uuid_int=7)
-
+    store = vr.StateStore(":memory:")
     placements = _place_groups(
-        Client(),
+        _PlacingClient(),
         [("USDC", [source], False)],
         LOG,
+        state=store,
     )
 
     assert len(placements) == 1
     placement = placements[0]
     assert placement.kind == "standalone"
     assert placement.intent_by_order_id == {"solo-1": source}
-    assert vr._unsettled_orders(placement) == [
-        vr.UnsettledOrder(
-            order_id="solo-1",
-            market="XSGD/USDC",
-            side="bid",
-            price=Decimal("0.99"),
-            expiration=999,
-            placed_at=placement.orders[0].placed_at,
-        )
-    ]
+    assert [
+        (row.order_id, row.market, row.side, row.price, row.expiration)
+        for row in store.load_unsettled()
+    ] == [("solo-1", "XSGD/USDC", "bid", Decimal("0.99"), 999)]
 
 
 # ---------------------------------------------------------------------------
@@ -586,17 +621,18 @@ class _InactivePairClient(_PlacingClient):
         self.batches: list[list[str]] = []
         self.standalone: list[str] = []
 
-    def place_vl_batch(self, legs):
+    def send_vl_batch(self, batch):
+        legs = [order.wire["leg"] for order in batch.orders]
         self.batches.append([leg.market for leg in legs])
         for leg in legs:
             if leg.market in self.inactive:
                 raise errors.SeraError(
                     None, f"Pair {leg.market} is not an active trading pair.", 400)
-        return super().place_vl_batch(legs)
+        return super().send_vl_batch(batch)
 
-    def place_order(self, market, side, qty_base, price, expiration):
-        self.standalone.append(market)
-        return OrderRecord(order_id=f"solo-{market}", uuid_int=7)
+    def send_order(self, order):
+        self.standalone.append(order.wire["market"])
+        return super().send_order(order)
 
 
 def _bids(*markets: str):

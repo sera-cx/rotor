@@ -164,6 +164,25 @@ class SignableOrder:
     wire: dict
 
 
+@dataclass(frozen=True)
+class SignedOrder:
+    """A signed order ready to send. Sera books it under these ids or not at all."""
+
+    order_id: str
+    uuid_int: int
+    # The POST body, signature included.
+    wire: dict
+
+
+@dataclass(frozen=True)
+class SignedVLBatch:
+    """The signed legs of one VL batch, ready to send."""
+
+    # Leg 0's order id, which also names the batch for cancellation.
+    vl_batch_id: str
+    orders: list[SignedOrder]
+
+
 # Signer contract: domain + type schema + message -> 0x-prefixed signature.
 Signer = Callable[[dict, dict, dict], str]
 
@@ -380,6 +399,26 @@ class SeraClient:
         )
         return SignableOrder(order_id=final_order_id, uuid_int=uuid_int, struct=struct, wire=wire)
 
+    def sign_order(
+        self,
+        market: str,
+        side: str,
+        qty_base: Decimal,
+        price: Decimal,
+        expiration: int,
+    ) -> SignedOrder:
+        """Build and sign one limit order. Nothing is sent."""
+        return self._signed(self.build_order(market, side, qty_base, price, expiration))
+
+    def send_order(self, order: SignedOrder) -> OrderRecord:
+        """Send one signed order (`POST /orders`)."""
+        body = self._request("POST", "/orders", json_body=order.wire, expect_status=(200, 201))
+        return OrderRecord(
+            # Sera may echo a final order id; otherwise keep the generated id.
+            order_id=body.get("order_id", order.order_id),
+            uuid_int=order.uuid_int,
+        )
+
     def place_order(
         self,
         market: str,
@@ -388,19 +427,11 @@ class SeraClient:
         price: Decimal,
         expiration: int,
     ) -> OrderRecord:
-        """Build, sign, and place one limit order."""
-        order = self.build_order(market, side, qty_base, price, expiration)
-        wire = dict(order.wire)
-        wire["signature"] = self._sign_order(order)
-        body = self._request("POST", "/orders", json_body=wire, expect_status=(200, 201))
-        return OrderRecord(
-            # Sera may echo a final order id; otherwise keep the generated id.
-            order_id=body.get("order_id", order.order_id),
-            uuid_int=order.uuid_int,
-        )
+        """Sign and send one limit order."""
+        return self.send_order(self.sign_order(market, side, qty_base, price, expiration))
 
-    def place_vl_batch(self, legs: list[VLLeg]) -> VLBatchResult:
-        """Build and sign each sibling, then place one VL batch."""
+    def sign_vl_batch(self, legs: list[VLLeg]) -> SignedVLBatch:
+        """Build and sign each sibling of one VL batch. Nothing is sent."""
         # Enforce server batch-size limits locally before generating signatures.
         if len(legs) < self.vl_batch_min:
             raise ValueError(
@@ -414,11 +445,12 @@ class SeraClient:
         # One UUID anchors the shared VL group; the first leg reuses it as its
         # order id so Sera can identify the primary order.
         group_uuid = eip712.new_order_id()
-        orders: list[SignableOrder] = []
+        orders: list[SignedOrder] = []
         for i, leg in enumerate(legs):
             # Leg 0 is the primary/group id; later legs get independent order ids
-            # but share the same group_uuid and carry their leg index.
-            orders.append(self.build_order(
+            # but share the same group_uuid and carry their leg index. Each
+            # sibling carries its own signature over its own Order message.
+            orders.append(self._signed(self.build_order(
                 leg.market,
                 leg.side,
                 leg.qty_base,
@@ -427,34 +459,25 @@ class SeraClient:
                 order_id=group_uuid if i == 0 else eip712.new_order_id(),
                 leg_id=i,
                 group_uuid=group_uuid,
-            ))
+            )))
+        return SignedVLBatch(vl_batch_id=group_uuid, orders=orders)
 
-        wires: list[dict] = []
-        for order in orders:
-            # Each sibling carries its own signature over its own Order message.
-            wire = dict(order.wire)
-            wire["signature"] = self._sign_order(order)
-            wires.append(wire)
-
-        # Submit all signed siblings as one VL batch.
+    def send_vl_batch(self, batch: SignedVLBatch) -> VLBatchResult:
+        """Send one signed VL batch (`POST /orders/vl/batch`)."""
+        orders = batch.orders
         body = self._request(
             "POST",
             "/orders/vl/batch",
-            json_body={"orders": wires},
+            json_body={"orders": [order.wire for order in orders]},
             expect_status=(200, 201),
         )
         # Reconcile server-returned order ids with the locally built orders.
-        order_ids = [str(v) for v in body.get("order_ids", [])]
+        order_ids = [str(v) for v in body.get("order_ids") or []]
         if not order_ids:
             order_ids = [p.order_id for p in orders]
         # The batch is already live on Sera; resolve a cancelable batch id BEFORE
         # any mismatch handling so a malformed response can never orphan it.
-        vl_batch_id = str(
-            body.get("vl_batch_id")
-            or body.get("batch_id")
-            or order_ids[0]
-            or orders[0].order_id
-        )
+        vl_batch_id = str(body.get("vl_batch_id") or body.get("batch_id") or batch.vl_batch_id)
         # A length mismatch breaks positional id->leg tracking, but the whole
         # batch is still cancelable by vl_batch_id. Log loudly and track what we
         # can correlate rather than raising and leaving live orders unmanaged.
@@ -481,8 +504,8 @@ class SeraClient:
             amendments=[
                 VLBatchAmendment(
                     order_id=str(row.get("order_id", "")),
-                    original_amount=str(row.get("original_amount", "")),
-                    actual_amount=str(row.get("actual_amount", "")),
+                    original_amount=str(row.get("original_amount") or ""),
+                    actual_amount=str(row.get("actual_amount") or ""),
                     reason=str(row.get("reason", "")),
                 )
                 for row in body.get("amendments", []) or []
@@ -497,6 +520,10 @@ class SeraClient:
             fills=list(body.get("fills", []) or []),
             vl_group=vl_group,
         )
+
+    def place_vl_batch(self, legs: list[VLLeg]) -> VLBatchResult:
+        """Sign and send one VL batch."""
+        return self.send_vl_batch(self.sign_vl_batch(legs))
 
     def cancel_order(self, order_id: str, uuid_int: int) -> bool:
         """Cancel one order. Returns False when Sera reports cancel cooldown."""
@@ -649,6 +676,12 @@ class SeraClient:
         if self.eip712_domain is None:
             raise RuntimeError("client not booted; call bootstrap() first")
         return self._signer(self.eip712_domain, types, message)
+
+    def _signed(self, order: SignableOrder) -> SignedOrder:
+        """Attach rotor's signature over the order's own Order message."""
+        wire = dict(order.wire)
+        wire["signature"] = self._sign_order(order)
+        return SignedOrder(order_id=order.order_id, uuid_int=order.uuid_int, wire=wire)
 
     def _sign_order(self, order: SignableOrder) -> str:
         """Sign a locally built order as Sera's Order type."""

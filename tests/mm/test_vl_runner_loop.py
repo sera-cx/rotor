@@ -7,8 +7,16 @@ import time
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
+
 from rotor.mm import vl_runner as vr
-from rotor.mm.exchange.client import MarketInfo, OrderRecord, VLBatchResult
+from rotor.mm.exchange.client import (
+    MarketInfo,
+    OrderRecord,
+    SignedOrder,
+    SignedVLBatch,
+    VLBatchResult,
+)
 from rotor.mm.exchange.errors import SeraError, SeraRateLimit, SeraUnavailable
 from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
@@ -136,6 +144,11 @@ class _FakeClient:
         self.fill_status = fill_status
         # Asks spend base tokens; a wallet funded only with USDC cannot back them.
         self.reject_asks = reject_asks
+        # Raised by send_vl_batch() after Sera books the batch, one per call:
+        # the answer is lost on the way back.
+        self.send_errors: list[Exception] = []
+        # Raised by send_vl_batch() before the batch reaches Sera, one per call.
+        self.unsent_errors: list[Exception] = []
         # Markets Sera rejects orders for as not active (still listed).
         self.inactive_markets: set[str] = set()
         self.inactive_rejections: list[str] = []
@@ -164,36 +177,52 @@ class _FakeClient:
         # Sera's clock follows the local one, which tests may fake.
         return int(time.time()) + order_ttl_seconds
 
-    def place_vl_batch(self, legs) -> VLBatchResult:
+    def sign_vl_batch(self, legs) -> SignedVLBatch:
+        self._batch_count += 1
+        batch_id = f"batch-{self._batch_count}"
+        orders = []
+        for idx, leg in enumerate(legs):
+            self._uuid_int += 1
+            orders.append(SignedOrder(f"{batch_id}-leg-{idx}", self._uuid_int, {"leg": leg}))
+        return SignedVLBatch(batch_id, orders)
+
+    def send_vl_batch(self, batch: SignedVLBatch) -> VLBatchResult:
+        legs = [order.wire["leg"] for order in batch.orders]
         for leg in legs:
             if leg.market in self.inactive_markets:
                 self.inactive_rejections.append(leg.market)
                 # Sera's VL route relays the matching engine's message, no code.
                 raise SeraError(None, f"Pair {leg.market} is not an active trading "
                                 "pair. See GET /markets for available pairs.", 400)
-        self._batch_count += 1
-        batch_id = f"batch-{self._batch_count}"
-        records: list[OrderRecord] = []
+        if self.unsent_errors:
+            self.events.append(("unsent_vl", batch.vl_batch_id))
+            raise self.unsent_errors.pop(0)
+        if self.send_errors:
+            self.events.append(("lost_vl", batch.vl_batch_id))
+            self._book_vl(batch, legs)
+            raise self.send_errors.pop(0)
+        return self._book_vl(batch, legs)
+
+    def _book_vl(self, batch: SignedVLBatch, legs) -> VLBatchResult:
+        batch_id = batch.vl_batch_id
+        records = [OrderRecord(order.order_id, order.uuid_int) for order in batch.orders]
         rows = []
-        for idx, leg in enumerate(legs):
-            order_id = f"{batch_id}-leg-{idx}"
-            self._uuid_int += 1
-            records.append(OrderRecord(order_id, self._uuid_int))
-            self.active_orders.add(order_id)
+        for record, leg in zip(records, legs, strict=True):
+            self.active_orders.add(record.order_id)
             rows.append({
                 "market": leg.market,
                 "side": leg.side,
                 "price": leg.price,
                 "qty": leg.qty_base,
-                "order_id": order_id,
+                "order_id": record.order_id,
             })
             if (
                 self.fill_first_xsgd_bid
-                and self._batch_count == 1
+                and batch_id == "batch-1"
                 and leg.market == "XSGD/USDC"
                 and leg.side == "bid"
             ):
-                self.fill_order_ids.add(order_id)
+                self.fill_order_ids.add(record.order_id)
         self.batch_orders[batch_id] = [record.order_id for record in records]
         self.batch_places.append({"batch_id": batch_id, "legs": rows})
         self.events.append(("place_vl", batch_id))
@@ -207,34 +236,36 @@ class _FakeClient:
             vl_group=None,
         )
 
-    def place_order(
+    def sign_order(
         self,
         market: str,
         side: str,
         qty_base: Decimal,
         price: Decimal,
         expiration: int,
-    ) -> OrderRecord:
+    ) -> SignedOrder:
+        self._order_count += 1
+        self._uuid_int += 1
+        return SignedOrder(f"solo-{self._order_count}", self._uuid_int, {
+            "market": market,
+            "side": side,
+            "qty": qty_base,
+            "price": price,
+            "expiration": expiration,
+        })
+
+    def send_order(self, order: SignedOrder) -> OrderRecord:
+        market, side = order.wire["market"], order.wire["side"]
         if market in self.inactive_markets:
             self.inactive_rejections.append(market)
             raise SeraError("PAIR_INACTIVE", "Invalid request", 400)
         if self.reject_asks and side == "ask":
             self.events.append(("rejected", market, side))
             raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
-        self._order_count += 1
-        self._uuid_int += 1
-        order_id = f"solo-{self._order_count}"
-        self.active_orders.add(order_id)
-        self.standalone_places.append({
-            "market": market,
-            "side": side,
-            "qty": qty_base,
-            "price": price,
-            "expiration": expiration,
-            "order_id": order_id,
-        })
-        self.events.append(("place_order", order_id, market, side))
-        return OrderRecord(order_id, self._uuid_int)
+        self.active_orders.add(order.order_id)
+        self.standalone_places.append({**order.wire, "order_id": order.order_id})
+        self.events.append(("place_order", order.order_id, market, side))
+        return OrderRecord(order.order_id, order.uuid_int)
 
     def get_vault_balances(self) -> dict[str, Decimal]:
         self.events.append(("balances",))
@@ -263,6 +294,8 @@ class _FakeClient:
         self.events.append(("cancel_vl", vl_batch_id))
         if not self.cancel_ok:
             return False
+        if vl_batch_id not in self.batch_orders:
+            raise SeraError(None, f"VL batch not found: {vl_batch_id}", 400)
         for order_id in self.batch_orders.get(vl_batch_id, []):
             self.active_orders.discard(order_id)
         return True
@@ -379,6 +412,75 @@ def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
         assert store.load_positions() == {
             "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)
         }
+    finally:
+        store.close()
+
+
+def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_path):
+    # Sera books tick 1's USDC bid batch, but its answer times out on the way
+    # back, and a taker fills 5 of its XSGD bid. Rotor recorded the batch before
+    # sending it, so tick 2 cancels it and the fill still becomes a position
+    # that is returned at its price, as if the answer had arrived.
+    client = _FakeClient(fill_first_xsgd_bid=True)
+    client.send_errors = [httpx.ReadTimeout("timed out")]
+    source = _SequencedSource({
+        ("SGD", "USD"): ["1.0000", "1.0000", "0.9800"],
+        ("EUR", "USD"): ["2.0000"],
+    })
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[12 * HOUR, 12 * HOUR, 1.0])
+
+    result = vr.run(
+        config_path="vl.toml",
+        poll_seconds=305.0,
+        min_requote_seconds=0.0,
+        log_level="CRITICAL",
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    assert result == 0
+    assert ("lost_vl", "batch-1") in client.events
+    assert ("cancel_vl", "batch-1") in client.events
+    assert _xsgd_asks(client)[1:] == [
+        (Decimal("5"), Decimal("1.0025")),
+        # The market fell to 0.98; the ask still does not sell below the fill.
+        (Decimal("5"), Decimal("1.0000")),
+    ]
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        assert store.load_positions() == {
+            "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)
+        }
+    finally:
+        store.close()
+
+
+def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(monkeypatch, tmp_path):
+    # Tick 1's USDC bid batch fails to connect, so Sera never books it. Tick 2's
+    # cancel gets Sera's "not found", drops it, and quotes as normal; its
+    # ledger rows settle at zero fills once the orders would have expired.
+    client = _FakeClient()
+    client.unsent_errors = [httpx.ConnectError("connection refused")]
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[305.0, 600.0, 1.0])
+
+    result = vr.run(
+        config_path="vl.toml",
+        poll_seconds=305.0,
+        min_requote_seconds=0.0,
+        log_level="CRITICAL",
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    assert result == 0
+    assert ("cancel_vl", "batch-1") in client.events
+    assert _markets_quoted_per_tick(client)[1:] == [
+        {"XSGD/USDC", "EURC/USDC"}, {"XSGD/USDC", "EURC/USDC"}]
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        assert not any(row.order_id.startswith("batch-1-") for row in store.load_unsettled())
+        assert store.load_positions() == {}
     finally:
         store.close()
 
@@ -868,10 +970,10 @@ def test_run_refreshes_metadata_early_after_a_rejection_that_suggests_it_is_stal
     _wire_runner(monkeypatch, config=_config(), client=client, source=source)
     _fake_clock(monkeypatch, steps=[305.0, 305.0, 1.0])
 
-    def batch_limit_changed(market, side, qty_base, price, expiration):
+    def batch_limit_changed(order):
         raise SeraError(None, "quantity is not on the market lot grid", 422)
 
-    monkeypatch.setattr(client, "place_order", batch_limit_changed)
+    monkeypatch.setattr(client, "send_order", batch_limit_changed)
 
     vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
 

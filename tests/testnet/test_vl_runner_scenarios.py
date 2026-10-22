@@ -18,7 +18,13 @@ from eth_account.messages import encode_typed_data
 
 from rotor.config import get_config
 from rotor.mm import vl_runner as vr
-from rotor.mm.exchange.client import OrderRecord, SeraClient, VLBatchResult
+from rotor.mm.exchange.client import (
+    OrderRecord,
+    SeraClient,
+    SignedOrder,
+    SignedVLBatch,
+    VLBatchResult,
+)
 from rotor.price_reference.models import PriceObservation
 
 
@@ -72,13 +78,22 @@ class _RecordingClient:
         self.placed_orders: list[_PlacedOrder] = []
         self.vl_batches: list[VLBatchResult] = []
         self.cancel_events: list[tuple[str, str, bool]] = []
+        # Signed but not yet sent: the legs/terms to record once Sera accepts.
+        self._legs: dict[str, list] = {}
+        self._terms: dict[str, tuple] = {}
 
     def __getattr__(self, name: str):
         return getattr(self.inner, name)
 
-    def place_vl_batch(self, legs) -> VLBatchResult:
-        result = self.inner.place_vl_batch(legs)
+    def sign_vl_batch(self, legs) -> SignedVLBatch:
+        batch = self.inner.sign_vl_batch(legs)
+        self._legs[batch.vl_batch_id] = list(legs)
+        return batch
+
+    def send_vl_batch(self, batch: SignedVLBatch) -> VLBatchResult:
+        result = self.inner.send_vl_batch(batch)
         self.vl_batches.append(result)
+        legs = self._legs.pop(batch.vl_batch_id)
         for leg, record in zip(legs, result.records, strict=True):
             self.placed_orders.append(
                 _PlacedOrder(
@@ -94,21 +109,21 @@ class _RecordingClient:
             )
         return result
 
-    def place_order(
+    def sign_order(
         self,
         market: str,
         side: str,
         qty_base: Decimal,
         price: Decimal,
         expiration: int,
-    ) -> OrderRecord:
-        record = self.inner.place_order(
-            market,
-            side,
-            qty_base,
-            price,
-            expiration,
-        )
+    ) -> SignedOrder:
+        order = self.inner.sign_order(market, side, qty_base, price, expiration)
+        self._terms[order.order_id] = (market, side, qty_base, price)
+        return order
+
+    def send_order(self, order: SignedOrder) -> OrderRecord:
+        record = self.inner.send_order(order)
+        market, side, qty_base, price = self._terms.pop(order.order_id)
         self.placed_orders.append(
             _PlacedOrder(
                 market=market,

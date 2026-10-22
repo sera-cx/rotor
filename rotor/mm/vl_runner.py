@@ -36,7 +36,13 @@ from rotor.algo.simple_market_making import (
 )
 from rotor.config import get_config
 from rotor.mm.exchange import errors
-from rotor.mm.exchange.client import OrderRecord, SeraClient, VLBatchResult, VLLeg
+from rotor.mm.exchange.client import (
+    OrderRecord,
+    SeraClient,
+    SignedOrder,
+    VLBatchResult,
+    VLLeg,
+)
 from rotor.mm.positions import Position, apply_fill, return_price
 from rotor.mm.quote_engine import (
     LiveOrder,
@@ -395,6 +401,14 @@ class StateStore:
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 rows,
+            )
+
+    def remove_unsettled(self, order_ids: list[str]) -> None:
+        """Drop orders Sera refused: it never booked them, so they cannot fill."""
+        with self._db:
+            self._db.executemany(
+                "DELETE FROM unsettled_orders WHERE order_id = ?",
+                [(order_id,) for order_id in order_ids],
             )
 
     def load_unsettled(self) -> list[UnsettledOrder]:
@@ -1025,9 +1039,9 @@ def run(
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
 
-            # Phase 7: place exactly the fresh quote set. Every placed order is
-            # recorded for settlement as soon as Sera accepts it; an order or VL
-            # batch Sera rejects is skipped and the rest still go out.
+            # Phase 7: place exactly the fresh quote set. Every order is recorded
+            # for settlement before it is sent; an order or VL batch Sera rejects
+            # is skipped and the rest still go out.
             issues = PlacementIssues()
             placed = _place_groups(client, groups, log, state=state, issues=issues)
             for market in sorted(issues.inactive - inactive_alerted):
@@ -1043,18 +1057,20 @@ def run(
             inactive_alerted -= {o.market for p in placed for o in p.orders}
             if issues.stale_metadata:
                 next_refresh = min(next_refresh, last_refresh + EARLY_REFRESH_SECONDS)
+            # Placements Sera may have booked without answering are tracked too,
+            # so the next cycle cancels them with the rest.
+            live = placed + issues.unanswered
+            try:
+                live = _prune_fully_filled_placements(
+                    live,
+                    _filled_quantities_from_placement_fills(placed),
+                    log,
+                )
+            except Exception as exc:
+                log.warning("placement fill tracking failed: %s", exc)
+            if state is not None:
+                state.replace_active(live)
             if placed:
-                live = placed
-                try:
-                    live = _prune_fully_filled_placements(
-                        live,
-                        _filled_quantities_from_placement_fills(placed),
-                        log,
-                    )
-                except Exception as exc:
-                    log.warning("placement fill tracking failed: %s", exc)
-                if state is not None:
-                    state.replace_active(live)
                 # A fresh quote set went out: reset the stall watchdog.
                 last_quote_ok = time.time()
                 if notifier is not None:
@@ -1691,6 +1707,10 @@ class PlacementIssues:
     inactive: set[str] = field(default_factory=set)
     # Whether a rejection suggests stale grids, minimums, or batch limits.
     stale_metadata: bool = False
+    # Placements sent without a usable answer (a timeout, a server error, an
+    # unreadable reply). Sera may have booked them, so they are tracked for
+    # cancellation, and their orders stay in the ledger.
+    unanswered: list[LivePlacement] = field(default_factory=list)
 
     def note(self, exc: Exception) -> None:
         if isinstance(exc, errors.SeraError) and (
@@ -1726,9 +1746,10 @@ def _place_groups(
     Each VL batch and each standalone order is placed on its own. One that Sera
     rejects (an unfunded order, a rate limit) is logged and skipped; the rest
     still go out and are tracked. A VL batch rejected because one of its
-    markets is not active is re-sent without that market. With `state`, each
-    accepted placement's orders are recorded for fill settlement as soon as
-    Sera accepts them. `issues` collects what placement learned.
+    markets is not active is re-sent without that market. With `state`, every
+    order is recorded for fill settlement before it is sent, and removed again
+    only if Sera refuses it. `issues` collects what placement learned,
+    including placements sent without a usable answer.
     """
     issues = PlacementIssues() if issues is None else issues
     placed: list[LivePlacement] = []
@@ -1759,18 +1780,33 @@ def _place_vl_batch(
     """
     legs = list(intents)
     while len(legs) >= client.vl_batch_min:
+        batch = client.sign_vl_batch([
+            VLLeg(
+                market=i.market,
+                side=i.side,
+                qty_base=i.qty_base,
+                price=i.price,
+                expiration=i.expiration,
+            )
+            for i in legs
+        ])
+        _record_before_sending(state, batch.orders, legs)
         try:
-            result = client.place_vl_batch([
-                VLLeg(
-                    market=i.market,
-                    side=i.side,
-                    qty_base=i.qty_base,
-                    price=i.price,
-                    expiration=i.expiration,
-                )
-                for i in legs
-            ])
+            result = client.send_vl_batch(batch)
+            # Convert Sera's batch response into local cancellation/fill state.
+            placement = _placement_from_vl_result(spent_token, result, legs)
         except Exception as exc:
+            if not _refused(exc):
+                log.error(
+                    "VL batch %s spent=%s legs=%d got no usable answer (%s); "
+                    "tracking it in case Sera booked it",
+                    batch.vl_batch_id, spent_token, len(legs), exc,
+                )
+                issues.unanswered.append(_unanswered_placement(
+                    "vl", spent_token, batch.orders, legs, vl_batch_id=batch.vl_batch_id))
+                return []
+            if state is not None:
+                state.remove_unsettled([order.order_id for order in batch.orders])
             issues.note(exc)
             inactive = _inactive_market(exc, legs)
             if inactive is None:
@@ -1786,11 +1822,7 @@ def _place_vl_batch(
             )
             legs = [leg for leg in legs if leg.market != inactive]
             continue
-        # Convert Sera's batch response into local cancellation/fill state.
-        placement = _placement_from_vl_result(spent_token, result, legs)
         placed.append(placement)
-        if state is not None:
-            state.add_unsettled(_unsettled_orders(placement))
         log.debug(
             "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
             result.vl_batch_id,
@@ -1814,15 +1846,27 @@ def _place_standalone(
     issues: PlacementIssues,
 ) -> None:
     """Place one ordinary order, logging and skipping it if Sera rejects it."""
+    order = client.sign_order(
+        intent.market,
+        intent.side,
+        intent.qty_base,
+        intent.price,
+        intent.expiration,
+    )
+    _record_before_sending(state, [order], [intent])
     try:
-        record = client.place_order(
-            intent.market,
-            intent.side,
-            intent.qty_base,
-            intent.price,
-            intent.expiration,
-        )
+        record = client.send_order(order)
     except Exception as exc:
+        if not _refused(exc):
+            log.error(
+                "%s %s order %s got no usable answer (%s); tracking it in case Sera booked it",
+                intent.market, intent.side, order.order_id, exc,
+            )
+            issues.unanswered.append(_unanswered_placement(
+                "standalone", intent.spent_token, [order], [intent]))
+            return
+        if state is not None:
+            state.remove_unsettled([order.order_id])
         issues.note(exc)
         inactive = _inactive_market(exc, [intent])
         if inactive is not None:
@@ -1850,14 +1894,80 @@ def _place_standalone(
         intent_by_order_id={record.order_id: intent},
     )
     placed.append(placement)
-    if state is not None:
-        state.add_unsettled(_unsettled_orders(placement))
     log.debug(
         "placed standalone %s %s side=%s spent=%s",
         intent.market,
         record.order_id,
         intent.side,
         intent.spent_token,
+    )
+
+
+def _refused(exc: Exception) -> bool:
+    """Whether Sera answered a placement with a 4xx refusal, so booked nothing.
+
+    Anything else (a timeout, a dropped connection, a server error, a reply
+    rotor cannot read) leaves open whether the order is live on Sera.
+    """
+    return isinstance(exc, errors.SeraError) and 400 <= exc.status_code < 500
+
+
+def _record_before_sending(
+    state: StateStore | None,
+    orders: list[SignedOrder],
+    intents: list[OrderIntent],
+) -> None:
+    """Put signed orders in the settlement ledger before they are sent.
+
+    Their ids are final once signed, so a fill on any order Sera books is
+    counted even if its answer is lost. An order Sera never books has no
+    fills and settles at zero after its expiry.
+    """
+    if state is None:
+        return
+    now = time.time()
+    state.add_unsettled([
+        UnsettledOrder(
+            order_id=order.order_id,
+            market=intent.market,
+            side=intent.side,
+            price=intent.price,
+            expiration=intent.expiration,
+            placed_at=now,
+        )
+        for order, intent in zip(orders, intents, strict=True)
+    ])
+
+
+def _unanswered_placement(
+    kind: str,
+    spent_token: str,
+    orders: list[SignedOrder],
+    intents: list[OrderIntent],
+    *,
+    vl_batch_id: str | None = None,
+) -> LivePlacement:
+    """Track a placement Sera may have booked, so the next cycle cancels it."""
+    now = time.time()
+    return LivePlacement(
+        kind=kind,
+        spent_token=spent_token,
+        orders=[
+            LiveOrder(
+                side=intent.side,
+                order_id=order.order_id,
+                uuid_int=order.uuid_int,
+                placed_at=now,
+                market=intent.market,
+                qty_base=intent.qty_base,
+            )
+            for order, intent in zip(orders, intents, strict=True)
+        ],
+        placed_at=now,
+        vl_batch_id=vl_batch_id,
+        intent_by_order_id={
+            order.order_id: intent for order, intent in zip(orders, intents, strict=True)
+        },
     )
 
 
@@ -1983,6 +2093,11 @@ def _is_order_gone(exc: Exception) -> bool:
     if not isinstance(exc, errors.SeraError):
         return False
     if exc.status_code == 404:
+        return True
+    # Sera answers a cancel for an order or batch it does not know with a 400
+    # that says so: "Order not found for cancellation:..." or "VL batch not
+    # found: ...". An unanswered placement Sera never booked ends up here.
+    if exc.status_code == 400 and "not found" in (exc.detail or "").lower():
         return True
     code = (exc.error_code or "").upper()
     return any(
@@ -2200,23 +2315,6 @@ def _filled_quantities(fills: dict[str, list[dict]]) -> dict[str, Decimal]:
         order_id: sum((_filled_base_qty(fill) for fill in rows), Decimal("0"))
         for order_id, rows in fills.items()
     }
-
-
-def _unsettled_orders(placement: LivePlacement) -> list[UnsettledOrder]:
-    """Ledger rows for a placement's orders whose intent (price, side) is known."""
-    intents = placement.intent_by_order_id or {}
-    return [
-        UnsettledOrder(
-            order_id=order.order_id,
-            market=intents[order.order_id].market,
-            side=intents[order.order_id].side,
-            price=intents[order.order_id].price,
-            expiration=intents[order.order_id].expiration,
-            placed_at=order.placed_at,
-        )
-        for order in placement.orders
-        if order.order_id in intents
-    ]
 
 
 def _positions_for_quoting(
