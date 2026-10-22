@@ -12,6 +12,6 @@ Files:
   scheduled fire-once (`--once`) run model.
 
 Provider-specific FX reference notes live in `rotor/price_reference/README.md`;
-the current supported source names are `wise`, `ecb`, `fed`, `bnm`, and `mas`.
-`wise`, `ecb`, `bnm`, and `mas` work without a key (`WISE_API_TOKEN` is
+the current supported source names are `wise`, `ecb`, `fed`, and `bnm`.
+`wise`, `ecb`, and `bnm` work without a key (`WISE_API_TOKEN` is
 optional); `fed` needs a free `FRED_API_KEY`. Live source checks live in `tests/live/`.

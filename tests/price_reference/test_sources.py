@@ -12,7 +12,6 @@ from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
     FedH10RateSource,
-    MasRateSource,
     WiseRateSource,
 )
 from rotor.price_reference.symbols import market_to_iso_pair
@@ -275,23 +274,3 @@ def test_bnm_source_crosses_rates_through_myr_and_averages_when_middle_missing()
     assert paths == ["/public/exchange-rate", "/public/exchange-rate"]
     with pytest.raises(ValueError, match="BNM publishes no XYZ rate"):
         src.quote("XYZ", "USD")
-
-
-def test_mas_source_crosses_rates_through_sgd():
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["resource_id"] == MasRateSource.DEFAULT_RESOURCE_IDS["USD"]
-        return httpx.Response(200, json={
-            "success": True,
-            "result": {
-                "records": [{
-                    "date": "2026-06-09",
-                    "exchange_rate_usd": "1.35",
-                }]
-            },
-        })
-
-    src = MasRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
-    obs = src.quote("USD", "SGD")
-
-    assert obs.rate == Decimal("1.35")
-    assert obs.pair == "USD/SGD"

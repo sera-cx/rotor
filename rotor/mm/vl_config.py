@@ -17,7 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10.
 from rotor.price_reference import parse_market_symbol
 
 # Closed set of external reference providers accepted per pair.
-PRICE_SOURCE_CHOICES = {"wise", "ecb", "fed", "bnm", "mas"}
+PRICE_SOURCE_CHOICES = {"wise", "ecb", "fed", "bnm"}
 
 
 @dataclass(frozen=True)
@@ -161,6 +161,12 @@ def _parse_pairs(
         parse_market_symbol(market)
         # Per-pair source controls where this market's benchmark comes from.
         price_source = str(row.get("price_source", "wise")).strip().lower()
+        if price_source == "mas":
+            # Its public daily dataset stopped in 2015, and MAS's current API
+            # needs a registered key.
+            raise ValueError(
+                f"{source}: price_source 'mas' was removed (MAS publishes no public "
+                "daily rate API); use 'ecb' or 'bnm', which both publish SGD")
         if price_source not in PRICE_SOURCE_CHOICES:
             raise ValueError(f"{source}: unsupported price_source {price_source!r}")
         # Quantity is mandatory per pair because markets have different scales.

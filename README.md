@@ -61,8 +61,8 @@ qty_base = "1000"
 fixed_bps = "40"
 ```
 
-Supported FX sources are `wise`, `ecb`, `fed`, `bnm`, and `mas`. `wise`, `ecb`,
-`bnm`, and `mas` work without a key (`WISE_API_TOKEN` is optional and only
+Supported FX sources are `wise`, `ecb`, `fed`, and `bnm`. `wise`, `ecb`, and
+`bnm` work without a key (`WISE_API_TOKEN` is optional and only
 raises Wise's rate limits); `fed` (the official FRED API) needs a free
 `FRED_API_KEY`. A pair's source sets its mid: the central-bank sources publish
 daily reference rates, and `wise` (for currencies none of them covers) uses the
@@ -100,7 +100,7 @@ notifier. Install the extra with `poetry install --extras telegram` when real
 Telegram sends are needed; without the extra or token, sends degrade to dry-run
 logs.
 
-Daily FX sources (`ecb`, `fed`, `bnm`, `mas`) publish nothing on weekends or
+Daily FX sources (`ecb`, `fed`, `bnm`) publish nothing on weekends or
 public holidays. Instead of going dark until they publish again, Rotor keeps
 quoting on a source's last published rate for up to 7 days past that rate's
 date. With `--telegram` it warns when pairs start quoting on carried rates,
@@ -129,8 +129,8 @@ Opt-in real Sera testnet checks are skipped by default:
 ROTOR_RUN_TESTNET=1 poetry run python -m pytest -q tests/testnet
 ```
 
-Opt-in live FX source checks (keyless `ecb`/`bnm`/`mas`; `fed`/`wise` run when
-their key is set) are also skipped by default:
+Opt-in live FX source checks (keyless `ecb`/`bnm`/`wise`; `fed` runs when its
+key is set) are also skipped by default:
 
 ```bash
 make live-prices   # or: ROTOR_RUN_LIVE_PRICES=1 poetry run python -m pytest -q tests/live

@@ -11,7 +11,7 @@ Folders:
 - `price_reference/`: external price source and oracle tests.
 - `security/`: signing-key loading and typed-data signing tests.
 - `testnet/`: opt-in real Sera testnet integration checks, skipped by default.
-- `live/`: opt-in live FX source checks (ECB/BNM/MAS keyless; FRED/Wise need a
+- `live/`: opt-in live FX source checks (ECB/BNM/Wise keyless; FRED/Wise need a
   key), skipped unless `ROTOR_RUN_LIVE_PRICES=1`.
 
 Root-level files:

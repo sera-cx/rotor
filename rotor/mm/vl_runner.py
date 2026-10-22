@@ -724,7 +724,7 @@ class DarkPairAlerts:
 class StaleReferenceAlerts:
     """Tell the operator when pairs quote on reference rates that stopped updating.
 
-    Official daily FX sources (BNM, ECB, the Fed, MAS) publish nothing on
+    Official daily FX sources (BNM, ECB, the Fed) publish nothing on
     weekends or public holidays, so the oracle carries their last rate forward
     instead of halting the pair. Each such episode is announced once on the
     important channel, repeated quietly every `reminder_seconds`, and closed with

@@ -3,7 +3,7 @@
 These hit real external endpoints, so they are skipped unless
 ``ROTOR_RUN_LIVE_PRICES=1``. Two groups:
 
-  * Public (keyless): ECB (XML), Bank Negara Malaysia, data.gov.sg (MAS), and
+  * Public (keyless): ECB (XML), Bank Negara Malaysia, and
     Wise (anonymous quotes; ``WISE_API_TOKEN`` is used if set).
   * Credentialed: ``fed`` (FRED API — needs ``FRED_API_KEY``); skipped unless
     its key is configured.
@@ -71,6 +71,13 @@ def _assert_sane(name, base, quote, low, high, obs):
     # ts must be a real (published) timestamp, never in the future.
     assert isinstance(obs.ts, float)
     assert 0 < obs.ts <= time.time() + 86400
+    # ...and recent enough to quote on: a source whose data stopped (as the
+    # MAS dataset did in 2015) must fail here, not pass on a plausible rate.
+    source = load_price_reference_source(name)
+    limit = getattr(source, "default_max_carry_age_s", None) or source.default_max_age_s
+    assert time.time() - obs.ts <= limit, (
+        f"{name} {base}/{quote} rate is {time.time() - obs.ts:.0f}s old (limit {limit:.0f}s)"
+    )
 
 
 # (source, base, quote, low, high). Bands are quote-per-base.
@@ -81,7 +88,6 @@ PUBLIC_CASES = [
     ("ecb", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
     ("ecb", "EUR", "USD", Decimal("0.7"), Decimal("1.7")),
     ("bnm", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
-    ("mas", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
     # Wise prices anonymous quotes; WISE_API_TOKEN only raises its limits.
     ("wise", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
 ]

@@ -75,6 +75,13 @@ def test_parse_vl_config_rejects_unsupported_price_source():
         ]))
 
 
+def test_parse_vl_config_says_the_mas_source_was_removed():
+    with pytest.raises(ValueError, match="'mas' was removed .* use 'ecb' or 'bnm'"):
+        parse_vl_config(_config(pair=[
+            {"market": "XSGD/USDC", "price_source": "mas", "qty_base": "100"},
+        ]))
+
+
 def test_parse_vl_config_rejects_non_positive_budget_amount():
     with pytest.raises(ValueError, match="budget USDC amount must be > 0"):
         parse_vl_config(_config(budget=[{"token": "USDC", "amount": "0"}]))

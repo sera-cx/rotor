@@ -2,8 +2,7 @@
 
 Opt-in tests that call the real FX reference sources. Two groups:
 
-- **Public (keyless):** `ecb`, `bnm` (Bank Negara Malaysia), `mas` (data.gov.sg),
-  and `wise` (anonymous quotes; `WISE_API_TOKEN` is used if set). Need outbound
+- **Public (keyless):** `ecb`, `bnm` (Bank Negara Malaysia), and `wise` (anonymous quotes; `WISE_API_TOKEN` is used if set). Need outbound
   network access but no credentials.
 - **Credentialed:** `fed` (the official FRED API — needs `FRED_API_KEY`), skipped
   unless the key is set.
@@ -35,7 +34,6 @@ Skipped by default (no `ROTOR_RUN_LIVE_PRICES=1`), so `make test` stays offline.
 |--------|------------|----------------------------|
 | `ecb`  | none | any two currencies in the ECB daily XML (USD, SGD, MYR, EUR, …), crossed via EUR |
 | `bnm`  | none | any currency BNM publishes (USD, SGD, EUR, …), crossed via MYR |
-| `mas`  | none | USD ↔ SGD only — extend with `MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON` |
 | `fed`  | `FRED_API_KEY` | AUD BRL CAD CHF EUR GBP JPY MXN MYR NZD SGD ZAR (+ USD), crossed via USD — replace with `FED_H10_SERIES_JSON` |
 | `wise` | none (`WISE_API_TOKEN` optional) | broad — any Wise source/target |
 

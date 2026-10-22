@@ -92,7 +92,7 @@ The wrapper honors `ROTOR_CONFIG`, `ROTOR_ORDER_TTL`, and `ROTOR_LOG_LEVEL`.
 - **One instance per wallet.** Rotor takes an advisory lock on
   `<state>.lock`; do not let scheduled runs overlap against the same wallet.
 - **Egress.** The sandbox needs outbound HTTPS to Sera and your price source
-  (Wise/ECB/BNM/MAS/FRED-API). The legacy FRED scrape endpoint is bot-walled,
+  (Wise/ECB/BNM/FRED-API). The legacy FRED scrape endpoint is bot-walled,
   which is why `fed` uses the FRED API.
 - **`SERA_BASE_URL` must be `https://`** (rotor refuses a plain-http endpoint
   outside `localhost`).

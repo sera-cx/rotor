@@ -7,7 +7,6 @@ from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
     FedH10RateSource,
-    MasRateSource,
     RateSource,
     WiseRateSource,
 )
@@ -73,23 +72,8 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
             max_age_s=_max_age_override("BNM"),
             max_carry_age_s=_max_carry_age_override("BNM"),
         )
-    if source_name == "mas":
-        return MasRateSource(
-            url=str(
-                get_config(
-                    "MAS_EXCHANGE_RATE_URL",
-                    "https://data.gov.sg/api/action/datastore_search",
-                )
-            ),
-            resource_ids=(
-                get_config_json("MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON", None)
-                or MasRateSource.DEFAULT_RESOURCE_IDS
-            ),
-            max_age_s=_max_age_override("MAS"),
-            max_carry_age_s=_max_carry_age_override("MAS"),
-        )
     # Keep accepted source names closed so misspellings fail loudly.
-    raise ValueError("PRICE_REFERENCE_SOURCE must be one of: wise, ecb, fed, bnm, mas")
+    raise ValueError("PRICE_REFERENCE_SOURCE must be one of: wise, ecb, fed, bnm")
 
 
 def _max_age_override(prefix: str) -> float | None:

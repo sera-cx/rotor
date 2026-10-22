@@ -21,7 +21,7 @@ SERA_PRIVATE_KEY = ""
 # Tiny unresolved-state DB. This is not trade history.
 ROTOR_STATE_PATH = ".rotor_state.sqlite"
 
-# Price source: "wise", "ecb", "fed", "bnm", or "mas".
+# Price source: "wise", "ecb", "fed", or "bnm".
 # VL pairs configure their source in TOML; this value is the fallback.
 PRICE_REFERENCE_SOURCE = "wise"
 # Wise supplies the after-fee rates every pair is kept outside of. The token is
@@ -39,11 +39,6 @@ FRED_API_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 FED_H10_SERIES_JSON = {"EUR": "DEXUSEU", "MYR": "DEXMAUS", "SGD": "DEXSIUS"}
 # Bank Negara Malaysia publishes MYR-crossed exchange rates here.
 BNM_EXCHANGE_RATE_BASE_URL = "https://api.bnm.gov.my/public/exchange-rate"
-# MAS public exchange-rate data is fetched through data.gov.sg by default.
-MAS_EXCHANGE_RATE_URL = "https://data.gov.sg/api/action/datastore_search"
-MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON = {
-    "USD": "d_046ff8d521a218d9178178cfbfc45c2c",
-}
 
 # Optional mapping for tokens whose market symbols differ from ISO currency
 # codes used by reference-rate providers.

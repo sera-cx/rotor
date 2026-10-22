@@ -12,7 +12,6 @@ from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
     FedH10RateSource,
-    MasRateSource,
     RateSource,
     WiseRateSource,
 )
@@ -29,7 +28,6 @@ __all__ = [
     "EcbRateSource",
     "FedH10RateSource",
     "BnmRateSource",
-    "MasRateSource",
     "WiseRateSource",
     "load_price_reference_source",
     "load_token_to_iso",

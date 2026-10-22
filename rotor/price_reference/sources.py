@@ -15,7 +15,7 @@ from rotor.config import get_config
 from rotor.price_reference.models import PriceObservation
 
 # Default per-source staleness windows. Intraday providers (Wise) should be
-# rejected after minutes; daily-published official references (ECB/Fed/BNM/MAS)
+# rejected after minutes; daily-published official references (ECB/Fed/BNM)
 # legitimately carry the same rate across a business day plus weekends, so they
 # get a wider default. Both are overridable per source via config.
 INTRADAY_MAX_AGE_S = 600.0          # 10 minutes
@@ -463,82 +463,6 @@ def _myr_per_currency(rows: dict[str, dict], currency: str) -> tuple[Decimal, di
     if row is None:
         raise ValueError(f"BNM publishes no {currency} rate")
     return _parse_bnm_rate(row), row
-
-
-class MasRateSource:
-    """MAS/public Singapore exchange rates crossed through SGD.
-
-    The default data.gov.sg resource covers USD/SGD. Additional currencies can
-    be supplied by config when MAS publishes compatible resource ids.
-    """
-
-    name = "mas"
-    # data.gov.sg exposes the latest official daily SGD rates.
-    DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
-    DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
-
-    DEFAULT_RESOURCE_IDS = {
-        "USD": "d_046ff8d521a218d9178178cfbfc45c2c",
-    }
-
-    def __init__(
-        self,
-        *,
-        url: str = "https://data.gov.sg/api/action/datastore_search",
-        resource_ids: dict[str, str] | None = None,
-        timeout: float = DEFAULT_TIMEOUT_S,
-        max_age_s: float | None = None,
-        max_carry_age_s: float | None = None,
-        http: httpx.Client | None = None,
-    ) -> None:
-        self.url = url
-        self.default_max_age_s = (
-            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
-        )
-        self.default_max_carry_age_s = (
-            self.DEFAULT_MAX_CARRY_AGE_S
-            if max_carry_age_s is None
-            else float(max_carry_age_s)
-        )
-        configured = self.DEFAULT_RESOURCE_IDS if resource_ids is None else resource_ids
-        self.resource_ids = {
-            key.upper(): value
-            for key, value in configured.items()
-        }
-        self._http = http or httpx.Client(timeout=timeout)
-
-    def quote(
-        self, base: str, quote: str, *, amount: Decimal | None = None
-    ) -> PriceObservation:
-        """Fetch MAS rates and cross through SGD."""
-        base = base.upper()
-        quote = quote.upper()
-        base_sgd, base_raw = self._sgd_per_currency(base)
-        quote_sgd, quote_raw = self._sgd_per_currency(quote)
-        return PriceObservation(
-            source=self.name,
-            pair=_pair(base, quote),
-            rate=base_sgd / quote_sgd,
-            # The datastore record carries the official rate date.
-            ts=_published_ts(base_raw.get("date"), quote_raw.get("date")),
-            raw={"base": base_raw, "quote": quote_raw},
-        )
-
-    def _sgd_per_currency(self, currency: str) -> tuple[Decimal, dict]:
-        if currency == "SGD":
-            return Decimal("1"), {"currency": "SGD", "rate": "1"}
-        resource_id = self.resource_ids.get(currency)
-        if not resource_id:
-            raise KeyError(f"MAS resource id not configured for {currency}")
-        response = self._http.get(
-            self.url,
-            params={"resource_id": resource_id, "limit": 1, "sort": "date desc"},
-        )
-        response.raise_for_status()
-        row = response.json()["result"]["records"][0]
-        field = f"exchange_rate_{currency.lower()}"
-        rate = _positive_decimal(row[field])
-        return rate, {"currency": currency, "resource_id": resource_id, **row}
 
 
 def _pair(base: str, quote: str) -> str:

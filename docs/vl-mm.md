@@ -130,11 +130,12 @@ Rules:
   other pairs quote; rotor refuses to start only if Sera lists none of them.
   A running rotor re-checks this hourly (see [Sera Changes While
   Running](#sera-changes-while-running)).
-- `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `fed` (the official
+- `price_source` is `wise`, `ecb`, `fed`, or `bnm` (`mas` was removed: MAS
+  publishes no public daily rate API; ECB and BNM both publish SGD). `fed` (the official
   FRED API) needs a free `FRED_API_KEY`; the others work without a key.
   `WISE_API_TOKEN` is optional: Wise prices anonymous quotes too, and a token
   only raises its rate limits.
-- A pair's source sets its mid. `ecb`, `fed`, `bnm`, and `mas` publish daily
+- A pair's source sets its mid. `ecb`, `fed`, and `bnm` publish daily
   reference rates; `wise` (for currencies none of them covers) uses the
   midpoint of Wise's after-fee sell and buy rates for the pair's `qty_base`.
 - Every pair is also kept outside Wise's after-fee rates for each order's own
@@ -159,7 +160,7 @@ cross-rate details.
 
 Each source observation is stamped with the provider's published timestamp and
 checked against a per-source freshness window: 10 minutes for `wise` (intraday)
-and 48 hours for the daily references (`ecb`, `fed`, `bnm`, `mas`). Override a
+and 48 hours for the daily references (`ecb`, `fed`, `bnm`). Override a
 single source with `<SOURCE>_MAX_AGE_S`, all of them with
 `PRICE_REFERENCE_MAX_AGE_S`, or everything at runtime with `--max-reference-age`.
 

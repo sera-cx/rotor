@@ -11,7 +11,7 @@ Files and folders:
 - `cli/`: argparse command tree for `rotor mm vl`.
 - `mm/`: VL runner, TOML config loader, and Sera exchange integration.
 - `notifications/`: optional Telegram lifecycle/error notifications.
-- `price_reference/`: FX source adapters (`wise`, `ecb`, `fed`, `bnm`, `mas`)
+- `price_reference/`: FX source adapters (`wise`, `ecb`, `fed`, `bnm`)
   and token-to-ISO mapping.
 - `security/`: signing-key loading and EIP-712 signing helpers.
 - `updater.py`: opt-in daily Git pull helper for autonomous source deployments.

@@ -18,7 +18,6 @@ from rotor.price_reference.models import PriceObservation
 from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
-    MasRateSource,
     WiseRateSource,
 )
 from rotor.price_reference.symbols import market_to_iso_pair, parse_market_symbol
@@ -47,11 +46,11 @@ def test_load_token_to_iso_uppercases_json_overrides(monkeypatch):
 
 
 def test_load_price_reference_source_rejects_unknown_source():
-    with pytest.raises(ValueError, match="wise, ecb, fed, bnm, mas"):
+    with pytest.raises(ValueError, match="wise, ecb, fed, bnm"):
         load_price_reference_source("manual")
 
 
-@pytest.mark.parametrize("name", ["wise", "ecb", "fed", "bnm", "mas"])
+@pytest.mark.parametrize("name", ["wise", "ecb", "fed", "bnm"])
 def test_load_price_reference_source_accepts_supported_sources(name):
     assert load_price_reference_source(name).name in {name, "fed"}
 
@@ -136,13 +135,6 @@ def test_ecb_source_rejects_xml_without_daily_rates():
 
     with pytest.raises(ValueError, match="daily rates"):
         src.quote("SGD", "USD")
-
-
-def test_mas_source_rejects_unconfigured_currency():
-    src = MasRateSource(resource_ids={})
-
-    with pytest.raises(KeyError, match="MAS resource id"):
-        src.quote("EUR", "SGD")
 
 
 def test_reference_oracle_wraps_source_failures_with_pair_and_type():

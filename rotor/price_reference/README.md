@@ -8,11 +8,11 @@ Files:
 - `__init__.py`: public exports for source adapters, data models, config
   loaders, and symbol mapping helpers.
 - `aggregator.py`: freshness-checking `ReferencePriceOracle` wrapper.
-- `config.py`: config-driven factory for `wise`, `ecb`, `fed`, `bnm`, and `mas`
+- `config.py`: config-driven factory for `wise`, `ecb`, `fed`, and `bnm`
   sources plus optional token-to-ISO overrides.
 - `models.py`: dataclasses for raw source observations and quote-safe reference
   prices.
-- `sources.py`: Wise, ECB, Fed H.10, BNM, and MAS source adapters.
+- `sources.py`: Wise, ECB, Fed H.10, and BNM source adapters.
 - `symbols.py`: Sera token symbol to ISO currency mapping.
 
 Available sources:
@@ -37,20 +37,22 @@ Available sources:
   a series named neither way is rejected at startup. `FED_H10_SERIES_JSON`
   replaces the built-in list.
 - `bnm`: Bank Negara Malaysia OpenAPI exchange rates, crossed through MYR. Keyless.
-- `mas`: MAS/data.gov.sg exchange rates, crossed through SGD. Keyless. The default
-  resource covers USD; add resource ids for more currencies when needed.
+There is no MAS source: MAS's only public daily dataset (on data.gov.sg)
+stopped in October 2015, and its current API needs a registered key. ECB and
+BNM both publish SGD.
 
-Only `wise` and `fed` require a credential; `ecb`, `bnm`, and `mas` are keyless.
+Only `fed` requires a credential; `wise` (token optional), `ecb`, and `bnm` are
+keyless.
 
 ## Freshness
 
 Each observation is stamped with the provider's **published** timestamp (Wise's
-quote time; the ECB `Cube time`; the FRED/BNM/MAS row date), not fetch time, so a
+quote time; the ECB `Cube time`; the FRED/BNM row date), not fetch time, so a
 stale (e.g. weekend or holiday) feed is detectable. `ReferencePriceOracle`
 treats an observation older than the source's window as stale:
 
 - `wise`: 10 minutes (intraday).
-- `ecb` / `fed` / `bnm` / `mas`: 48 hours (daily references legitimately carry
+- `ecb` / `fed` / `bnm`: 48 hours (daily references legitimately carry
   the same rate across a business day plus weekends).
 
 Override one source with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`), all
@@ -58,7 +60,7 @@ of them with `PRICE_REFERENCE_MAX_AGE_S`, or everything at runtime with the
 `--max-reference-age` CLI flag.
 
 Past its window a daily reference is **carried forward** rather than rejected:
-`ecb`, `fed`, `bnm`, and `mas` publish nothing on weekends or public holidays, so
+`ecb`, `fed`, and `bnm` publish nothing on weekends or public holidays, so
 the oracle still returns the last published rate, marked `stale` with its
 `age_s`, until that rate is 7 days old. Past that it raises `ReferenceTooStale`,
 a `ReferenceUnavailable` subclass. `wise` declares no carry limit and is rejected
@@ -79,11 +81,10 @@ The bot maps token markets to fiat ISO pairs before pricing:
 Environment config:
 
 ```bash
-export PRICE_REFERENCE_SOURCE="wise"   # wise, ecb, fed, bnm, or mas
+export PRICE_REFERENCE_SOURCE="wise"   # wise, ecb, fed, or bnm
 export WISE_API_TOKEN="..."            # optional: higher Wise rate limits
 export FRED_API_KEY="..."              # required for the fed source
 export FED_H10_SERIES_JSON='{"EUR":"DEXUSEU","MYR":"DEXMAUS","SGD":"DEXSIUS"}'
-export MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON='{"USD":"d_046ff8d521a218d9178178cfbfc45c2c"}'
 export ECB_MAX_AGE_S="172800"          # optional per-source staleness override
 export BNM_MAX_CARRY_AGE_S="604800"    # optional: how long a stale daily rate is still quoted
 ```
@@ -100,13 +101,9 @@ FRED_API_KEY = "..."  # free key: https://fred.stlouisfed.org/docs/api/api_key.h
 FRED_API_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 FED_H10_SERIES_JSON = {"EUR": "DEXUSEU", "MYR": "DEXMAUS", "SGD": "DEXSIUS"}
 BNM_EXCHANGE_RATE_BASE_URL = "https://api.bnm.gov.my/public/exchange-rate"
-MAS_EXCHANGE_RATE_URL = "https://data.gov.sg/api/action/datastore_search"
-MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON = {
-    "USD": "d_046ff8d521a218d9178178cfbfc45c2c",
-}
 ```
 
-ECB, Fed H.10, BNM, and MAS are official/reference sources. They are useful as
+ECB, Fed H.10, and BNM are official/reference sources. They are useful as
 transparent fallbacks or regional official feeds, but they are not live tick
 sources in the same way Wise can be. `fed` uses the official FRED API and needs
-a free `FRED_API_KEY`; ECB, BNM, and MAS are keyless.
+a free `FRED_API_KEY`; ECB and BNM are keyless.

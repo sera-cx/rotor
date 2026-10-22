@@ -42,7 +42,7 @@ Pricing:
 - All price, size, budget, and rate math uses `Decimal`.
 - Tokens are priced at their currency's reference rate (Sera's 1:1 stablecoin
   assumption); rotor reads no token market price, so a depeg is not detected.
-- The source rate is quote-per-base and is the pair's mid. `ecb`/`fed`/`bnm`/`mas`
+- The source rate is quote-per-base and is the pair's mid. `ecb`/`fed`/`bnm`
   are published reference rates; `wise` is the midpoint of Wise's after-fee
   sell and buy rates for the pair's `qty_base`.
 - Every order, normal or return, is kept outside Wise's after-fee rates for its
@@ -55,7 +55,7 @@ Pricing:
 - Quotes fail closed when market minimums are not met.
 - Observation timestamps are the provider's published date, not fetch time, so a
   stale daily feed is detectable. Staleness windows are per-source (intraday for
-  `wise`, daily for `ecb`/`fed`/`bnm`/`mas`), overridable via config/CLI.
+  `wise`, daily for `ecb`/`fed`/`bnm`), overridable via config/CLI.
 - A stale daily reference is carried forward until its carry limit (default 7
   days from the published date), because official sources do not publish on
   weekends or holidays. The oracle marks that price `stale`, the runner alerts
