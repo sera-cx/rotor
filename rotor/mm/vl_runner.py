@@ -79,6 +79,9 @@ DEFAULT_STATE_PATH = ".rotor_state.sqlite"
 # While pairs quote on carried-forward reference rates, repeat the warning at
 # most this often, so a weekend produces a handful of messages, not one per tick.
 STALE_REMINDER_SECONDS = 6 * 60 * 60.0
+# A pair that produces no quote this long while others may still quote (its
+# price source failing, say) is alerted once; quoting again is reported.
+DARK_PAIR_ALERT_SECONDS = 15 * 60.0
 # An order's fills are counted this long after it expires, so a match made just
 # before expiry has time to show up in its fill list.
 SETTLE_GRACE_SECONDS = 60.0
@@ -247,6 +250,14 @@ class StateStore:
                 net_base TEXT NOT NULL,
                 price TEXT NOT NULL,
                 opened_at REAL NOT NULL
+            )
+        """)
+        # Pairs not quoting, so --once fires share the episode (see DarkPairAlerts).
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS dark_pairs (
+                market TEXT PRIMARY KEY,
+                since REAL NOT NULL,
+                alerted INTEGER NOT NULL
             )
         """)
         # The stall watchdog's clock, so --once fires share it (see StallWatchdog).
@@ -526,6 +537,23 @@ class StateStore:
                 rows,
             )
 
+    def replace_dark_pairs(self, episodes: dict[str, tuple[float, bool]]) -> None:
+        """Replace the open not-quoting episodes (market -> since, alerted)."""
+        with self._db:
+            self._db.execute("DELETE FROM dark_pairs")
+            self._db.executemany(
+                "INSERT INTO dark_pairs (market, since, alerted) VALUES (?, ?, ?)",
+                [(market, since, int(alerted)) for market, (since, alerted) in episodes.items()],
+            )
+
+    def load_dark_pairs(self) -> dict[str, tuple[float, bool]]:
+        """Load the open not-quoting episodes."""
+        return {
+            market: (float(since), bool(alerted))
+            for market, since, alerted in self._db.execute(
+                "SELECT market, since, alerted FROM dark_pairs")
+        }
+
     def save_watchdog(self, values: dict[str, float]) -> None:
         """Store the stall watchdog's timestamps."""
         with self._db:
@@ -621,6 +649,73 @@ class StallWatchdog:
         if self._state is not None:
             self._state.save_watchdog(
                 {"last_quote_ok": self.last_quote_ok, "last_alert": self.last_alert})
+
+
+class DarkPairAlerts:
+    """Alert when one pair stops quoting while the others may carry on.
+
+    The stall watchdog sees only whether anything was placed, so a single pair
+    whose price source keeps failing would otherwise show up only as a log
+    line per tick. A pair skipped on every tick for DARK_PAIR_ALERT_SECONDS
+    gets one alert with the reason; its next quote sends one "quoting again".
+    Episodes are kept in the state file, so --once fires share them.
+    """
+
+    def __init__(
+        self,
+        markets: set[str],
+        *,
+        state: StateStore | None = None,
+        window: float = DARK_PAIR_ALERT_SECONDS,
+    ) -> None:
+        self._state = state
+        self.window = window
+        loaded = {} if state is None else state.load_dark_pairs()
+        # market -> (first skipped at, alerted yet)
+        self._episodes = {m: e for m, e in loaded.items() if m in markets}
+
+    def update(
+        self,
+        refs: TickReferences,
+        *,
+        notifier: TelegramNotifier | None,
+        log: logging.Logger,
+        alerted_elsewhere: set[str] = frozenset(),
+        now: float | None = None,
+    ) -> None:
+        """Advance each pair's episode from this tick and alert on changes.
+
+        `alerted_elsewhere` are markets another alert already covers (a rate
+        past its carry limit); they are tracked but not alerted twice.
+        """
+        now = time.time() if now is None else now
+        dark: list[str] = []
+        back: list[str] = []
+        before = dict(self._episodes)
+        for market, error in sorted(refs.skipped.items(), key=lambda item: item[0]):
+            since, alerted = self._episodes.get(market, (now, False))
+            if not alerted and now - since >= self.window:
+                alerted = True
+                if market not in alerted_elsewhere:
+                    reason = (str(error).splitlines() or [type(error).__name__])[0]
+                    dark.append(f"{market} for {_fmt_duration(now - since)}: {reason}")
+            self._episodes[market] = (since, alerted)
+        for market in sorted(refs.quoted):
+            episode = self._episodes.pop(market, None)
+            if episode is not None and episode[1] and market not in alerted_elsewhere:
+                back.append(f"{market} after {_fmt_duration(now - episode[0])}")
+        if self._episodes != before and self._state is not None:
+            self._state.replace_dark_pairs(self._episodes)
+        for lines, icon, heading in (
+            (dark, "⚠️", "Not quoting these pairs; the other pairs are quoting:"),
+            (back, "✅", "Quoting again:"),
+        ):
+            if not lines:
+                continue
+            body = "\n".join([heading, *lines])
+            log.warning("%s", body.replace("\n", " | "))
+            if notifier is not None:
+                notifier.send_raw(f"{icon} {body}", important=True)
 
 
 class StaleReferenceAlerts:
@@ -738,6 +833,10 @@ class StaleReferenceAlerts:
             log.warning("%s", body.replace("\n", " | "))
             if notifier is not None:
                 notifier.send_raw(f"{icon} {body}", important=important)
+
+    def stopped(self) -> set[str]:
+        """Markets already alerted as stopped on a rate past its carry limit."""
+        return {m for m, e in self._episodes.items() if e.status == "stopped"}
 
     def _carry_line(self, market: str, ref: ReferencePrice) -> str:
         """Describe one pair quoting on a carried-forward rate."""
@@ -906,6 +1005,8 @@ def run(
             )
     # Throttled warnings while pairs quote on carried-forward daily rates.
     stale_alerts = StaleReferenceAlerts(runtimes, state=state)
+    # One alert when a single pair stops quoting for a while, one when it is back.
+    dark_pairs = DarkPairAlerts(markets, state=state)
     # Reattach to any orders already resting on Sera for the configured markets
     # so a restart does not orphan or duplicate live quotes. In dry-run we never
     # touch live state.
@@ -1082,10 +1183,23 @@ def run(
 
             # Warn (throttled) while pairs quote on carried-forward daily rates.
             # An alert failure must never cost a tick, so it is only logged.
+            # Pairs the stale alerts report as stopped (before or after this
+            # update) get their stop and recovery messages from there only.
+            stopped_pairs = stale_alerts.stopped()
             try:
                 stale_alerts.update(tick_refs, notifier=notifier, log=log)
             except Exception as exc:
                 log.warning("stale-reference alert failed: %s", exc)
+            if not dry_run:
+                try:
+                    dark_pairs.update(
+                        tick_refs,
+                        notifier=notifier,
+                        log=log,
+                        alerted_elsewhere=stopped_pairs | stale_alerts.stopped(),
+                    )
+                except Exception as exc:
+                    log.warning("not-quoting alert failed: %s", exc)
 
             if not intents:
                 # No emitted sides means nothing can be safely placed this tick.

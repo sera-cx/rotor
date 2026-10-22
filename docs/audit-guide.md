@@ -58,7 +58,8 @@ Pricing:
   disables carrying.
 - A failing, past-carry-limit, or sub-minimum pair is skipped in isolation; the
   other pairs still quote. A tick is fully skipped only when no pair produces a
-  quote.
+  quote. A pair skipped on every tick for 15 minutes is alerted once
+  (`DarkPairAlerts`, persisted in `dark_pairs`), and once more when it quotes.
 
 Positions and return orders:
 

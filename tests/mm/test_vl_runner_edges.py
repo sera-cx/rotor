@@ -330,6 +330,73 @@ def test_a_state_file_from_before_identities_is_tied_to_its_next_run(tmp_path):
         store.close()
 
 
+def _refs(*, quoted=(), skipped=()) -> vr.TickReferences:
+    refs = vr.TickReferences()
+    for market in quoted:
+        refs.quoted[market] = object()
+    for market in skipped:
+        refs.skipped[market] = RuntimeError(f"{market} source down\nmore detail")
+    return refs
+
+
+def test_a_brief_skip_is_not_alerted_and_a_long_one_is_alerted_once():
+    sent: list[str] = []
+
+    class Notifier:
+        def send_raw(self, text, *, important=False):
+            sent.append(text)
+
+    alerts = vr.DarkPairAlerts({"XSGD/USDC", "EURC/USDC"})
+    log = logging.getLogger("test")
+    timeline = [
+        (0, _refs(skipped=["EURC/USDC"], quoted=["XSGD/USDC"])),
+        (300, _refs(quoted=["EURC/USDC", "XSGD/USDC"])),  # a blip: no message
+        (600, _refs(skipped=["XSGD/USDC"], quoted=["EURC/USDC"])),
+        (1200, _refs(skipped=["XSGD/USDC"], quoted=["EURC/USDC"])),
+        (1500, _refs(skipped=["XSGD/USDC"], quoted=["EURC/USDC"])),
+        (1800, _refs(skipped=["XSGD/USDC"], quoted=["EURC/USDC"])),
+        (2100, _refs(quoted=["EURC/USDC", "XSGD/USDC"])),
+    ]
+    for now, refs in timeline:
+        alerts.update(refs, notifier=Notifier(), log=log, now=float(now))
+
+    assert sent == [
+        "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
+        "XSGD/USDC for 15m: XSGD/USDC source down",
+        "✅ Quoting again:\nXSGD/USDC after 25m",
+    ]
+
+
+def test_not_quoting_episodes_survive_restarts_and_skip_pairs_alerted_elsewhere(tmp_path):
+    sent: list[str] = []
+
+    class Notifier:
+        def send_raw(self, text, *, important=False):
+            sent.append(text)
+
+    path = tmp_path / "state.sqlite"
+    log = logging.getLogger("test")
+    store = vr.StateStore(path)
+    try:
+        vr.DarkPairAlerts({"XSGD/USDC"}, state=store).update(
+            _refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log, now=0.0)
+    finally:
+        store.close()
+    store = vr.StateStore(path)
+    try:
+        alerts = vr.DarkPairAlerts({"XSGD/USDC"}, state=store)
+        # A pair whose rate passed its carry limit already got the stale alert.
+        alerts.update(_refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log,
+                      alerted_elsewhere={"XSGD/USDC"}, now=900.0)
+        alerts.update(_refs(quoted=["XSGD/USDC"]), notifier=Notifier(), log=log,
+                      alerted_elsewhere={"XSGD/USDC"}, now=1200.0)
+        assert store.load_dark_pairs() == {}
+    finally:
+        store.close()
+
+    assert sent == []
+
+
 def test_state_store_drops_the_superseded_pending_returns_table(tmp_path):
     path = tmp_path / "state.sqlite"
     db = sqlite3.connect(path)

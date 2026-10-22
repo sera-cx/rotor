@@ -614,6 +614,49 @@ def test_run_alerts_on_a_stall_and_reports_when_quoting_resumes(monkeypatch):
     assert len(notifier.containing("quoting resumed after 25m")) == 1
 
 
+def test_fire_once_runs_alert_when_one_pair_stops_quoting_and_when_it_is_back(
+    monkeypatch, tmp_path,
+):
+    # XSGD/USDC's price source fails while EURC/USDC keeps quoting, so nothing
+    # stalls overall. Fires run 305 s apart: the one 15 minutes into the outage
+    # alerts once, and the first fire after the source recovers says so.
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource(
+        {("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]},
+        always_fail={("SGD", "USD")},
+    )
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    clock = {"now": T0}
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    def fire() -> int:
+        result = vr.run(config_path="vl.toml", once=True, min_requote_seconds=0.0,
+                        telegram=True, log_level="CRITICAL",
+                        state_path=tmp_path / "state.sqlite")
+        clock["now"] += 305.0
+        return result
+
+    outage = [fire() for _ in range(5)]
+    alerts = notifier.containing("Not quoting these pairs")
+    source.always_fail = set()
+    fire()
+    fire()
+
+    assert outage == [0, 0, 0, 0, 0]
+    assert [text for text, _ in alerts] == [
+        "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
+        "XSGD/USDC for 15m: SGD/USD: test-source failed "
+        "(RuntimeError: source unavailable for pair)"
+    ]
+    assert len(notifier.containing("Not quoting these pairs")) == 1
+    assert [text for text, _ in notifier.containing("Quoting again")] == [
+        "✅ Quoting again:\nXSGD/USDC after 25m"]
+    assert not notifier.containing("VL quoting stalled")
+
+
 def test_run_holds_the_return_side_from_the_tick_after_a_fill(monkeypatch, tmp_path):
     # At the normal cadence the filled order is still resting (and unexpired) on
     # the next tick; its fill already decides that tick's ask.

@@ -165,7 +165,11 @@ stale pair instead.
 Pairs are isolated within a tick: if one pair's reference is unavailable or past
 its carry limit, or its quote fails market minimums, only that pair is skipped —
 the other configured pairs still quote. A tick is fully skipped only when no pair
-produces a quote. Placement is isolated the same way: an order or VL batch that
+produces a quote. With `--telegram`, a pair that has produced no quote for 15
+minutes in a row is alerted once with the reason (for example its price source
+failing), and again once when it quotes again; a pair already reported as past
+its carry limit is not alerted twice. These episodes are kept in the state
+file, so `--once` fires share them. Placement is isolated the same way: an order or VL batch that
 Sera rejects (for example an ask whose base token the wallet does not hold) is
 logged and skipped, and the tick's other orders still go out.
 
