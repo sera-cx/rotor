@@ -155,6 +155,9 @@ Sera signing and API:
   Retry-After); a 503 is retried only for requests safe to repeat (GETs,
   cancels, single-order placement, which Sera dedupes on order_id),
   never for a VL batch. A cancel-cooldown 429 is never retried.
+- `SERA_API_KEY`/`SERA_API_SECRET` are trimmed, and one still holding whitespace
+  or a control character is refused at startup by name, never by value (the
+  HTTP library would otherwise quote the rejected header, secret included).
 - API keys stay in headers; private keys, bearer tokens, signatures, and API
   secrets must not appear in logs.
 

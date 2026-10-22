@@ -206,9 +206,11 @@ class SeraClient:
         self.owner_address = owner_address.lower()
         # Signing is injected so tests/dry-runs can avoid real private keys.
         self._signer = signer
-        # API credentials are stored for authenticated endpoints.
-        self._api_key = api_key
-        self._api_secret = api_secret
+        # API credentials are stored for authenticated endpoints. A stray space
+        # or newline would make the HTTP library reject the Authorization
+        # header with an error that quotes it, secret included, into the logs.
+        self._api_key = _clean_credential("SERA_API_KEY", api_key)
+        self._api_secret = _clean_credential("SERA_API_SECRET", api_secret)
         # Normalize the base URL once so later path joins are simple.
         self.base_url = base_url.rstrip("/")
         # Refuse to sign and submit orders over a non-TLS transport (outside of
@@ -921,6 +923,17 @@ def _retry_wait(response: httpx.Response, attempt: int) -> float:
     except ValueError:
         wait = float(2**attempt)
     return min(max(wait, 0.0), MAX_RETRY_WAIT_S)
+
+
+def _clean_credential(name: str, value: str) -> str:
+    """Trim a credential; refuse whitespace or control characters inside it.
+
+    The error names the setting only, never its value.
+    """
+    value = value.strip()
+    if any(char.isspace() or not char.isprintable() for char in value):
+        raise ValueError(f"{name} contains whitespace or a control character; check its value")
+    return value
 
 
 def _require_secure_base_url(base_url: str) -> None:

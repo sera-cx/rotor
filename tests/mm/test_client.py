@@ -111,6 +111,45 @@ def _make_client(
     return c
 
 
+@pytest.mark.parametrize(("key", "secret"), [
+    ("key123\n", "s3cr3t-secret"),
+    (" key123", "s3cr3t-secret\r\n"),
+    ("key123", "s3cr3t-secret\t"),
+])
+def test_api_credentials_are_trimmed_and_sent_clean(key, secret):
+    headers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"orders": []})
+
+    client = SeraClient(owner_address=OWNER, signer=_stub_signer, api_key=key,
+                        api_secret=secret, base_url="https://api.sera.cx/api/v1")
+    client._http.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+
+    client.get_open_orders()
+
+    assert headers == ["Bearer key123:s3cr3t-secret"]
+
+
+@pytest.mark.parametrize(("key", "secret", "name"), [
+    ("key 123", "s3cr3t-secret", "SERA_API_KEY"),
+    ("key123", "s3cr3t\nsecret", "SERA_API_SECRET"),
+    ("key123", "s3cr3t\x00secret", "SERA_API_SECRET"),
+])
+def test_api_credentials_with_inner_whitespace_are_refused_without_echoing_them(
+    key, secret, name,
+):
+    with pytest.raises(ValueError) as raised:
+        SeraClient(owner_address=OWNER, signer=_stub_signer, api_key=key,
+                   api_secret=secret, base_url="https://api.sera.cx/api/v1")
+
+    message = str(raised.value)
+    assert name in message
+    assert "s3cr3t" not in message and "key 123" not in message
+
+
 def test_bootstrap_populates_market_cache():
     captured: list[dict] = []
     client = _make_client(_build_mock_routes(), captured)
