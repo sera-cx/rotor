@@ -24,16 +24,11 @@ ROTOR_STATE_PATH = ".rotor_state.sqlite"
 # Price source: "wise", "ecb", "fed", "bnm", or "mas".
 # VL pairs configure their source in TOML; this value is the fallback.
 PRICE_REFERENCE_SOURCE = "wise"
-# Wise uses the quotes API priced for the worked amount; its rate is the
-# fee-inclusive effective rate. The token is required.
+# Wise supplies the after-fee rates every pair is kept outside of. The token is
+# optional; it only raises Wise's rate limits.
 WISE_API_TOKEN = ""
 # Wise endpoint root; useful to override in tests or regional deployments.
 WISE_BASE_URL = "https://api.wise.com"
-# Optional Wise tuning: pin a payment method (else cheapest enabled is used) and a
-# fallback source amount used only when a caller does not supply one.
-# WISE_PAY_IN = "BALANCE"
-# WISE_PAY_OUT = "BANK_TRANSFER"
-# WISE_DEFAULT_AMOUNT = "1000"
 # ECB publishes an XML daily reference-rate feed at this URL.
 ECB_RATES_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
 # Fed H.10 rates use the official FRED API; set a free FRED_API_KEY from

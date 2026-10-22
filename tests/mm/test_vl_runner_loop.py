@@ -100,6 +100,26 @@ class _SequencedSource:
         )
 
 
+    # Also stands in for Wise's after-fee settlement rates: fresh, at the latest
+    # rate quoted, with these fees (none by default, so they move no order).
+    sell_fee = Decimal("0")
+    buy_fee = Decimal("0")
+    default_max_age_s = 600.0
+
+    def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        return self._settlement(base, quote, 1 - self.sell_fee)
+
+    def buy_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        return self._settlement(base, quote, 1 + self.buy_fee)
+
+    def _settlement(self, base: str, quote: str, factor: Decimal) -> PriceObservation:
+        pair = (base.upper(), quote.upper())
+        values = self.rates[pair]
+        rate = values[min(max(self.calls.get(pair, 1) - 1, 0), len(values) - 1)]
+        return PriceObservation(
+            source="wise", pair=f"{pair[0]}/{pair[1]}", rate=rate * factor, ts=time.time())
+
+
 class _StopFlag:
     def __init__(self) -> None:
         self.requested = False
@@ -521,6 +541,33 @@ def test_a_mainnet_run_refuses_the_state_file_of_a_testnet_run(monkeypatch, tmp_
             "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
     finally:
         store.close()
+
+
+def test_run_keeps_normal_and_return_orders_outside_wises_settlement_rates(
+    monkeypatch, tmp_path,
+):
+    # Buying SGD through Wise costs 80 bps, wider than the 50 bps quote. The
+    # normal ask and, after tick 1's XSGD bid fills, the return ask both sit at
+    # Wise's cost of buying that size back; bids keep their 50 bps.
+    client = _FakeClient(fill_first_xsgd_bid=True)
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    source.buy_fee = Decimal("0.0080")
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[12 * HOUR, 1.0])
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, log_level="CRITICAL",
+           state_path=tmp_path / "state.sqlite")
+
+    assert _xsgd_asks(client)[:2] == [
+        (Decimal("10"), Decimal("1.0080")),
+        # The auction alone would ask 1.0025 for the 5 XSGD bought at 0.9950.
+        (Decimal("5"), Decimal("1.0080")),
+    ]
+    xsgd_bids = [
+        leg["price"] for batch in client.batch_places for leg in batch["legs"]
+        if leg["market"] == "XSGD/USDC" and leg["side"] == "bid"
+    ]
+    assert set(xsgd_bids) == {Decimal("0.9950")}
 
 
 def test_fire_once_runs_settle_the_previous_runs_fills(monkeypatch, tmp_path):

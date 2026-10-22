@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from decimal import Decimal
 
 import httpx
@@ -25,6 +26,7 @@ from rotor.mm.vl_runner import (
     _validate_budget_caps,
     group_intents,
 )
+from rotor.price_reference.models import PriceObservation
 
 LOG = logging.getLogger("test")
 HOUR = 3600.0
@@ -110,6 +112,41 @@ def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
         iso_base="SGD",
         iso_quote="USD",
     )
+
+
+class _Wise:
+    """Wise's after-fee rates around a live mid, recording the sizes priced."""
+
+    default_max_age_s = 600.0
+
+    def __init__(self, *, live="1.0000", sell_fee="0.0024", buy_fee="0.0037", age=0.0,
+                 fail=False):
+        self.live = Decimal(live)
+        self.sell_fee = Decimal(sell_fee)
+        self.buy_fee = Decimal(buy_fee)
+        self.age = age
+        self.fail = fail
+        self.priced: list[tuple[str, Decimal]] = []
+
+    def sell_rate(self, base, quote, qty_base):
+        return self._obs("sell", qty_base, self.live * (1 - self.sell_fee))
+
+    def buy_rate(self, base, quote, qty_base):
+        return self._obs("buy", qty_base, self.live * (1 + self.buy_fee))
+
+    def _obs(self, direction, qty, rate):
+        self.priced.append((direction, qty))
+        if self.fail:
+            raise RuntimeError("429 Too Many Requests")
+        return PriceObservation(source="wise", pair="SGD/USD", rate=rate, ts=NOW - self.age)
+
+
+NOW = 1_800_000_000.0
+
+
+def _settled(intents, wise, info=None):
+    runtime = replace(_runtime(info), settlement=wise)
+    return vr._outside_settlement(intents, runtime, now=NOW, log=LOG)
 
 
 def _vl_config(*, return_bps: str = "2", budget: str = "1000") -> VLConfig:
@@ -199,6 +236,61 @@ def test_position_below_the_market_minimum_keeps_the_normal_order():
     out = _with_return(position, intents, now=0.0, info=_market(min_bid_quote="1"))
 
     assert out == intents
+
+
+# ---------------------------------------------------------------------------
+# Orders kept outside Wise's settlement rates
+# ---------------------------------------------------------------------------
+
+def _quote(fixed_bps="25", mid="1.0000", qty="100"):
+    m, f = Decimal(mid), Decimal(fixed_bps) / 10000
+    return [
+        _intent("XSGD/USDC", "bid", "USDC", price=str(m * (1 - f)), qty=qty, mid=mid),
+        _intent("XSGD/USDC", "ask", "XSGD", price=str(m * (1 + f)), qty=qty, mid=mid),
+    ]
+
+
+def test_each_side_takes_whichever_is_wider_of_fixed_bps_and_wises_after_fee_rate():
+    # Wise: selling SGD costs 24 bps, buying it 37 bps.
+    bid, ask = _settled(_quote("25"), _Wise())
+    assert (bid.price, ask.price) == (Decimal("0.9975"), Decimal("1.0037"))
+
+    bid, ask = _settled(_quote("50"), _Wise())
+    assert (bid.price, ask.price) == (Decimal("0.9950"), Decimal("1.0050"))
+
+
+def test_wise_is_priced_for_each_orders_own_size():
+    wise = _Wise()
+    bid, ask = _quote()
+    _settled([replace(bid, qty_base=Decimal("40")), ask], wise)
+
+    assert wise.priced == [("sell", Decimal("40")), ("buy", Decimal("100"))]
+
+
+def test_a_stale_daily_mid_cannot_quote_through_the_live_market():
+    # The central bank published 1.0000; the live market has since risen 1%.
+    bid, ask = _settled(_quote("50"), _Wise(live="1.0100"))
+    # The bid stays where the daily mid put it (just less competitive); the ask
+    # follows Wise up instead of selling below the live market.
+    assert (bid.price, ask.price) == (Decimal("0.9950"), Decimal("1.0138"))
+
+    # The market has fallen 1%: the bid follows Wise down.
+    bid, ask = _settled(_quote("50"), _Wise(live="0.9900"))
+    assert (bid.price, ask.price) == (Decimal("0.9876"), Decimal("1.0050"))
+
+
+def test_without_a_fresh_wise_rate_the_pair_does_not_quote():
+    with pytest.raises(vr.ReferenceUnavailable, match="Wise settlement rate failed"):
+        _settled(_quote(), _Wise(fail=True))
+    with pytest.raises(vr.ReferenceUnavailable, match="Wise settlement rate is 601s old"):
+        _settled(_quote(), _Wise(age=601.0))
+
+
+def test_a_bid_wise_pushes_below_the_market_minimum_is_dropped():
+    # 100 XSGD at 0.9975 is 99.75 USDC; at Wise's 0.9900 it is 99.00.
+    sides = _settled(_quote("25"), _Wise(sell_fee="0.0100"), info=_market(min_bid_quote="99.5"))
+
+    assert [intent.side for intent in sides] == ["ask"]
 
 
 # ---------------------------------------------------------------------------

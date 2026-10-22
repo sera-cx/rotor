@@ -42,9 +42,14 @@ Pricing:
 - All price, size, budget, and rate math uses `Decimal`.
 - Tokens are priced at their currency's reference rate (Sera's 1:1 stablecoin
   assumption); rotor reads no token market price, so a depeg is not detected.
-- The source rate is quote-per-base. `wise` prices the pair's size via the Wise
-  quotes API and returns the fee-inclusive effective rate for that amount; the
-  other sources (`ecb`/`fed`/`bnm`/`mas`) are pure mid/reference rates.
+- The source rate is quote-per-base and is the pair's mid. `ecb`/`fed`/`bnm`/`mas`
+  are published reference rates; `wise` is the midpoint of Wise's after-fee
+  sell and buy rates for the pair's `qty_base`.
+- Every order, normal or return, is kept outside Wise's after-fee rates for its
+  own final size (`_outside_settlement`): bid <= Wise sell rate, ask >= Wise
+  buy cost, cheapest enabled method with no Wise balance on either end, rounded
+  away from mid. A failed or >10-minute-old Wise rate skips the pair; a bid
+  pushed below the market minimum is dropped.
 - Bids round down and asks round up.
 - Amounts round down.
 - Quotes fail closed when market minimums are not met.

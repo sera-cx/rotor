@@ -28,14 +28,10 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
     source_name = str(name or get_config("PRICE_REFERENCE_SOURCE", "wise")).lower()
     if source_name == "wise":
         # Base URL is configurable so tests/deployments can point at mocks or
-        # alternate Wise environments. Optional payment-method pins and a default
-        # amount tune the amount-aware quotes pricing.
+        # alternate Wise environments.
         return WiseRateSource(
             base_url=str(get_config("WISE_BASE_URL", "https://api.wise.com")),
             token_env="WISE_API_TOKEN",
-            pay_in=get_config("WISE_PAY_IN", None),
-            pay_out=get_config("WISE_PAY_OUT", None),
-            default_amount=get_config("WISE_DEFAULT_AMOUNT", None),
             max_age_s=_max_age_override("WISE"),
         )
     if source_name == "ecb":

@@ -64,6 +64,7 @@ from rotor.price_reference import (
     ReferencePrice,
     ReferencePriceOracle,
     ReferenceTooStale,
+    ReferenceUnavailable,
     load_price_reference_source,
     load_token_to_iso,
     market_to_iso_pair,
@@ -120,6 +121,8 @@ class PairRuntime:
     # ISO currency symbols used by the reference oracle.
     iso_base: str
     iso_quote: str
+    # Wise, for the after-fee rates no order may quote inside (every pair).
+    settlement: object = None
 
 
 @dataclass(frozen=True)
@@ -1582,6 +1585,9 @@ def _build_runtimes(
         if pair.price_source not in source_cache:
             source_cache[pair.price_source] = load_price_reference_source(pair.price_source)
         source = source_cache[pair.price_source]
+        # Every pair, whatever its mid source, is kept outside Wise's after-fee rates.
+        if "wise" not in source_cache:
+            source_cache["wise"] = load_price_reference_source("wise")
         # Build one algo per pair because pair sizes/spreads may differ.
         algo = build_algo(
             qty_base=pair.qty_base,
@@ -1597,6 +1603,7 @@ def _build_runtimes(
                     source, max_age_s=max_reference_age_s, carry_stale=carry_stale),
                 iso_base=iso_base,
                 iso_quote=iso_quote,
+                settlement=source_cache["wise"],
             )
         )
     if not runtimes:
@@ -1732,8 +1739,7 @@ def _intents_for_runtime(
     funds: dict[str, Decimal] | None,
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
-    # Fetch a fresh reference for this pair, priced for the worked base size so
-    # amount-aware sources (Wise) reflect the fee for this amount.
+    # Fetch a fresh mid for this pair (Wise, as a mid source, prices the size).
     ref = runtime.oracle.get(
         runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
     )
@@ -1760,6 +1766,7 @@ def _intents_for_runtime(
         intents = _with_return_order(
             intents, runtime, position, config, now=now, log=log)
     intents = _within_limits(intents, runtime.info, budgets, funds, log)
+    intents = _outside_settlement(intents, runtime, now=now, log=log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
     return intents
@@ -1883,6 +1890,71 @@ def _within_limits(
             intent.spent_token, source,
         )
         out.append(replace(intent, qty_base=qty))
+    return out
+
+
+def _outside_settlement(
+    intents: list[OrderIntent],
+    runtime: PairRuntime,
+    *,
+    now: float,
+    log: logging.Logger,
+) -> list[OrderIntent]:
+    """Keep each order outside what settling its own size through Wise costs.
+
+    A bid is never above Wise's after-fee rate for converting its size of base
+    into quote, and an ask never below Wise's after-fee cost of buying its size
+    of base. These rates follow Wise's live mid, so a daily mid that the market
+    has moved away from cannot put a quote through the live market. Whichever
+    of this and the order's own price is further from mid wins; sizes are final
+    (after budget and balance trimming, or a return order's position), because
+    Wise's fees fall with size. A bid pushed below the market's minimum
+    notional is dropped. A Wise failure, or a rate older than Wise's freshness
+    window, skips the pair.
+    """
+    wise = runtime.settlement
+    info = runtime.info
+    out: list[OrderIntent] = []
+    for intent in intents:
+        fetch = wise.sell_rate if intent.side == "bid" else wise.buy_rate
+        try:
+            obs = fetch(runtime.iso_base, runtime.iso_quote, intent.qty_base)
+        except Exception as exc:
+            raise ReferenceUnavailable(
+                f"{runtime.iso_base}/{runtime.iso_quote}: Wise settlement rate failed "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        age = now - obs.ts
+        if age > wise.default_max_age_s:
+            raise ReferenceUnavailable(
+                f"{runtime.iso_base}/{runtime.iso_quote}: Wise settlement rate is "
+                f"{age:.0f}s old"
+            )
+        if intent.side == "bid":
+            price = min(intent.price, _quantize_price(info, obs.rate, "bid"))
+        else:
+            price = max(intent.price, _quantize_price(info, obs.rate, "ask"))
+        if price == intent.price:
+            out.append(intent)
+            continue
+        try:
+            _validate_minimums(
+                info,
+                intent.qty_base,
+                price if intent.side == "bid" else None,
+                price if intent.side == "ask" else None,
+            )
+        except ValueError as exc:
+            log.warning(
+                "%s %s dropped: at Wise's settlement rate it is too small (%s)",
+                intent.market, intent.side, exc,
+            )
+            continue
+        log.debug(
+            "%s %s moved from %s to Wise's settlement rate %s for %s",
+            intent.market, intent.side, fmt(intent.price), fmt(price), fmt(intent.qty_base),
+        )
+        out.append(replace(intent, price=price))
     return out
 
 

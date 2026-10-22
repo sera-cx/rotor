@@ -69,6 +69,15 @@ class _StaticRateSource:
             ts=time.time(),
         )
 
+    # Testnet tokens have no real Wise market: settle at the static rate, no fee.
+    default_max_age_s = 600.0
+
+    def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        return self.quote(base, quote)
+
+    def buy_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        return self.quote(base, quote)
+
 
 class _RecordingClient:
     """Thin recorder around a real Sera client used by the runner."""

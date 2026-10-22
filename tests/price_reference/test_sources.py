@@ -34,118 +34,124 @@ def test_every_earn_majors_token_has_a_built_in_currency():
         assert market_to_iso_pair(f"USDT/{token}") == ("USD", iso)
 
 
-def _wise_quote_response(options):
+def _wise_reply(options, *, rate=0.78):
     return {
-        "rate": 0.78,
+        "rate": rate,
         "rateTimestamp": "2026-05-31T00:00:00Z",
-        "sourceCurrency": "SGD",
-        "targetCurrency": "USD",
         "paymentOptions": options,
     }
 
 
-def test_wise_source_prices_amount_and_picks_cheapest_enabled(monkeypatch):
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["method"] = request.method
-        seen["path"] = request.url.path
-        seen["auth"] = request.headers.get("authorization")
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=_wise_quote_response([
-            # cheapest enabled (most target) — should be selected
-            {"payIn": "BALANCE", "payOut": "BANK_TRANSFER",
-             "sourceAmount": 2000, "targetAmount": 1547.60,
-             "fee": {"total": 6.07}, "disabled": False},
-            {"payIn": "CARD", "payOut": "BANK_TRANSFER",
-             "sourceAmount": 2000, "targetAmount": 1476.74,
-             "fee": {"total": 97.37}, "disabled": False},
-            # better rate but disabled — must be skipped
-            {"payIn": "PROMO", "payOut": "X",
-             "sourceAmount": 2000, "targetAmount": 1600.0,
-             "fee": {"total": 0.0}, "disabled": True},
-        ]))
-
-    monkeypatch.setenv("WISE_API_TOKEN", "token-123")
-    src = WiseRateSource(
+def _wise(handler) -> WiseRateSource:
+    return WiseRateSource(
         base_url="https://api.wise.test",
         http=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    obs = src.quote("SGD", "USD", amount=Decimal("2000"))
-
-    # Effective (fee-inclusive) rate from the cheapest enabled option.
-    assert obs.rate == Decimal("1547.60") / Decimal("2000")
-    assert obs.pair == "SGD/USD"
-    assert obs.raw["pay_in"] == "BALANCE"
-    assert seen["method"] == "POST"
-    assert seen["path"].endswith("/v3/quotes")
-    assert seen["auth"] == "Bearer token-123"
-    assert seen["body"] == {
-        "sourceCurrency": "SGD",
-        "targetCurrency": "USD",
-        "sourceAmount": 2000.0,
-    }
 
 
-def test_wise_source_honors_pinned_payment_method(monkeypatch):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=_wise_quote_response([
-            {"payIn": "BALANCE", "payOut": "BANK_TRANSFER",
-             "sourceAmount": 1000, "targetAmount": 775.0, "disabled": False},
-            {"payIn": "CARD", "payOut": "BANK_TRANSFER",
-             "sourceAmount": 1000, "targetAmount": 740.0, "disabled": False},
-        ]))
-
-    monkeypatch.setenv("WISE_API_TOKEN", "t")
-    src = WiseRateSource(
-        pay_in="card",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-    obs = src.quote("SGD", "USD", amount=Decimal("1000"))
-
-    # The pinned (more expensive) CARD option is used despite a cheaper one.
-    assert obs.rate == Decimal("740.0") / Decimal("1000")
+def _option(pay_in, source, target, *, pay_out="BANK_TRANSFER", disabled=False):
+    return {"payIn": pay_in, "payOut": pay_out, "sourceAmount": source,
+            "targetAmount": target, "disabled": disabled}
 
 
-def test_wise_source_uses_default_amount_when_none_given(monkeypatch):
-    seen = {}
+def test_wise_sell_rate_is_what_converting_the_amount_pays_by_the_cheapest_transfer(
+    monkeypatch,
+):
+    seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=_wise_quote_response([
-            {"payIn": "BALANCE", "payOut": "BANK_TRANSFER",
-             "sourceAmount": 500, "targetAmount": 388.0, "disabled": False},
-        ]))
-
-    monkeypatch.setenv("WISE_API_TOKEN", "t")
-    src = WiseRateSource(
-        default_amount="500",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-    src.quote("SGD", "USD")
-
-    assert seen["body"]["sourceAmount"] == 500.0
-
-
-def test_wise_source_quotes_without_a_token(monkeypatch):
-    # Wise prices anonymous quote requests; the token is optional.
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["auth"] = request.headers.get("authorization")
-        return httpx.Response(200, json=_wise_quote_response([
-            {"payIn": "BANK_TRANSFER", "payOut": "BANK_TRANSFER",
-             "sourceAmount": 1000, "targetAmount": 740.0, "disabled": False},
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json=_wise_reply([
+            _option("DEBIT", 2000, 1540.00),
+            _option("BANK_TRANSFER", 2000, 1554.00),  # cheapest usable
+            # Better, but conversions inside a Wise balance are not settlement,
+            # and a disabled method cannot be used.
+            _option("BALANCE", 2000, 1558.00),
+            _option("SWIFT", 2000, 1559.00, pay_out="BALANCE"),
+            _option("PROMO", 2000, 1600.00, disabled=True),
         ]))
 
     monkeypatch.delenv("WISE_API_TOKEN", raising=False)
     monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
-    src = WiseRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    obs = _wise(handler).sell_rate("SGD", "USD", Decimal("2000"))
 
-    obs = src.quote("SGD", "USD", amount=Decimal("1000"))
+    assert seen == [("/v3/quotes", {
+        "sourceCurrency": "SGD", "targetCurrency": "USD", "sourceAmount": 2000.0})]
+    assert obs.rate == Decimal("0.777")
+    assert obs.raw["pay_in"] == "BANK_TRANSFER"
 
-    assert seen["auth"] is None
-    assert obs.rate == Decimal("0.74")
+
+def test_wise_buy_rate_is_what_buying_the_amount_costs_by_the_cheapest_transfer():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=_wise_reply([
+            _option("BANK_TRANSFER", 1566.00, 2000),  # cheapest usable
+            _option("DEBIT", 1580.00, 2000),
+            _option("BALANCE", 1562.00, 2000),
+        ], rate=1.282))
+
+    obs = _wise(handler).buy_rate("SGD", "USD", Decimal("2000"))
+
+    # Buy 2000 SGD by paying USD: the target side is fixed.
+    assert seen == [{"sourceCurrency": "USD", "targetCurrency": "SGD", "targetAmount": 2000.0}]
+    assert obs.rate == Decimal("0.783")
+
+
+def test_wise_mid_is_halfway_between_its_sell_and_buy_rates_for_the_amount():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "sourceAmount" in body:
+            return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 783, 1000)]))
+
+    obs = _wise(handler).quote("SGD", "USD", amount=Decimal("1000"))
+
+    assert obs.rate == Decimal("0.780")
+    assert obs.source == "wise"
+
+
+def test_wise_sends_a_token_only_when_one_is_set(monkeypatch):
+    auth = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth.append(request.headers.get("authorization"))
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
+
+    monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
+    monkeypatch.delenv("WISE_API_TOKEN", raising=False)
+    _wise(handler).sell_rate("SGD", "USD", Decimal("1000"))
+    monkeypatch.setenv("WISE_API_TOKEN", "token-123")
+    _wise(handler).sell_rate("SGD", "USD", Decimal("1000"))
+
+    assert auth == [None, "Bearer token-123"]
+
+
+def test_wise_reuses_a_recent_reply_and_falls_back_to_it_when_a_request_fails(monkeypatch):
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr("rotor.price_reference.sources.time.time", lambda: clock["now"])
+    calls = {"n": 0, "fail": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["fail"]:
+            return httpx.Response(429, json={"error": "slow down"})
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
+
+    wise = _wise(handler)
+    wise.sell_rate("SGD", "USD", Decimal("1000"))
+    clock["now"] += 30
+    wise.sell_rate("SGD", "USD", Decimal("1000"))
+    assert calls["n"] == 1  # one tick asks Wise once per amount
+
+    clock["now"] += 300
+    calls["fail"] = True
+    # The last reply comes back; the caller checks how old its rate is.
+    assert wise.sell_rate("SGD", "USD", Decimal("1000")).rate == Decimal("0.777")
+    assert calls["n"] == 2
+    with pytest.raises(httpx.HTTPStatusError):
+        wise.sell_rate("SGD", "USD", Decimal("2000"))  # nothing to fall back on
 
 
 def test_ecb_source_crosses_rates_through_eur():
@@ -242,42 +248,33 @@ def test_fed_h10_source_requires_api_key():
 
 
 def test_bnm_source_crosses_rates_through_myr_and_averages_when_middle_missing():
-    payloads = {
-        "USD": {
-            "data": {
-                "currency_code": "USD",
-                "unit": 1,
-                "rate": {
-                    "date": "2026-06-09",
-                    "buying_rate": "4.04",
-                    "selling_rate": "4.06",
-                    "middle_rate": None,
-                },
-            }
-        },
-        "SGD": {
-            "data": {
-                "currency_code": "SGD",
-                "unit": 1,
-                "rate": {
-                    "date": "2026-06-09",
-                    "buying_rate": "3.00",
-                    "selling_rate": "3.02",
-                    "middle_rate": "3.01",
-                },
-            }
-        },
-    }
+    paths = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        currency = request.url.path.rsplit("/", 1)[-1]
-        return httpx.Response(200, json=payloads[currency])
+        paths.append(request.url.path)
+        return httpx.Response(200, json={
+            "data": [
+                {"currency_code": "USD", "unit": 1, "rate": {
+                    "date": "2026-06-09", "buying_rate": "4.04", "selling_rate": "4.06",
+                    "middle_rate": None}},
+                {"currency_code": "SGD", "unit": 1, "rate": {
+                    "date": "2026-06-09", "buying_rate": "3.00", "selling_rate": "3.02",
+                    "middle_rate": "3.01"}},
+                # Quoted per 100 units, as BNM does for the dirham.
+                {"currency_code": "AED", "unit": 100, "rate": {
+                    "date": "2026-06-09", "middle_rate": "110.25"}},
+            ],
+            "meta": {"session": "1700"},
+        })
 
     src = BnmRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
-    obs = src.quote("SGD", "USD")
 
-    assert obs.rate == Decimal("3.01") / Decimal("4.05")
-    assert obs.pair == "SGD/USD"
+    assert src.quote("SGD", "USD").rate == Decimal("3.01") / Decimal("4.05")
+    assert src.quote("AED", "USD").rate == Decimal("1.1025") / Decimal("4.05")
+    # The latest session's list, not the per-currency endpoint (11:30 session).
+    assert paths == ["/public/exchange-rate", "/public/exchange-rate"]
+    with pytest.raises(ValueError, match="BNM publishes no XYZ rate"):
+        src.quote("XYZ", "USD")
 
 
 def test_mas_source_crosses_rates_through_sgd():

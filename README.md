@@ -64,9 +64,17 @@ fixed_bps = "40"
 Supported FX sources are `wise`, `ecb`, `fed`, `bnm`, and `mas`. `wise`, `ecb`,
 `bnm`, and `mas` work without a key (`WISE_API_TOKEN` is optional and only
 raises Wise's rate limits); `fed` (the official FRED API) needs a free
-`FRED_API_KEY`. `wise` prices the pair's size through the
-Wise quotes API, so its benchmark is the fee-inclusive effective rate for that
-amount; the other sources are pure mid rates.
+`FRED_API_KEY`. A pair's source sets its mid: the central-bank sources publish
+daily reference rates, and `wise` (for currencies none of them covers) uses the
+midpoint of Wise's after-fee sell and buy rates for the pair's size.
+
+Every pair, whatever its source, is also kept outside Wise's after-fee rates
+for each order's own size: a bid is never above what converting that much of the
+base token through Wise pays, and an ask never below what buying it through Wise
+costs, by the cheapest enabled transfer method that does not involve a Wise
+balance. Each side takes whichever is further from mid: `fixed_bps` or Wise.
+Wise's rates are live, so a daily mid the market has moved away from cannot put
+a quote through the market.
 
 ## Run
 

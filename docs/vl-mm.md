@@ -25,6 +25,9 @@ time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
 - After the window it **holds at the fill price indefinitely**. Rotor never
   returns a position at a loss against its fill price. Breakeven is measured on
   price alone; any fees or gas a deployment charges are not included.
+- Like every order, it is never inside Wise's after-fee rate for its size (see
+  Config), so in a market that moved against the position it can sit further out
+  than the auction alone would put it.
 - It never quotes closer to the latest mid than `return_bps`. If the market moved
   in rotor's favour, the order sits `return_bps` from mid instead of overpaying.
 - It never spends more than the normal order it replaces, so a larger position is
@@ -131,12 +134,21 @@ Rules:
   FRED API) needs a free `FRED_API_KEY`; the others work without a key.
   `WISE_API_TOKEN` is optional: Wise prices anonymous quotes too, and a token
   only raises its rate limits.
-- `wise` is amount-aware: it prices a Wise quote for the pair's `qty_base` and
-  uses the **fee-inclusive effective rate** for the cheapest enabled payment
-  method, so its benchmark already reflects Wise's conversion cost at that size.
-  The other sources are pure mid/reference rates. Pin a Wise method with
-  `WISE_PAY_IN`/`WISE_PAY_OUT` if you do not want cheapest-enabled.
-- `fixed_bps` can be global or overridden per pair.
+- A pair's source sets its mid. `ecb`, `fed`, `bnm`, and `mas` publish daily
+  reference rates; `wise` (for currencies none of them covers) uses the
+  midpoint of Wise's after-fee sell and buy rates for the pair's `qty_base`.
+- Every pair is also kept outside Wise's after-fee rates for each order's own
+  size, after budget and balance trimming (a return order: its position's
+  size). A bid is never above what converting that much of the base token
+  through Wise pays, and an ask never below what buying it costs, by the
+  cheapest enabled transfer method that does not involve a Wise balance. Wise's
+  fees fall with size: about 25-80 bps on majors at a few thousand dollars.
+  Wise's rates are live, so a daily mid the market has moved away from cannot
+  put a quote through the market. A Wise rate older than 10 minutes, or no
+  answer at all (a reply up to that old is reused), skips the pair.
+- `fixed_bps` (global or per pair) is the least distance a quote sits from mid:
+  each side takes whichever is further, `fixed_bps` or Wise. Lower it to quote
+  tighter wherever Wise allows; Wise's rate is the floor.
 - `return_bps` must be positive. It is the closest a return order quotes to mid.
 - `return_window_hours` must be positive (default 48).
 

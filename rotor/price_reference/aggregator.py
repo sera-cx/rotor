@@ -57,7 +57,7 @@ class ReferencePriceOracle:
         """Return the quote-per-base rate for an ISO pair.
 
         `amount` is the base-currency size being worked; it is forwarded to the
-        source so amount-aware providers (Wise) can price the exact size.
+        source so Wise can price its after-fee rates for that size.
         """
         # Normalize the pair label for consistent operator-facing errors.
         pair = f"{base.upper()}/{quote.upper()}"

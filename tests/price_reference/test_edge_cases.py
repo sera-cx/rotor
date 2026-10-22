@@ -60,7 +60,10 @@ def test_wise_source_rejects_response_without_enabled_options(monkeypatch):
     def handler(_request: httpx.Request) -> httpx.Response:
         # All options disabled (no funding method available to the account).
         return httpx.Response(200, json={"rate": 0.78, "paymentOptions": [
-            {"payIn": "BALANCE", "targetAmount": 770.0, "disabled": True},
+            {"payIn": "BANK_TRANSFER", "sourceAmount": 1000, "targetAmount": 770.0,
+             "disabled": True},
+            {"payIn": "BALANCE", "sourceAmount": 1000, "targetAmount": 775.0,
+             "disabled": False},
         ]})
 
     monkeypatch.setenv("WISE_API_TOKEN", "t")
@@ -69,14 +72,14 @@ def test_wise_source_rejects_response_without_enabled_options(monkeypatch):
         http=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
-    with pytest.raises(ValueError, match="no enabled payment options"):
+    with pytest.raises(ValueError, match="no enabled transfer method"):
         src.quote("SGD", "USD")
 
 
 def test_wise_source_rejects_non_positive_target(monkeypatch):
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"rate": 0.78, "paymentOptions": [
-            {"payIn": "BALANCE", "sourceAmount": 1000, "targetAmount": "0",
+            {"payIn": "BANK_TRANSFER", "sourceAmount": 1000, "targetAmount": "0",
              "disabled": False},
         ]})
 

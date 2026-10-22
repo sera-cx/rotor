@@ -53,20 +53,27 @@ class RateSource(Protocol):
         """Return quote-per-base rate for an ISO pair.
 
         `amount` is the base-currency size being worked. Most sources are pure
-        reference feeds and ignore it; the Wise adapter uses it to price the
-        amount-specific (fee-inclusive) effective rate via the quotes API.
+        reference feeds and ignore it; the Wise adapter prices its after-fee
+        rates for that amount.
         """
 
 
 class WiseRateSource:
-    """Wise quotes adapter — amount-aware effective FX rate.
+    """Wise quotes API (`POST /v3/quotes`): what converting through Wise costs.
 
-    Uses the Wise quotes API (`POST /v3/quotes`) with the worked size as
-    `sourceAmount`, so the benchmark reflects Wise's fee for the actual amount,
-    not just the mid-market rate. The effective quote-per-base rate is
-    `targetAmount / sourceAmount` for the cheapest enabled payment option (or a
-    pinned `payIn`/`payOut`). `WISE_API_TOKEN` is optional: Wise prices quotes
-    for anonymous callers too, with tighter rate limits.
+    Rotor uses Wise for after-fee rates: what someone actually gets converting a
+    given amount through Wise, by the cheapest enabled transfer method that does
+    not involve a Wise balance (a bank transfer or local debit, say). Fees fall
+    with size, so each rate is priced for an exact amount.
+
+    - `sell_rate`: quote currency received per base unit when converting an
+      amount of base into quote.
+    - `buy_rate`: quote currency paid per base unit to buy an amount of base.
+    - `quote`: as a mid source, for currencies no central-bank source covers,
+      halfway between the two for the worked amount.
+
+    Wise prices anonymous quote requests; `WISE_API_TOKEN` only raises its rate
+    limits.
     """
 
     # Source name carried into observations and logs.
@@ -76,17 +83,17 @@ class WiseRateSource:
     # A stale Wise quote means the feed is broken, not closed: never carry it,
     # whatever carry limit is configured for the daily sources.
     DEFAULT_MAX_CARRY_AGE_S = None
-    # Fallback source amount when a caller does not pass one (e.g. ad-hoc checks).
+    # Amount priced when a caller does not pass one (e.g. ad-hoc checks).
     DEFAULT_AMOUNT = Decimal("1000")
+    # A reply fetched this recently is reused, so one tick asks Wise once per
+    # currency pair, direction, and amount.
+    REUSE_S = 60.0
 
     def __init__(
         self,
         *,
         base_url: str = "https://api.wise.com",
         token_env: str = "WISE_API_TOKEN",
-        pay_in: str | None = None,
-        pay_out: str | None = None,
-        default_amount: object | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
         http: httpx.Client | None = None,
@@ -97,15 +104,6 @@ class WiseRateSource:
         # Store the config key name instead of the token value so secrets are
         # read only when a quote is requested.
         self.token_env = token_env
-        # Optional payment-method pins; default selects the cheapest enabled one.
-        self.pay_in = (str(pay_in).strip().upper() or None) if pay_in else None
-        self.pay_out = (str(pay_out).strip().upper() or None) if pay_out else None
-        # Fallback amount used only when a caller omits one.
-        self.default_amount = (
-            self.DEFAULT_AMOUNT
-            if default_amount in (None, "")
-            else _positive_decimal(default_amount)
-        )
         # Per-source freshness window; defaults to the class intraday window.
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
@@ -113,56 +111,97 @@ class WiseRateSource:
         self.default_max_carry_age_s = self.DEFAULT_MAX_CARRY_AGE_S
         # Allow tests to inject a fake client; otherwise create a bounded client.
         self._http = http or httpx.Client(timeout=timeout)
+        # (source, target, amount field, amount) -> (fetched at, reply)
+        self._replies: dict[tuple[str, str, str, str], tuple[float, dict]] = {}
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
     ) -> PriceObservation:
-        """Create a Wise quote for `amount` and return the effective rate."""
-        # Wise answers anonymous quote requests too; a token only raises limits.
-        token = str(get_config(self.token_env, "") or "").strip()
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        # Use the worked size; fall back to the configured default if absent.
-        source_amount = _positive_decimal(
-            amount if amount is not None else self.default_amount
-        )
-        # Create an (un-profiled) quote priced for this exact source amount.
-        response = self._http.post(
-            f"{self.base_url}/v3/quotes",
-            headers=headers,
-            json={
-                "sourceCurrency": base.upper(),
-                "targetCurrency": quote.upper(),
-                "sourceAmount": float(source_amount),
-            },
-        )
-        # Let httpx expose non-2xx responses as provider failures.
-        response.raise_for_status()
-        body = response.json()
-        # Pick the cheapest enabled payment option (or a pinned one) and derive
-        # the fee-inclusive quote-per-base rate from its amounts.
-        option = _select_wise_option(body.get("paymentOptions"), self.pay_in, self.pay_out)
-        option_source = _positive_decimal(option.get("sourceAmount", source_amount))
-        option_target = _positive_decimal(option.get("targetAmount"))
-        effective_rate = option_target / option_source
+        """Mid for `amount` of base: halfway between Wise's sell and buy rates."""
+        qty = _positive_decimal(amount if amount is not None else self.DEFAULT_AMOUNT)
+        sell = self.sell_rate(base, quote, qty)
+        buy = self.buy_rate(base, quote, qty)
         return PriceObservation(
             source=self.name,
             pair=_pair(base, quote),
-            rate=effective_rate,
+            rate=(sell.rate + buy.rate) / 2,
+            ts=min(sell.ts, buy.ts),
+            raw={"sell_rate": str(sell.rate), "buy_rate": str(buy.rate), "amount": str(qty)},
+        )
+
+    def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        """Quote received per base unit converting `qty_base` of base into quote."""
+        body = self._reply(base, quote, "sourceAmount", qty_base)
+        option = _cheapest_wise_option(body)
+        rate = _positive_decimal(option.get("targetAmount")) / _positive_decimal(
+            option.get("sourceAmount"))
+        return self._observation(base, quote, rate, body, option)
+
+    def buy_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        """Quote paid per base unit to buy exactly `qty_base` of base."""
+        body = self._reply(quote, base, "targetAmount", qty_base)
+        option = _cheapest_wise_option(body)
+        rate = _positive_decimal(option.get("sourceAmount")) / _positive_decimal(
+            option.get("targetAmount"))
+        return self._observation(base, quote, rate, body, option)
+
+    def _observation(
+        self, base: str, quote: str, rate: Decimal, body: dict, option: dict
+    ) -> PriceObservation:
+        return PriceObservation(
+            source=self.name,
+            pair=_pair(base, quote),
+            rate=rate,
             # Freshness is anchored to when Wise set the rate.
             ts=_parse_ts(body.get("rateTimestamp") or body.get("createdTime")),
             raw={
                 "mid_rate": str(body.get("rate", "")),
-                "effective_rate": str(effective_rate),
-                "source_amount": str(option_source),
-                "target_amount": str(option_target),
                 "pay_in": option.get("payIn"),
                 "pay_out": option.get("payOut"),
-                "fee_total": str((option.get("fee") or {}).get("total", "")),
-                "rate_timestamp": body.get("rateTimestamp"),
             },
         )
+
+    def _reply(self, source: str, target: str, amount_field: str, amount: Decimal) -> dict:
+        """Wise's quote for converting `source` into `target`, one side fixed.
+
+        A reply fetched within REUSE_S is reused. If a request fails, the last
+        reply for the same amount is returned instead; callers reject it once
+        its rate is older than the freshness window.
+        """
+        amount = _positive_decimal(amount)
+        key = (source.upper(), target.upper(), amount_field, str(amount))
+        now = time.time()
+        cached = self._replies.get(key)
+        if cached is not None and now - cached[0] < self.REUSE_S:
+            return cached[1]
+        headers = {"Content-Type": "application/json"}
+        # Wise answers anonymous quote requests too; a token only raises limits.
+        token = str(get_config(self.token_env, "") or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            response = self._http.post(
+                f"{self.base_url}/v3/quotes",
+                headers=headers,
+                json={
+                    "sourceCurrency": source.upper(),
+                    "targetCurrency": target.upper(),
+                    amount_field: float(amount),
+                },
+            )
+            # Let httpx expose non-2xx responses as provider failures.
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            if cached is not None:
+                return cached[1]
+            raise
+        # Forget replies too old to quote on, so the cache stays small.
+        self._replies = {
+            k: v for k, v in self._replies.items() if now - v[0] <= self.default_max_age_s
+        }
+        self._replies[key] = (now, body)
+        return body
 
 
 class EcbRateSource:
@@ -388,8 +427,12 @@ class BnmRateSource:
         """Fetch BNM rates and cross through MYR."""
         base = base.upper()
         quote = quote.upper()
-        base_myr, base_raw = self._myr_per_currency(base)
-        quote_myr, quote_raw = self._myr_per_currency(quote)
+        # One read of BNM's latest session gives both currencies. The
+        # per-currency endpoint defaults to the 11:30 interbank session, which
+        # covers only a few currencies (no AED, CNY, or IDR, for one).
+        rows = self._latest_session()
+        base_myr, base_raw = _myr_per_currency(rows, base)
+        quote_myr, quote_raw = _myr_per_currency(rows, quote)
         return PriceObservation(
             source=self.name,
             pair=_pair(base, quote),
@@ -399,17 +442,27 @@ class BnmRateSource:
             raw={"base": base_raw, "quote": quote_raw},
         )
 
-    def _myr_per_currency(self, currency: str) -> tuple[Decimal, dict]:
-        if currency == "MYR":
-            return Decimal("1"), {"currency_code": "MYR", "unit": 1, "rate": "1"}
+    def _latest_session(self) -> dict[str, dict]:
         response = self._http.get(
-            f"{self.base_url}/{currency}",
+            self.base_url,
             headers={"Accept": "application/vnd.BNM.API.v1+json"},
         )
         response.raise_for_status()
-        row = response.json()["data"]
-        rate = _parse_bnm_rate(row)
-        return rate, row
+        return {
+            str(row.get("currency_code", "")).upper(): row
+            for row in response.json().get("data", [])
+            if isinstance(row, dict)
+        }
+
+
+def _myr_per_currency(rows: dict[str, dict], currency: str) -> tuple[Decimal, dict]:
+    """MYR per one unit of `currency` from a BNM session's rows."""
+    if currency == "MYR":
+        return Decimal("1"), {"currency_code": "MYR", "unit": 1, "rate": "1"}
+    row = rows.get(currency)
+    if row is None:
+        raise ValueError(f"BNM publishes no {currency} rate")
+    return _parse_bnm_rate(row), row
 
 
 class MasRateSource:
@@ -493,39 +546,31 @@ def _pair(base: str, quote: str) -> str:
     return f"{base.upper()}/{quote.upper()}"
 
 
-def _select_wise_option(options: Any, pay_in: str | None, pay_out: str | None) -> dict:
-    """Choose the Wise payment option to price the effective rate from.
+def _cheapest_wise_option(body: Any) -> dict:
+    """The enabled payment option giving the most target per unit of source.
 
-    Disabled options (funding methods unavailable to the account) are skipped.
-    A pinned `payIn`/`payOut` wins; otherwise the cheapest enabled option (the
-    one returning the most target currency) is used.
+    Options that pay in from or out to a Wise balance are left out: they are
+    conversions inside Wise, not what settling a trade through Wise costs.
     """
+    options = body.get("paymentOptions") if isinstance(body, dict) else None
     if not isinstance(options, list) or not options:
         raise ValueError("Wise quote returned no payment options")
-    enabled = [
+    usable = [
         opt for opt in options
-        if isinstance(opt, dict) and not opt.get("disabled")
+        if isinstance(opt, dict)
+        and not opt.get("disabled")
+        and "BALANCE" not in (str(opt.get("payIn", "")).upper(), str(opt.get("payOut", "")).upper())
     ]
-    if not enabled:
-        raise ValueError("Wise quote returned no enabled payment options")
-    if pay_in or pay_out:
-        for opt in enabled:
-            if (not pay_in or str(opt.get("payIn", "")).upper() == pay_in) and (
-                not pay_out or str(opt.get("payOut", "")).upper() == pay_out
-            ):
-                return opt
-        raise ValueError(
-            f"Wise quote has no enabled option for payIn={pay_in} payOut={pay_out}"
-        )
-    # Cheapest enabled option = the one delivering the most target currency.
-    return max(enabled, key=lambda opt: _option_target(opt))
+    if not usable:
+        raise ValueError("Wise quote returned no enabled transfer method")
+    return max(usable, key=_option_rate)
 
 
-def _option_target(option: dict) -> Decimal:
-    """Return a payment option's target amount, or zero if unparseable."""
+def _option_rate(option: dict) -> Decimal:
+    """Target received per unit of source for one option, or zero if unparseable."""
     try:
-        return Decimal(str(option.get("targetAmount")))
-    except (InvalidOperation, ValueError, TypeError):
+        return Decimal(str(option.get("targetAmount"))) / Decimal(str(option.get("sourceAmount")))
+    except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
         return Decimal("0")
 
 

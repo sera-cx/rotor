@@ -17,13 +17,15 @@ Files:
 
 Available sources:
 
-- `wise`: Wise quotes API (`POST /v3/quotes`), priced for the worked amount.
-  Works without a key; `WISE_API_TOKEN` is optional and only raises Wise's
-  rate limits. Unlike the reference feeds below, its rate is the
-  **fee-inclusive effective rate** (`targetAmount / sourceAmount`) for the
-  cheapest enabled payment method, so it moves with the trade size. Pin a method
-  with `WISE_PAY_IN`/`WISE_PAY_OUT`; set a fallback size with
-  `WISE_DEFAULT_AMOUNT` (used only when a caller omits the amount).
+- `wise`: Wise quotes API (`POST /v3/quotes`). Works without a key;
+  `WISE_API_TOKEN` is optional and only raises Wise's rate limits. Its
+  after-fee rates for an exact amount, by the cheapest enabled transfer method
+  that does not involve a Wise balance, are `sell_rate` (quote received per
+  base converting base into quote) and `buy_rate` (quote paid per base buying
+  base). The runner keeps every pair's orders outside them. As a mid source
+  (`quote`), it returns the midpoint of the two. A reply is reused for 60
+  seconds, and on a failed request the last reply comes back for the caller's
+  freshness check.
 - `ecb`: ECB daily euro reference rates, crossed through EUR. Keyless. Pure mid.
 - `fed`: Federal Reserve H.10 rates via the official FRED API
   (`api.stlouisfed.org/fred/series/observations`), crossed through USD. Needs a
@@ -79,7 +81,6 @@ Environment config:
 ```bash
 export PRICE_REFERENCE_SOURCE="wise"   # wise, ecb, fed, bnm, or mas
 export WISE_API_TOKEN="..."            # optional: higher Wise rate limits
-export WISE_PAY_IN="BALANCE"           # optional: pin Wise payment method
 export FRED_API_KEY="..."              # required for the fed source
 export FED_H10_SERIES_JSON='{"EUR":"DEXUSEU","MYR":"DEXMAUS","SGD":"DEXSIUS"}'
 export MAS_EXCHANGE_RATE_RESOURCE_IDS_JSON='{"USD":"d_046ff8d521a218d9178178cfbfc45c2c"}'
