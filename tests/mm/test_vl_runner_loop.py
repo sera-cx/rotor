@@ -1107,6 +1107,25 @@ def test_run_keeps_quoting_through_failed_metadata_refreshes_and_alerts_once(mon
     assert len(notifier.containing("metadata refreshed again")) == 1
 
 
+def test_debug_logging_never_logs_telegram_request_urls(caplog, tmp_path):
+    # httpx logs each request URL at INFO, and a Telegram URL carries the bot
+    # token. Rotor's own DEBUG lines stay on; the libraries' are capped.
+    names = ("httpx", "httpcore", "telegram")
+    levels = {name: logging.getLogger(name).level for name in names}
+    try:
+        vr.run(config_path=tmp_path / "missing.toml", dry_run=True, once=True,
+               log_level="DEBUG")
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
+        with caplog.at_level(logging.DEBUG), httpx.Client(transport=transport) as http:
+            http.post("https://api.telegram.org/bot123:SECRET/sendMessage")
+            logging.getLogger("rotor.mm.vl").debug("rotor debug line")
+        assert "123:SECRET" not in caplog.text
+        assert "rotor debug line" in caplog.text
+    finally:
+        for name, level in levels.items():
+            logging.getLogger(name).setLevel(level)
+
+
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):
     client = _FakeClient()
     source = _SequencedSource(

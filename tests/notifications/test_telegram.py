@@ -140,6 +140,33 @@ def test_heartbeat_rate_limited(notifier):
     assert send.call_args.kwargs["channel"] == "debug"
 
 
+def test_token_is_trimmed():
+    n = TelegramNotifier(token=" 123:ABC \n", normal_chat_id="c")
+    n._dry_run = False
+    fake_bot = MagicMock()
+    fake_bot.__aenter__ = AsyncMock(return_value=fake_bot)
+    fake_bot.__aexit__ = AsyncMock(return_value=False)
+    fake_bot.send_message = AsyncMock()
+    fake_telegram = MagicMock()
+    fake_telegram.Bot.return_value = fake_bot
+    with patch.dict("sys.modules", {"telegram": fake_telegram}):
+        assert n._send("hello", channel="normal") is True
+    fake_telegram.Bot.assert_called_once_with("123:ABC")
+
+
+def test_send_failure_never_logs_the_token(caplog):
+    # python-telegram-bot's InvalidToken message quotes the token.
+    n = TelegramNotifier(token="123:SECRET", normal_chat_id="c")
+    n._dry_run = False
+    rejected = RuntimeError("The token `123:SECRET` was rejected by the server.")
+    with patch.object(n, "_async_send", new=MagicMock()), \
+            patch("asyncio.run", side_effect=rejected), \
+            caplog.at_level(logging.WARNING):
+        assert n._send("x", channel="normal") is False
+    assert "123:SECRET" not in caplog.text
+    assert "The token `<TELEGRAM_TOKEN>` was rejected" in caplog.text
+
+
 def test_async_send_invokes_bot():
     n = TelegramNotifier(token="tok", normal_chat_id="c")
     n._dry_run = False

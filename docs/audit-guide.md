@@ -208,6 +208,10 @@ Telegram:
 - Telegram logs stay compact; failures are one-line warnings.
 - Notification payloads should not include secrets, signatures, or raw order
   payloads.
+- The bot token is in every Telegram request URL: the token is trimmed, a send
+  failure's message has it replaced with `<TELEGRAM_TOKEN>`, and the `httpx`,
+  `httpcore`, and `telegram` loggers are capped at WARNING whatever
+  `--log-level` is, so request URLs are never logged.
 
 Logging:
 

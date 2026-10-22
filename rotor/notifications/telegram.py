@@ -77,8 +77,8 @@ class TelegramNotifier:
         """
         # Explicit constructor args override config, which helps tests and
         # one-off scripts avoid environment mutations.
-        self._token = token if token is not None else get_config(
-            "TELEGRAM_TOKEN", "")
+        self._token = (token if token is not None else get_config(
+            "TELEGRAM_TOKEN", "")).strip()
         self._normal_chat_id = (
             normal_chat_id if normal_chat_id is not None
             else get_config("TELEGRAM_NORMAL_CHAT_ID", "")
@@ -235,7 +235,13 @@ class TelegramNotifier:
             return True
         except Exception as e:
             # Telegram failures must NOT take down the MM loop.
-            self._log.warning("TelegramNotifier: send failed (%s): %s", channel, e)
+            # Telegram's errors can quote the token ("The token `...` was
+            # rejected by the server"); never let it reach the log.
+            self._log.warning(
+                "TelegramNotifier: send failed (%s): %s",
+                channel,
+                str(e).replace(self._token, "<TELEGRAM_TOKEN>"),
+            )
             return False
 
     async def _async_send(self, text: str, chat_id: str) -> None:

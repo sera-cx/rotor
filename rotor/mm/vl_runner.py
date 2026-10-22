@@ -802,6 +802,11 @@ def run(
         level=getattr(logging, log_level.upper(), logging.WARNING),
         format="%(levelname).1s %(message)s",
     )
+    # HTTP and Telegram libraries log request URLs at INFO/DEBUG, and every
+    # Telegram URL carries the bot token. Rotor's own --log-level lines are
+    # unaffected.
+    for name in ("httpx", "httpcore", "telegram"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     log = logging.getLogger("rotor.mm.vl")
     # Created first so a failed startup can alert and its waits can be stopped.
     notifier = TelegramNotifier(log=log) if telegram else None
