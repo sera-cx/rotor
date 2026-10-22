@@ -105,6 +105,8 @@ Positions and return orders:
   it; bids round down and asks round up, so grid rounding cannot cross it.
 - A return order is never closer to mid than `return_bps`, never spends more than
   the normal order it replaces, and replaces only the normal order on its side.
+- A position under `RETURN_MIN_SHARE` (10%) of the normal order on its return
+  side, or below the market minimum, keeps that normal order.
 - All price math, including the auction's time fraction, is `Decimal`.
 
 Live order lifecycle:

@@ -78,6 +78,10 @@ from rotor.updater import (
 BOOT_CANCEL_RETRY_SECONDS = 300.0
 # Sera refuses to cancel an order younger than this (HTTP 429 cancel cooldown).
 SERA_CANCEL_COOLDOWN_SECONDS = 300.0
+# A position smaller than this share of the normal order on its return side
+# keeps that full normal quote rather than shrinking the side to a dust-sized
+# return order (which can rest for days at its fill price).
+RETURN_MIN_SHARE = Decimal("0.1")
 DEFAULT_STATE_PATH = ".rotor_state.sqlite"
 # While pairs quote on carried-forward reference rates, repeat the warning at
 # most this often, so a weekend produces a handful of messages, not one per tick.
@@ -2124,12 +2128,20 @@ def _with_return_order(
 
     The return order never spends more than the normal order it replaces, so
     budgets and the per-tick budget guard see no new spend; a larger position is
-    returned over several fills. A position too small to meet the market minimum
-    keeps the normal order instead, and the next fill on that side absorbs it.
+    returned over several fills. A position too small to meet the market minimum,
+    or smaller than RETURN_MIN_SHARE of the normal order, keeps the normal order
+    instead, and the next fill on that side absorbs it.
     """
     side = position.return_side
     normal = next((intent for intent in intents if intent.side == side), None)
     if normal is None:
+        return intents
+    if abs(position.net_base) < RETURN_MIN_SHARE * normal.qty_base:
+        log.debug(
+            "%s position %s is under %s of the normal %s %s; quoting normally",
+            runtime.config.market, fmt(position.net_base), RETURN_MIN_SHARE,
+            side, fmt(normal.qty_base),
+        )
         return intents
     info = runtime.info
     target = return_price(

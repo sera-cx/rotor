@@ -35,7 +35,9 @@ time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
   in rotor's favour, the order sits `return_bps` from mid instead of overpaying.
 - It never spends more than the normal order it replaces, so a larger position is
   returned over several fills and budgets see no new spend. A position below the
-  market's minimum order keeps the normal order on that side; the next fill there
+  market's minimum order, or under a tenth of the normal order on that side
+  (`RETURN_MIN_SHARE`), keeps the full normal order there instead of shrinking
+  the side to a dust-sized return order; the next fill there
   absorbs it.
 - The other side keeps quoting normally. Fills there grow the position, and its
   fill price and clock become size-weighted averages.

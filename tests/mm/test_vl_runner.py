@@ -229,6 +229,19 @@ def test_return_order_never_spends_more_than_the_normal_order():
     assert bid.qty_base * bid.price <= intents[0].qty_base * intents[0].price
 
 
+def test_a_dust_position_keeps_the_full_normal_order_on_its_side():
+    # 9.99 XSGD short against a 100 XSGD bid: under a tenth of it, so the bid
+    # stays a full normal quote; 10 XSGD is enough to take the side.
+    intents = _normal_quote()
+
+    assert _with_return(Position(Decimal("-9.99"), Decimal("1.0050"), 0.0), intents,
+                        now=12 * HOUR) == intents
+
+    bid, _ask = _with_return(Position(Decimal("-10"), Decimal("1.0050"), 0.0), intents,
+                             now=12 * HOUR)
+    assert (bid.qty_base, bid.is_return) == (Decimal("10"), True)
+
+
 def test_position_below_the_market_minimum_keeps_the_normal_order():
     position = Position(Decimal("-0.5"), Decimal("1.0050"), 0.0)
     intents = _normal_quote()
