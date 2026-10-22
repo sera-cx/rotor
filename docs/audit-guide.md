@@ -56,7 +56,8 @@ Pricing:
 - Amounts round down.
 - Quotes fail closed when market minimums are not met.
 - Observation timestamps are the provider's published date, not fetch time, so a
-  stale daily feed is detectable. Staleness windows are per-source (intraday for
+  stale daily feed is detectable; a reply without a usable date is a failed
+  read (never stamped "now"). Staleness windows are per-source (intraday for
   `wise`, daily for `ecb`/`fed`/`bnm`), overridable via config/CLI.
 - A stale daily reference is carried forward until its carry limit (default 7
   days from the published date), because official sources do not publish on

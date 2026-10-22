@@ -243,3 +243,29 @@ def test_invalid_carry_override_is_rejected(monkeypatch):
 
     with pytest.raises(ValueError, match="BNM_MAX_CARRY_AGE_S must be a number of seconds"):
         load_price_reference_source("bnm")
+
+
+def test_a_wise_reply_without_a_timestamp_is_a_failed_read_not_a_fresh_rate():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"rate": 0.78, "paymentOptions": [
+            {"payIn": "BANK_TRANSFER", "payOut": "BANK_TRANSFER", "sourceAmount": 1000,
+             "targetAmount": 777, "disabled": False},
+        ]})
+
+    src = WiseRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(ValueError, match="no timestamp"):
+        src.sell_rate("SGD", "USD", Decimal("1000"))
+
+
+def test_a_bnm_reply_without_dates_is_a_failed_read_not_a_fresh_rate():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [
+            {"currency_code": "USD", "unit": 1, "rate": {"middle_rate": "4.05"}},
+            {"currency_code": "SGD", "unit": 1, "rate": {"middle_rate": "3.01"}},
+        ]})
+
+    src = BnmRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(ValueError, match="no usable publication date"):
+        src.quote("SGD", "USD")

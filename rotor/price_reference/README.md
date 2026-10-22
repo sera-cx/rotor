@@ -48,7 +48,8 @@ keyless.
 
 Each observation is stamped with the provider's **published** timestamp (Wise's
 quote time; the ECB `Cube time`; the FRED/BNM row date), not fetch time, so a
-stale (e.g. weekend or holiday) feed is detectable. `ReferencePriceOracle`
+stale (e.g. weekend or holiday) feed is detectable. A reply without a usable
+date is a failed read, never stamped with the current time. `ReferencePriceOracle`
 treats an observation older than the source's window as stale:
 
 - `wise`: 10 minutes (intraday).

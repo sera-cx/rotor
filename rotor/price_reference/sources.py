@@ -509,14 +509,16 @@ def _option_rate(option: dict) -> Decimal:
 
 
 def _published_ts(*dates: Any) -> float:
-    """Return the oldest parseable publication timestamp, or now if none.
+    """Return the oldest parseable publication timestamp.
 
     Daily references cross two currency observations; the crossed rate is only
-    as fresh as its oldest input. A missing/unparseable date falls back to the
-    current time so a source that omits a date is not falsely flagged stale.
+    as fresh as its oldest input. A reply with no usable date at all is a
+    failed read: stamping it "now" would make a rate of unknown age look fresh.
     """
     stamps = [ts for ts in (_date_ts(date) for date in dates) if ts is not None]
-    return min(stamps) if stamps else time.time()
+    if not stamps:
+        raise ValueError(f"no usable publication date in {dates!r}")
+    return min(stamps)
 
 
 def _date_ts(value: Any) -> float | None:
@@ -566,18 +568,20 @@ def _positive_decimal(value: Any) -> Decimal:
 
 
 def _parse_ts(value: Any) -> float:
-    """Parse common provider timestamp shapes into POSIX seconds."""
-    # Missing timestamp falls back to now, which is useful for simple providers
-    # that only return a current rate.
+    """Parse common provider timestamp shapes into POSIX seconds.
+
+    A missing timestamp is a failed read, never "now": a rate of unknown age
+    must not look fresh.
+    """
     if value is None:
-        return time.time()
+        raise ValueError("reply has no timestamp")
     # Numeric timestamps are already seconds.
     if isinstance(value, int | float):
         return float(value)
     # String timestamps may be numeric, ISO 8601, or Wise's strict format.
     text = str(value).strip()
     if not text:
-        return time.time()
+        raise ValueError("reply has an empty timestamp")
     # Python's fromisoformat expects an explicit +00:00 instead of trailing Z.
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
