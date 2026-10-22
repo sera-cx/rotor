@@ -384,8 +384,12 @@ ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
 poetry run python -m pytest -q tests/testnet/test_vl_runner_scenarios.py
 ```
 
-Those scenarios run the actual tick loop with a deterministic test mid, fill a
-maker quote from a taker wallet between ticks, and verify that the fill settles
-into a position and is quoted back as a return order sized to the fill. They
-default to a `305` second wait between ticks so live cancellation cooldowns can
-clear, and run four ticks so the filled order expires and settles.
+Those scenarios run the actual tick loop with a deterministic test mid and a
+stand-in Wise fee (`ROTOR_TESTNET_WISE_FEE_BPS`, default 20), fill a maker quote
+from a taker wallet between ticks, and verify that the fill settles into a
+position and that every later order on the return side is the return order:
+sized to the position, at the return auction's price for when it was placed
+(within one price step), never through the fill price. They default to a `305`
+second wait between ticks so live cancellation cooldowns can clear, and run
+three ticks so the filled order expires and settles. With `--cancel-on-exit`
+the run then waits out Sera's cancel cooldown before exiting.

@@ -82,8 +82,11 @@ The live scenario harness runs the actual VL runner with a deterministic
 test-only mid source, lets the maker place its normal two-sided quote set, then
 uses the taker wallet between ticks to fill one maker side. It verifies both
 `bid -> return ask` and `ask -> return bid` behavior, including fill polling,
-cancel-first requote, `return_bps` pricing, and VL grouping when the configured
-markets share the spent token.
+cancel-first requote, the return order's auction price and size (normal quotes
+sit at a stand-in Wise fee, `ROTOR_TESTNET_WISE_FEE_BPS`, default 20), and VL
+grouping when the configured markets share the spent token. Expect about 15
+minutes per direction: three ticks 305 s apart, then a wait for Sera's cancel
+cooldown on exit.
 
 `ROTOR_TESTNET_SCENARIO_BETWEEN_TICKS_SECONDS` defaults to `305` so Sera's
 cancel cooldown has time to clear before the second tick. Setting it lower is

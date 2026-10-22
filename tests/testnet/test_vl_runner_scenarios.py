@@ -25,6 +25,8 @@ from rotor.mm.exchange.client import (
     SignedVLBatch,
     VLBatchResult,
 )
+from rotor.mm.positions import return_price
+from rotor.mm.quote_engine import StopFlag
 from rotor.price_reference.models import PriceObservation
 
 
@@ -51,14 +53,18 @@ class _PlacedOrder:
     uuid_int: int
     path: str
     batch_id: str | None = None
+    # When rotor sent it, so a return order's auction price can be recomputed.
+    placed_at: float = 0.0
+    # Runner tick (1-based) that placed it.
+    tick: int = 1
 
 
 class _StaticRateSource:
     name = "testnet-static"
 
-    def __init__(self, rate: Decimal, *, fee_bps: Decimal = Decimal("50")) -> None:
+    def __init__(self, rate: Decimal, *, wise_fee_bps: Decimal) -> None:
         self.rate = rate
-        self.fee = fee_bps / Decimal("10000")
+        self.fee = wise_fee_bps / Decimal("10000")
 
     def quote(self, base: str, quote: str, *, amount=None) -> PriceObservation:
         base = base.upper()
@@ -71,8 +77,11 @@ class _StaticRateSource:
         )
 
     # Testnet tokens have no real Wise market: stand in for Wise's after-fee
-    # rates (where normal quotes sit) at the static rate +/- the scenario spread.
+    # rates (where normal quotes sit) at the static rate +/- a test Wise fee.
     default_max_age_s = 600.0
+
+    def mid_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        return self.quote(base, quote)
 
     def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
         return self._at(base, quote, 1 - self.fee)
@@ -93,6 +102,8 @@ class _RecordingClient:
         self.placed_orders: list[_PlacedOrder] = []
         self.vl_batches: list[VLBatchResult] = []
         self.cancel_events: list[tuple[str, str, bool]] = []
+        # Current runner tick, advanced by the scenario's sleep hook.
+        self.tick = 1
         # Signed but not yet sent: the legs/terms to record once Sera accepts.
         self._legs: dict[str, list] = {}
         self._terms: dict[str, tuple] = {}
@@ -120,6 +131,8 @@ class _RecordingClient:
                     uuid_int=record.uuid_int,
                     path="vl",
                     batch_id=result.vl_batch_id,
+                    placed_at=time.time(),
+                    tick=self.tick,
                 )
             )
         return result
@@ -148,6 +161,8 @@ class _RecordingClient:
                 order_id=record.order_id,
                 uuid_int=record.uuid_int,
                 path="standalone",
+                placed_at=time.time(),
+                tick=self.tick,
             )
         )
         return record
@@ -163,9 +178,8 @@ class _RecordingClient:
         return ok
 
 
-class _StopFlag:
-    def __init__(self) -> None:
-        self.requested = False
+class _StopFlag(StopFlag):
+    """The runner's real stop flag (its waits really wait), minus signal handlers."""
 
     def install(self) -> None:
         return None
@@ -374,22 +388,23 @@ def _install_runner_hooks(
     *,
     maker: _RecordingClient,
     mid: Decimal,
-    fixed_bps: Decimal,
+    wise_fee_bps: Decimal,
     stop: _StopFlag,
     fill_after_first_tick,
     wait_between_ticks: float,
 ) -> None:
-    source = _StaticRateSource(mid, fee_bps=fixed_bps)
+    source = _StaticRateSource(mid, wise_fee_bps=wise_fee_bps)
     calls = 0
-    # Tick 1 quotes and is filled; the filled order expires and its fill settles
-    # into a position by tick 2 or 3, which then quotes the return order.
+    # Tick 1 quotes and is filled. Tick 2 quotes the fill back as a return order
+    # (from its visible fill, or its settled position once it expired); tick 3
+    # quotes it again from the settled position.
     ticks = 3
 
     def build_client(*, dry_run: bool, log):
         assert not dry_run
         return maker
 
-    def sleep_remaining(_started: float, _poll_seconds: float) -> None:
+    def sleep_remaining(_started: float, _poll_seconds: float, _stop=None) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -397,8 +412,9 @@ def _install_runner_hooks(
         if calls < ticks:
             if wait_between_ticks > 0:
                 time.sleep(wait_between_ticks)
+            maker.tick = calls + 1
             return
-        stop.requested = True
+        stop.request()
 
     monkeypatch.setattr(vr, "build_client", build_client)
     monkeypatch.setattr(vr, "load_price_reference_source", lambda _name: source)
@@ -419,6 +435,10 @@ def test_testnet_vl_runner_fill_then_return_requote(
     mid = _decimal("ROTOR_TESTNET_MID", _value("ROTOR_TESTNET_PRICE"), purpose)
     qty_base = _decimal("ROTOR_TESTNET_QTY_BASE", None, purpose)
     fixed_bps = _decimal("ROTOR_TESTNET_FIXED_BPS", "50", purpose)
+    # Normal quotes sit at this stand-in Wise fee; kept apart from fixed_bps so
+    # a return order (which starts 2 x fixed_bps from the fill) cannot be
+    # mistaken for a normal quote.
+    wise_fee_bps = _decimal("ROTOR_TESTNET_WISE_FEE_BPS", "20", purpose)
     return_bps = _decimal("ROTOR_TESTNET_RETURN_BPS", "1", purpose)
     budget_amount = _decimal("ROTOR_TESTNET_BUDGET_AMOUNT", "1000000", purpose)
     ttl_seconds = _int("ROTOR_TESTNET_ORDER_TTL", "90", purpose)
@@ -502,7 +522,7 @@ def test_testnet_vl_runner_fill_then_return_requote(
         monkeypatch,
         maker=maker,
         mid=mid,
-        fixed_bps=fixed_bps,
+        wise_fee_bps=wise_fee_bps,
         stop=stop,
         fill_after_first_tick=fill_after_first_tick,
         wait_between_ticks=wait_between_ticks,
@@ -542,23 +562,36 @@ def test_testnet_vl_runner_fill_then_return_requote(
     assert position.net_base == (qty_base if maker_side == "bid" else -qty_base)
     assert position.price == maker_order.price
 
-    # A later tick quoted it back without crossing the fill price.
+    # Later ticks quoted it back at the return auction's price for when each
+    # was placed (within one price step: rotor priced it moments earlier),
+    # sized to the position and never through the fill price.
     return_side = _opposite_side(maker_side)
-    return_orders = [
-        order for order in maker.placed_orders
-        if (
-            order.market == target_market
-            and order.side == return_side
-            and order.order_id != maker_order.order_id
-            and (
-                order.price <= maker_order.price if return_side == "bid"
-                else order.price >= maker_order.price
-            )
+    step = target_info.price_step or Decimal("1").scaleb(-target_info.tick_precision)
+    def auction_price(order: _PlacedOrder) -> Decimal:
+        target = return_price(
+            position, mid, fixed_bps=fixed_bps, return_bps=return_bps,
+            now=order.placed_at, window_seconds=48 * 3600.0,
         )
+        return vr._quantize_price(target_info, target, return_side)
+
+    later = [
+        order for order in maker.placed_orders
+        if order.market == target_market and order.side == return_side and order.tick > 1
     ]
+    normal_price = vr._quantize_price(
+        target_info,
+        mid * (1 + wise_fee_bps / 10000 if return_side == "ask" else 1 - wise_fee_bps / 10000),
+        return_side,
+    )
 
     assert result == 0
-    assert return_orders
+    assert later, f"no {return_side} on {target_market} after the fill"
+    for order in later:
+        assert abs(order.price - auction_price(order)) <= step, (order, auction_price(order))
+        assert order.price != normal_price, "a normal quote, not the return order"
+        assert order.qty_base == abs(position.net_base)
+        assert (order.price <= maker_order.price if return_side == "bid"
+                else order.price >= maker_order.price)
     assert maker.cancel_events
     if maker_side == "bid":
         assert _first_order(maker, market=target_market, side="bid").path == "vl"
