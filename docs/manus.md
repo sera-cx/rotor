@@ -55,6 +55,9 @@ Startup failures share an hourly budget across fires: at most 3 fires per clock
 hour try to start, and after the third failure the rest of that hour's fires
 exit 1 at once without contacting Sera. With `--telegram`, the hour's first and
 third failed startup alert, and so does the first start that succeeds after them.
+A fire that places nothing alerts once no fire has placed for 15 minutes (at
+most once per 15 minutes), and the next fire that places reports that quoting
+resumed.
 
 Keep `.rotor_state.sqlite` on persistent storage. Open orders are recovered from
 Sera on each fire, but the file is the only record of positions held for return

@@ -554,6 +554,66 @@ def test_fire_once_runs_settle_the_previous_runs_fills(monkeypatch, tmp_path):
     ]
 
 
+def test_fire_once_runs_share_the_stall_alert_and_report_when_quoting_resumes(
+    monkeypatch, tmp_path,
+):
+    # The vault is empty, so every fire places nothing. Fires run 305 s apart;
+    # the one 915 s after the stall began alerts, the next does not repeat it,
+    # and the first fire that places again says quoting resumed.
+    client = _FakeClient()
+    client.balances = {}
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    clock = {"now": T0}
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    def fire() -> int:
+        result = vr.run(config_path="vl.toml", once=True, min_requote_seconds=0.0,
+                        telegram=True, log_level="CRITICAL",
+                        state_path=tmp_path / "state.sqlite")
+        clock["now"] += 305.0
+        return result
+
+    stalled = [fire() for _ in range(5)]
+    alerts = len(notifier.containing("VL quoting stalled"))
+    client.balances = None
+    resumed = [fire(), fire()]
+
+    assert stalled == [1, 1, 1, 1, 1]
+    assert alerts == 1
+    assert resumed == [0, 0]
+    assert len(notifier.containing("VL quoting stalled")) == 1
+    assert len(notifier.containing("quoting resumed after 25m")) == 1
+
+
+def test_run_alerts_on_a_stall_and_reports_when_quoting_resumes(monkeypatch):
+    # Ticks every 305 s on an empty vault; the vault is funded before tick 6.
+    client = _FakeClient()
+    client.balances = {}
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    clock = _fake_clock(monkeypatch, steps=[305.0] * 6)
+    real_sleep = vr.sleep_remaining
+
+    def fund_before_tick_6(started, poll, stop=None):
+        real_sleep(started, poll, stop)
+        if clock["now"] == T0 + 5 * 305.0:
+            client.balances = None
+
+    monkeypatch.setattr(vr, "sleep_remaining", fund_before_tick_6)
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True,
+           state_path=":memory:")
+
+    assert len(notifier.containing("VL quoting stalled")) == 1
+    assert len(notifier.containing("quoting resumed after 25m")) == 1
+
+
 def test_run_holds_the_return_side_from_the_tick_after_a_fill(monkeypatch, tmp_path):
     # At the normal cadence the filled order is still resting (and unexpired) on
     # the next tick; its fill already decides that tick's ask.

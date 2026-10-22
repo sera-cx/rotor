@@ -121,6 +121,10 @@ Live order lifecycle:
   live run records them (`identity` table) and any run with others refuses to
   start, so positions never move between networks or wallets. Dry-run never
   opens the state file.
+- The stall watchdog (`StallWatchdog`) alerts when no fresh quote set has gone
+  out for max(3 polls, 15 minutes). Its clock is in the state file, so `--once`
+  fires share it; a fire checks only after placing nothing, so a successful
+  fire never alerts on the gap before it.
 - `--cancel-on-exit` is opt-in and cancels only tracked placements; an
   auto-update restart cancels tracked placements before re-exec regardless.
 

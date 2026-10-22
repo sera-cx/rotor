@@ -249,6 +249,13 @@ class StateStore:
                 opened_at REAL NOT NULL
             )
         """)
+        # The stall watchdog's clock, so --once fires share it (see StallWatchdog).
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS watchdog (
+                key TEXT PRIMARY KEY,
+                value REAL NOT NULL
+            )
+        """)
         # The wallet and Sera deployment this file belongs to (see claim()).
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS identity (
@@ -519,6 +526,19 @@ class StateStore:
                 rows,
             )
 
+    def save_watchdog(self, values: dict[str, float]) -> None:
+        """Store the stall watchdog's timestamps."""
+        with self._db:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO watchdog (key, value) VALUES (?, ?)", values.items())
+
+    def load_watchdog(self) -> dict[str, float]:
+        """Load the stall watchdog's timestamps."""
+        return {
+            key: float(value)
+            for key, value in self._db.execute("SELECT key, value FROM watchdog")
+        }
+
     def load_reference_alerts(self) -> dict[str, StaleAlertState]:
         """Load open stale-reference alert episodes."""
         return {
@@ -532,6 +552,75 @@ class StateStore:
                 "FROM reference_alerts ORDER BY market"
             )
         }
+
+
+class StallWatchdog:
+    """Alert when no fresh quote set has gone out for `window` seconds.
+
+    Every skipped tick (unreadable prices or fills, a stuck cancel, a budget
+    rejection) leaves quoting stalled while the heartbeat still says "alive".
+    A continuous run checks at each tick and starts the clock at boot. A
+    `--once` fire checks only after placing nothing, and its clock is kept in
+    the state file, so fires share it as one long run would. Placing again
+    after an alert sends one "resumed" message.
+    """
+
+    def __init__(
+        self,
+        window: float,
+        *,
+        state: StateStore | None,
+        notifier: TelegramNotifier | None,
+        log: logging.Logger,
+        carry_over: bool,
+    ) -> None:
+        now = time.time()
+        stored = state.load_watchdog() if state is not None else {}
+        self.window = window
+        self.last_quote_ok = stored.get("last_quote_ok", now) if carry_over else now
+        self.last_alert = stored.get("last_alert", 0.0)
+        self.quoted_this_run = False
+        self._state = state
+        self._notifier = notifier
+        self._log = log
+        self._save()
+
+    def quoted(self) -> None:
+        """A fresh quote set went out."""
+        now = time.time()
+        if self.last_alert >= self.last_quote_ok:
+            self._log.warning(
+                "quoting resumed after %s without a placement",
+                _fmt_duration(now - self.last_quote_ok))
+            if self._notifier is not None:
+                self._notifier.send_raw(
+                    "✅ VL quoting resumed after "
+                    f"{_fmt_duration(now - self.last_quote_ok)} without a placement.",
+                    important=True,
+                )
+        self.last_quote_ok = now
+        self.quoted_this_run = True
+        self._save()
+
+    def check(self) -> None:
+        """Alert, at most once per window, if quoting has stalled for a window."""
+        now = time.time()
+        stalled_for = now - self.last_quote_ok
+        if stalled_for < self.window or now - self.last_alert < self.window:
+            return
+        self._log.error("VL quoting stalled: no successful placement for %.0fs", stalled_for)
+        if self._notifier is not None:
+            self._notifier.notify_error(
+                "VL quoting stalled",
+                RuntimeError(f"no successful placement for {stalled_for:.0f}s"),
+            )
+        self.last_alert = now
+        self._save()
+
+    def _save(self) -> None:
+        if self._state is not None:
+            self._state.save_watchdog(
+                {"last_quote_ok": self.last_quote_ok, "last_alert": self.last_alert})
 
 
 class StaleReferenceAlerts:
@@ -846,31 +935,23 @@ def run(
     next_refresh = last_refresh + METADATA_REFRESH_SECONDS
     # True while metadata refreshes fail; alerted when it starts and ends.
     refresh_failing = False
-    # Stall watchdog: alert the operator (once per window) when the loop has not
-    # placed a fresh quote set for a while because every tick is skipping
-    # (stale prices, fill-poll failures, a stuck cancel). The hourly heartbeat
-    # otherwise keeps reporting "alive" while nothing is being quoted.
-    stall_alert_seconds = max(poll_seconds * 3, 900.0)
-    last_quote_ok = time.time()
-    last_stall_alert = 0.0
+    # Stall watchdog: alert (once per window) when no fresh quote set has gone
+    # out for a while. Dry-run never places, so it is not watched.
+    watchdog = StallWatchdog(
+        max(poll_seconds * 3, 900.0),
+        state=state,
+        notifier=notifier,
+        log=log,
+        carry_over=once,
+    )
     try:
         while not stop.requested:
             # Record tick start so the loop can maintain poll cadence.
             tick_started = time.time()
             if notifier is not None:
                 notifier.heartbeat()
-                # Warn (throttled) when quoting has stalled for too long.
-                if (
-                    not dry_run
-                    and tick_started - last_quote_ok >= stall_alert_seconds
-                    and tick_started - last_stall_alert >= stall_alert_seconds
-                ):
-                    stalled_for = tick_started - last_quote_ok
-                    notifier.notify_error(
-                        "VL quoting stalled",
-                        RuntimeError(f"no successful placement for {stalled_for:.0f}s"),
-                    )
-                    last_stall_alert = tick_started
+            if not dry_run and not once:
+                watchdog.check()
             if updater is not None:
                 update_result = updater.run_if_due(log)
                 if update_result is not None and update_result.updated:
@@ -1104,7 +1185,7 @@ def run(
                 state.replace_active(live)
             if placed:
                 # A fresh quote set went out: reset the stall watchdog.
-                last_quote_ok = time.time()
+                watchdog.quoted()
                 if notifier is not None:
                     notifier.notify_quote(
                         "VL",
@@ -1120,6 +1201,9 @@ def run(
                 return 0 if placed else 1
             sleep_remaining(tick_started, poll_seconds, stop)
     finally:
+        # A --once fire that placed nothing checks for a stall shared across fires.
+        if once and not dry_run and not watchdog.quoted_this_run:
+            watchdog.check()
         # Shutdown cleanup cancels tracked placements in live mode. An
         # auto-update restart always cancels first (even without --cancel-on-exit)
         # so the next process does not boot into stale-priced resting quotes that

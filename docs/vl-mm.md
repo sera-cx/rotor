@@ -227,8 +227,12 @@ signing, Rotor builds every order itself and signs only that, never a struct a
 server returns, and it refuses to start if `GET /config` names a contract other
 than Sera's for mainnet or Sepolia, or if `GET /markets` gives a mainnet token
 an address or decimals other than the ones rotor pins. With
-`--telegram`, a throttled alert fires if quoting stalls (no successful placement)
-for several cadences, so a silent stall is not masked by the hourly heartbeat.
+`--telegram`, an alert fires if quoting stalls (no successful placement for 3
+cadences, at least 15 minutes) and repeats at most once per that window, so a
+silent stall is not masked by the hourly heartbeat; the first placement after it
+reports that quoting resumed. The stall clock is kept in the state file, so
+`--once` fires share it: a fire that places nothing alerts once the stall has
+lasted that long across fires.
 
 On startup, Rotor reattaches existing open orders for the configured markets.
 It cancels those reattached placements before the first quote tick by default.
