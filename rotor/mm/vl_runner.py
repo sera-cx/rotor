@@ -249,6 +249,13 @@ class StateStore:
                 opened_at REAL NOT NULL
             )
         """)
+        # The wallet and Sera deployment this file belongs to (see claim()).
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS identity (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS reference_alerts (
                 market TEXT PRIMARY KEY,
@@ -258,6 +265,26 @@ class StateStore:
             )
         """)
         self._db.commit()
+
+    def claim(self, identity: dict[str, str]) -> None:
+        """Tie this file to one wallet on one Sera deployment, or refuse another.
+
+        The first live run writes its identity; every later run must match it,
+        so one network's or wallet's positions never drive another's orders.
+        A file from before identities were stored is tied to its next run.
+        """
+        stored = dict(self._db.execute("SELECT key, value FROM identity").fetchall())
+        if not stored:
+            with self._db:
+                self._db.executemany(
+                    "INSERT INTO identity (key, value) VALUES (?, ?)", identity.items())
+            return
+        if stored != identity:
+            raise RuntimeError(
+                f"state file {self.path} belongs to {_describe_identity(stored)}; "
+                f"this run is {_describe_identity(identity)}. Set ROTOR_STATE_PATH to "
+                "a separate state file for each wallet and network"
+            )
 
     def _ensure_active_order_columns(self) -> None:
         columns = {
@@ -751,13 +778,18 @@ def run(
         if auto_update
         else None
     )
+    state: StateStore | None = None
     try:
-        state = None if dry_run else StateStore(state_path or _state_path())
+        if not dry_run:
+            state = StateStore(state_path or _state_path())
+            state.claim(_identity(client))
     except Exception as exc:
         budget.record_failure()
         log.error("state store failed: %s", exc)
         if notifier is not None:
-            notifier.notify_error("rotor could not open its state file", exc)
+            notifier.notify_error("rotor could not use its state file", exc)
+        if state is not None:
+            state.close()
         return 1
     if budget.failures_this_hour() and notifier is not None:
         notifier.send_raw(
@@ -1253,6 +1285,22 @@ def _boot_budget_path(state_path: str | Path) -> str | None:
     if str(state_path) == ":memory:":
         return None
     return str(Path(state_path).expanduser()) + ".boot.json"
+
+
+def _identity(client: SeraClient) -> dict[str, str]:
+    """The wallet and Sera deployment a live run trades on."""
+    return {
+        "owner": client.owner_address.lower(),
+        "chain_id": str(client.eip712_domain["chainId"]),
+        "sera_contract": str(client.eip712_domain["verifyingContract"]).lower(),
+    }
+
+
+def _describe_identity(identity: dict[str, str]) -> str:
+    return (
+        f"wallet {identity.get('owner')} on chain {identity.get('chain_id')} "
+        f"(Sera {identity.get('sera_contract')})"
+    )
 
 
 def _state_path() -> str:

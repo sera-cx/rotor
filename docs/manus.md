@@ -21,7 +21,7 @@ required set for a live deployment using the `wise` price source is:
 | `SERA_API_SECRET` | Sera API secret |
 | `SERA_PRIVATE_KEY` | maker signing key (`0x…`) — most sensitive |
 | `WISE_API_TOKEN` | Wise quotes API token |
-| `ROTOR_STATE_PATH` | (recommended) unresolved-state DB path |
+| `ROTOR_STATE_PATH` | (recommended) unresolved-state DB path; one per wallet and network |
 
 Add `FRED_API_KEY` only if a pair uses `price_source = fed`, and `TELEGRAM_*`
 only with `--telegram`.

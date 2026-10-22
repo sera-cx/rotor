@@ -117,6 +117,11 @@ class _StopFlag:
 class _FakeClient:
     vl_batch_min = 2
     vl_batch_max = 50
+    owner_address = "0x" + "11" * 20
+    eip712_domain = {
+        "chainId": 11155111,
+        "verifyingContract": "0x83475A1bD98a8DC2DCd507A747e4DC85da241D6e",
+    }
 
     def __init__(
         self,
@@ -481,6 +486,39 @@ def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(monkeypatch
     try:
         assert not any(row.order_id.startswith("batch-1-") for row in store.load_unsettled())
         assert store.load_positions() == {}
+    finally:
+        store.close()
+
+
+def test_a_mainnet_run_refuses_the_state_file_of_a_testnet_run(monkeypatch, tmp_path):
+    # A testnet run buys 5 XSGD and stores the position. The operator then
+    # points the same checkout at mainnet: that run must not quote the testnet
+    # position back on mainnet, so it refuses the file before placing anything.
+    state_path = tmp_path / "state.sqlite"
+    testnet = _FakeClient(fill_first_xsgd_bid=True)
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=testnet, source=source)
+    _fake_clock(monkeypatch, steps=[HOUR, 1.0])
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, log_level="CRITICAL",
+           state_path=state_path)
+
+    mainnet = _FakeClient()
+    mainnet.eip712_domain = {
+        "chainId": 1, "verifyingContract": "0xB5C50C5D5f038404F85970b7f5B7259C4AC0E198"}
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, config=_config(), client=mainnet, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+
+    result = vr.run(config_path="vl.toml", min_requote_seconds=0.0, once=True,
+                    telegram=True, log_level="CRITICAL", state_path=state_path)
+
+    assert result == 1
+    assert mainnet.batch_places == [] and mainnet.standalone_places == []
+    assert len(notifier.containing("on chain 11155111")) == 1
+    store = vr.StateStore(state_path)
+    try:
+        assert store.load_positions() == {
+            "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
     finally:
         store.close()
 

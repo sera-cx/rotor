@@ -258,6 +258,14 @@ stale-reference alerts, and prunes rows once they resolve. Positions must surviv
 restarts: deleting the file forgets them. Set `ROTOR_STATE_PATH` to move the
 file.
 
+The file belongs to one wallet on one Sera deployment. The first live run
+records its wallet address, chain id, and Sera contract in it, and a later run
+with any other refuses to start (with a Telegram alert under `--telegram`)
+rather than quote one network's positions on another. Keep one file per wallet
+and network, for example `ROTOR_STATE_PATH=.rotor_state.testnet.sqlite` while
+testing and `.rotor_state.mainnet.sqlite` for real funds. A file written before
+rotor recorded this belongs to the next live run that opens it.
+
 Add `--telegram` to send lifecycle/error alerts through the optional Telegram
 notifier. Install the optional dependency with:
 

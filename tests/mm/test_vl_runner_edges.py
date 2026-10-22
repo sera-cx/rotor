@@ -283,6 +283,53 @@ def test_state_store_keeps_unsettled_orders_and_positions_across_restarts(tmp_pa
         store.close()
 
 
+TESTNET_WALLET = {"owner": "0x" + "11" * 20, "chain_id": "11155111", "sera_contract": "0x8347"}
+
+
+def test_state_store_belongs_to_the_first_wallet_and_network_that_uses_it(tmp_path):
+    path = tmp_path / "state.sqlite"
+    store = vr.StateStore(path)
+    try:
+        store.claim(TESTNET_WALLET)
+    finally:
+        store.close()
+
+    store = vr.StateStore(path)
+    try:
+        # The same wallet on the same network keeps using it.
+        store.claim(dict(TESTNET_WALLET))
+        # Mainnet, or another wallet, is refused.
+        for other in (
+            {**TESTNET_WALLET, "chain_id": "1", "sera_contract": "0xb5c5"},
+            {**TESTNET_WALLET, "owner": "0x" + "22" * 20},
+        ):
+            with pytest.raises(RuntimeError, match=(
+                f"belongs to wallet 0x{'11' * 20} on chain 11155111 .*"
+                "Set ROTOR_STATE_PATH to a separate state file")):
+                store.claim(other)
+    finally:
+        store.close()
+
+
+def test_a_state_file_from_before_identities_is_tied_to_its_next_run(tmp_path):
+    path = tmp_path / "state.sqlite"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE positions (market TEXT PRIMARY KEY, net_base TEXT NOT NULL, "
+               "price TEXT NOT NULL, opened_at REAL NOT NULL)")
+    db.execute("INSERT INTO positions VALUES ('XSGD/USDC', '5', '0.9950', 10.0)")
+    db.commit()
+    db.close()
+
+    store = vr.StateStore(path)
+    try:
+        store.claim(TESTNET_WALLET)
+        assert set(store.load_positions()) == {"XSGD/USDC"}
+        with pytest.raises(RuntimeError, match="belongs to"):
+            store.claim({**TESTNET_WALLET, "chain_id": "1"})
+    finally:
+        store.close()
+
+
 def test_state_store_drops_the_superseded_pending_returns_table(tmp_path):
     path = tmp_path / "state.sqlite"
     db = sqlite3.connect(path)

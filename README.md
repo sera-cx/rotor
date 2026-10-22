@@ -82,6 +82,9 @@ stores active orders, placed orders whose fills are not yet counted, open
 positions, and open stale-reference alerts, and prunes rows once they resolve.
 Positions are the part that must survive: deleting the file forgets them, and
 rotor goes back to quoting both sides normally. Set `ROTOR_STATE_PATH` to move it.
+The file belongs to the wallet and network that first used it, and rotor refuses
+to start on it with any other, so use one file per wallet and network (for
+example `.rotor_state.testnet.sqlite` and `.rotor_state.mainnet.sqlite`).
 
 Add `--telegram` to send lifecycle/error alerts through the optional Telegram
 notifier. Install the extra with `poetry install --extras telegram` when real
