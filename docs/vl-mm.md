@@ -154,7 +154,7 @@ single source with `<SOURCE>_MAX_AGE_S`, all of them with
 Daily references publish nothing on weekends or public holidays, so a stale daily
 rate is carried forward: the pair keeps quoting on the last published rate until
 that rate is 7 days old (`<SOURCE>_MAX_CARRY_AGE_S` or
-`PRICE_REFERENCE_MAX_CARRY_AGE_S` to change). With `--telegram`, Rotor warns once
+`PRICE_REFERENCE_MAX_CARRY_AGE_S` to change; neither applies to `wise`). With `--telegram`, Rotor warns once
 on the important channel when pairs start quoting on carried rates, repeats the
 warning on the normal channel every 6 hours, and reports when fresh rates return
 or when a rate passes its limit and the pair stops quoting. These alert episodes

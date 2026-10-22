@@ -8,7 +8,11 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from rotor.price_reference.aggregator import ReferencePriceOracle, ReferenceUnavailable
+from rotor.price_reference.aggregator import (
+    ReferencePriceOracle,
+    ReferenceTooStale,
+    ReferenceUnavailable,
+)
 from rotor.price_reference.config import load_price_reference_source, load_token_to_iso
 from rotor.price_reference.models import PriceObservation
 from rotor.price_reference.sources import (
@@ -219,10 +223,24 @@ def test_per_source_carry_override_from_config(monkeypatch):
     assert load_price_reference_source("bnm").default_max_carry_age_s == 259200.0
 
 
-def test_global_carry_override_applies_to_daily_sources(monkeypatch):
+def test_global_carry_override_applies_to_daily_sources_only(monkeypatch):
     monkeypatch.setenv("PRICE_REFERENCE_MAX_CARRY_AGE_S", "3600")
+    monkeypatch.setenv("WISE_MAX_CARRY_AGE_S", "3600")
 
     assert load_price_reference_source("ecb").default_max_carry_age_s == 3600.0
+    # Wise is intraday: a stale quote means the feed is broken, so it never carries.
+    assert load_price_reference_source("wise").default_max_carry_age_s is None
+
+
+def test_a_stale_wise_quote_is_refused_whatever_carry_limit_is_set(monkeypatch):
+    monkeypatch.setenv("PRICE_REFERENCE_MAX_CARRY_AGE_S", str(10 * 24 * 3600))
+    wise = load_price_reference_source("wise")
+    two_days_old = time.time() - 2.5 * 24 * 3600
+    monkeypatch.setattr(wise, "quote", lambda base, quote, *, amount=None: PriceObservation(
+        source="wise", pair="SGD/USD", rate=Decimal("0.75"), ts=two_days_old))
+
+    with pytest.raises(ReferenceTooStale):
+        ReferencePriceOracle(wise).get("SGD", "USD")
 
 
 def test_invalid_carry_override_is_rejected(monkeypatch):

@@ -20,7 +20,8 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
     daily for the official references). An operator can override any source's
     window with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`) or the global
     `PRICE_REFERENCE_MAX_AGE_S`. How long a stale daily rate is still quoted on
-    comes from `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`.
+    comes from `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`;
+    Wise is intraday and never carries a stale quote, so neither applies to it.
     """
     # CLI-provided names override config; default to Wise for fresher live-ish
     # FX data when no explicit source is configured.
@@ -36,7 +37,6 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
             pay_out=get_config("WISE_PAY_OUT", None),
             default_amount=get_config("WISE_DEFAULT_AMOUNT", None),
             max_age_s=_max_age_override("WISE"),
-            max_carry_age_s=_max_carry_age_override("WISE"),
         )
     if source_name == "ecb":
         # ECB is configured by a single XML feed URL.

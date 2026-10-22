@@ -60,8 +60,9 @@ Past its window a daily reference is **carried forward** rather than rejected:
 the oracle still returns the last published rate, marked `stale` with its
 `age_s`, until that rate is 7 days old. Past that it raises `ReferenceTooStale`,
 a `ReferenceUnavailable` subclass. `wise` declares no carry limit and is rejected
-as soon as it is stale. Change a limit with `<SOURCE>_MAX_CARRY_AGE_S` or
-`PRICE_REFERENCE_MAX_CARRY_AGE_S`, or disable carrying with
+as soon as it is stale, whatever limit is configured. Change a daily source's
+limit with `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`
+(neither applies to `wise`), or disable carrying with
 `ReferencePriceOracle(..., carry_stale=False)` (`--halt-on-stale-reference` on
 the CLI).
 

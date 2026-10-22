@@ -73,7 +73,8 @@ class WiseRateSource:
     name = "wise"
     # Wise returns near-real-time quotes with their own observation timestamp.
     DEFAULT_MAX_AGE_S = INTRADAY_MAX_AGE_S
-    # A stale Wise quote means the feed is broken, not closed: never carry it.
+    # A stale Wise quote means the feed is broken, not closed: never carry it,
+    # whatever carry limit is configured for the daily sources.
     DEFAULT_MAX_CARRY_AGE_S = None
     # Fallback source amount when a caller does not pass one (e.g. ad-hoc checks).
     DEFAULT_AMOUNT = Decimal("1000")
@@ -88,7 +89,6 @@ class WiseRateSource:
         default_amount: object | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         max_age_s: float | None = None,
-        max_carry_age_s: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         """Configure the Wise quotes client and credential lookup."""
@@ -110,11 +110,7 @@ class WiseRateSource:
         self.default_max_age_s = (
             self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
         )
-        self.default_max_carry_age_s = (
-            self.DEFAULT_MAX_CARRY_AGE_S
-            if max_carry_age_s is None
-            else float(max_carry_age_s)
-        )
+        self.default_max_carry_age_s = self.DEFAULT_MAX_CARRY_AGE_S
         # Allow tests to inject a fake client; otherwise create a bounded client.
         self._http = http or httpx.Client(timeout=timeout)
 
