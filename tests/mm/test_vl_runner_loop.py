@@ -162,6 +162,8 @@ class _FakeClient:
         self.cancel_ok = cancel_ok
         self.events: list[tuple] = []
         self.active_orders: set[str] = set()
+        # Every order Sera ever booked; fills for any other id are a 404.
+        self.booked: set[str] = set()
         self.batch_orders: dict[str, list[str]] = {}
         self.batch_places: list[dict] = []
         self.standalone_places: list[dict] = []
@@ -234,6 +236,7 @@ class _FakeClient:
         rows = []
         for record, leg in zip(records, legs, strict=True):
             self.active_orders.add(record.order_id)
+            self.booked.add(record.order_id)
             rows.append({
                 "market": leg.market,
                 "side": leg.side,
@@ -288,6 +291,7 @@ class _FakeClient:
             self.events.append(("rejected", market, side))
             raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
         self.active_orders.add(order.order_id)
+        self.booked.add(order.order_id)
         self.standalone_places.append({**order.wire, "order_id": order.order_id})
         self.events.append(("place_order", order.order_id, market, side))
         return OrderRecord(order.order_id, order.uuid_int)
@@ -310,6 +314,9 @@ class _FakeClient:
         tick = len([event for event in self.events if event[0] == "expiration"])
         if tick in self.unreadable_ticks and self.market_of(order_id) == self.unreadable_market:
             raise SeraRateLimit("RATE_LIMITED", "slow down", 429)
+        if order_id not in self.booked:
+            # Sera's own answer for an order it has no record of.
+            raise SeraError(None, "Order not found", 404)
         if order_id in self.fill_order_ids:
             # Like Sera, every call lists all of the order's fills so far.
             return [{"quantity": "5", "price": "1.0", "settlement_status": self.fill_status}]
@@ -480,7 +487,9 @@ def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_pat
         store.close()
 
 
-def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(monkeypatch, tmp_path):
+def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(
+    monkeypatch, tmp_path, caplog,
+):
     # Tick 1's USDC bid batch fails to connect, so Sera never books it. Tick 2's
     # cancel gets Sera's "not found", drops it, and quotes as normal; its
     # ledger rows settle at zero fills once the orders would have expired.
@@ -500,6 +509,8 @@ def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(monkeypatch
 
     assert result == 0
     assert ("cancel_vl", "batch-1") in client.events
+    # Its two legs settle with no fills, each with a warning saying why.
+    assert caplog.text.count("Sera has no record of it; settled with no fills") == 2
     assert _markets_quoted_per_tick(client)[1:] == [
         {"XSGD/USDC", "EURC/USDC"}, {"XSGD/USDC", "EURC/USDC"}]
     store = vr.StateStore(tmp_path / "state.sqlite")

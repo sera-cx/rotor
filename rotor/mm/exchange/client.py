@@ -629,8 +629,12 @@ class SeraClient:
             "/orders",
             params={"owner_address": self.owner_address, "status": status, "limit": 500},
         )
-        # Older/newer API responses may use trades or orders.
-        return list(body.get("trades") or body.get("orders") or [])
+        # Older/newer API responses may use trades or orders. A reply with
+        # neither list (an HTML page, an empty body) is not an empty book.
+        for key in ("orders", "trades"):
+            if isinstance(body.get(key), list):
+                return list(body[key])
+        raise RuntimeError("GET /orders returned no orders list")
 
     def get_order_fills(
         self, order_id: str, *, page_limit: int = 100, max_pages: int = 50
@@ -649,8 +653,12 @@ class SeraClient:
                 f"/fills/{order_id}",
                 params={"limit": page_limit, "offset": offset},
             )
-            # Missing items is treated as no fills rather than an error.
-            items = list(body.get("items") or [])
+            # Sera always answers with an items list. Anything else (an HTML
+            # page, an empty body, a renamed key) is unreadable, not "no fills":
+            # an order settles on one read, so a wrong zero would be permanent.
+            items = body.get("items")
+            if not isinstance(items, list):
+                raise RuntimeError(f"GET /fills/{order_id} returned no items list")
             out.extend(items)
             if len(items) < page_limit:
                 return out

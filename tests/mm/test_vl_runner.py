@@ -407,7 +407,7 @@ def _fill(quantity: str, status: str | None = "settled") -> dict:
 def _positions(client, store, server_now):
     """One tick's fill read: settle what is final, return positions for quoting."""
     unsettled = store.load_unsettled()
-    fills, _failed = vr._read_fills(client, [order.order_id for order in unsettled])
+    fills, _failed, _unknown = vr._read_fills(client, [order.order_id for order in unsettled])
     return vr._positions_for_quoting(
         store, unsettled, fills, server_now=server_now, log=LOG)
 
@@ -472,20 +472,37 @@ def test_failed_and_reverted_fills_count_as_nothing():
 def test_unknown_orders_have_no_fills_and_unreadable_ones_are_reported():
     client = _FillsClient()
 
-    client.error = errors.SeraError("NOT_FOUND", "no such order", 404)
-    assert vr._read_fills(client, ["a", "b", "a"]) == ({"a": [], "b": []}, {})
+    # Sera's own reply for an order it has no record of.
+    client.error = errors.from_response(404, {"detail": "Order not found"})
+    assert vr._read_fills(client, ["a", "b", "a"]) == ({"a": [], "b": []}, {}, {"a", "b"})
     assert client.calls == ["a", "b"]
 
     client.error = errors.SeraRateLimit("RATE_LIMITED", "slow down", 429)
-    fills, failed = vr._read_fills(client, ["a"])
-    assert fills == {}
+    fills, failed, unknown = vr._read_fills(client, ["a"])
+    assert (fills, unknown) == ({}, set())
     assert list(failed) == ["a"] and isinstance(failed["a"], errors.SeraRateLimit)
+
+
+@pytest.mark.parametrize("error", [
+    # An edge or proxy error page is not Sera saying the order does not exist.
+    errors.from_response(404, {"detail": "<html><title>404 Not Found</title></html>"}),
+    errors.from_response(404, {"detail": "Not Found"}),
+    # A reply with no items list (an HTML 200, an empty body, a renamed key).
+    RuntimeError("GET /fills/a returned no items list"),
+])
+def test_a_reply_that_is_not_seras_answer_is_unreadable_not_unfilled(error):
+    client = _FillsClient()
+    client.error = error
+
+    fills, failed, unknown = vr._read_fills(client, ["a"])
+
+    assert (fills, unknown, list(failed)) == ({}, set(), ["a"])
 
 
 def test_a_row_rotor_cannot_parse_makes_its_order_unreadable():
     client = _FillsClient({"good": [_fill("5")], "bad": [{"quantity": "five"}]})
 
-    fills, failed = vr._read_fills(client, ["good", "bad"])
+    fills, failed, _unknown = vr._read_fills(client, ["good", "bad"])
 
     assert fills == {"good": [_fill("5")]}
     assert list(failed) == ["bad"]

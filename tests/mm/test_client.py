@@ -501,6 +501,23 @@ def test_place_vl_batch_rejects_local_min_and_max_limits():
         ])
 
 
+@pytest.mark.parametrize("reply", [
+    (200, {}),                                   # empty or non-JSON body
+    (200, {"detail": "<html>maintenance</html>"}),
+    (200, {"data": []}),                         # a renamed key
+])
+def test_reads_without_seras_list_are_errors_not_empty(reply):
+    client = _make_client(_build_mock_routes({
+        "GET /fills/o-1": reply,
+        "GET /orders": reply,
+    }))
+
+    with pytest.raises(RuntimeError, match="returned no items list"):
+        client.get_order_fills("o-1")
+    with pytest.raises(RuntimeError, match="returned no orders list"):
+        client.get_open_orders()
+
+
 def test_get_open_orders_accepts_trades_response_shape():
     routes = _build_mock_routes({
         "GET /orders": {"trades": [{"trade_id": "trade-1"}]},

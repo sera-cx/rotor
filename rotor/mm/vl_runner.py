@@ -1137,7 +1137,7 @@ def run(
                 funds = _read_funds(client, log)
                 try:
                     unsettled = [] if state is None else state.load_unsettled()
-                    fills, failed = _read_fills(client, [
+                    fills, failed, unknown_orders = _read_fills(client, [
                         *(order.order_id for order in unsettled),
                         *(order.order_id for placement in live for order in placement.orders),
                     ])
@@ -1154,6 +1154,7 @@ def run(
                             fills,
                             server_now=tick_expiration - order_ttl_seconds,
                             log=log,
+                            unknown=unknown_orders,
                         )
                 except Exception as exc:
                     log.warning("skip tick: fill polling failed: %s", exc)
@@ -2555,31 +2556,45 @@ def _load_live_placements(
 
 def _read_fills(
     client: SeraClient, order_ids: list[str]
-) -> tuple[dict[str, list[dict]], dict[str, Exception]]:
-    """Fetch each order's fills once, returning the fills and any failures.
+) -> tuple[dict[str, list[dict]], dict[str, Exception], set[str]]:
+    """Fetch each order's fills once: the fills, any failures, and unknown orders.
 
-    An order Sera does not know has no fills. An order whose fills cannot be
-    read, or include a row rotor cannot parse, is returned with its error
-    instead, so a bad read affects only that order's market.
+    An order Sera itself says it has no record of has no fills, and is also
+    listed as unknown. An order whose fills cannot be read, including a 404
+    that is not Sera's own answer (an edge or proxy error page), or with a row
+    rotor cannot parse, is returned with its error instead, so a bad read
+    affects only that order's market and is retried next tick.
     """
     fills: dict[str, list[dict]] = {}
     failed: dict[str, Exception] = {}
+    unknown: set[str] = set()
     for order_id in dict.fromkeys(order_ids):
         try:
             rows = client.get_order_fills(order_id)
             for row in rows:
                 _filled_base_qty(row)
-        except errors.SeraError as exc:
-            if exc.status_code == 404:
+        except Exception as exc:
+            if _is_unknown_order(exc):
                 fills[order_id] = []
+                unknown.add(order_id)
             else:
                 failed[order_id] = exc
             continue
-        except Exception as exc:
-            failed[order_id] = exc
-            continue
         fills[order_id] = rows
-    return fills, failed
+    return fills, failed, unknown
+
+
+def _is_unknown_order(exc: Exception) -> bool:
+    """Whether this is Sera's own answer for an order it has no record of.
+
+    Sera answers GET /fills/{id} for an unknown order with a JSON 404 whose
+    detail is "Order not found"; any other 404 is not evidence of no fills.
+    """
+    return (
+        isinstance(exc, errors.SeraError)
+        and exc.status_code == 404
+        and (exc.detail or "").strip().lower() == "order not found"
+    )
 
 
 def _markets_of(
@@ -2647,6 +2662,7 @@ def _positions_for_quoting(
     *,
     server_now: float,
     log: logging.Logger,
+    unknown: set[str] = frozenset(),
 ) -> dict[str, Position]:
     """Settle every final order into the stored positions, then add fills in flight.
 
@@ -2669,6 +2685,13 @@ def _positions_for_quoting(
             in_flight.append((order, _visible_fill_qty(rows)))
             continue
         before, after = state.settle_order(order, settled)
+        if order.order_id in unknown:
+            # Expected only for a placement whose answer was lost and that
+            # Sera never booked; anything else is worth a look.
+            log.warning(
+                "%s %s order %s: Sera has no record of it; settled with no fills",
+                order.market, order.side, order.order_id,
+            )
         if settled > 0:
             log.info(
                 "%s %s filled %s @ %s; position %s -> %s",

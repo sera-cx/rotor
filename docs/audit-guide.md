@@ -73,7 +73,8 @@ Positions and return orders:
   The row is removed only when Sera refuses the order with a 4xx answer. On any
   other failure (timeout, dropped connection, 5xx, unreadable reply) it stays,
   and the placement is tracked as live so the next cycle cancels it. An order
-  Sera never booked has no fills (its fill read is a 404) and settles at zero.
+  Sera never booked has no fills (Sera answers its fill read with a JSON 404,
+  detail "Order not found") and settles at zero with a warning.
 - An order is settled only after its expiry plus 60 seconds of Sera server time,
   and only when none of its fills is `pending`/`confirming` (or an unknown
   status). Only `settled` fills count; `failed`/`reverted` count as zero.
@@ -82,6 +83,11 @@ Positions and return orders:
 - Each tick reads the fills of every ledger order and every live order once.
   Quoting adds the visible (not `failed`/`reverted`) fills of unsettled orders
   on top of the stored positions; only settled fills are ever stored.
+- Only Sera's own "Order not found" 404 means "no fills". Any other 404 (an
+  edge or proxy error page), a reply without an `items` list (an HTML 200, an
+  empty body), or a row rotor cannot parse makes the read fail; likewise
+  `GET /orders` without an `orders`/`trades` list is an error, not an empty
+  book.
 - An order whose fills cannot be read (an error, or a row rotor cannot parse)
   is never settled that tick, and its market is not quoted that tick; other
   markets are. After 12 ticks in a row it is reported as an error (and through
