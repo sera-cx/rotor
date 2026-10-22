@@ -147,8 +147,11 @@ Live order lifecycle:
   out for max(3 polls, 15 minutes). Its clock is in the state file, so `--once`
   fires share it; a fire checks only after placing nothing, so a successful
   fire never alerts on the gap before it.
-- `--cancel-on-exit` is opt-in and cancels only tracked placements; an
-  auto-update restart cancels tracked placements before re-exec regardless.
+- `--cancel-on-exit` is opt-in and cancels only tracked placements, waiting out
+  Sera's 5-minute cancel cooldown once (a second stop signal skips it); a stop
+  seen before Phase 7 places nothing new; leftovers are alerted and the loop
+  exits 1. An auto-update restart cancels tracked placements once before
+  re-exec regardless (the next process cancels leftovers at boot).
 
 Sera signing and API:
 

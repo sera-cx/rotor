@@ -114,3 +114,20 @@ def test_sleep_remaining_interruptible_does_not_call_time_sleep(monkeypatch):
     # With a requested stop, sleep_remaining waits on the event (returns at once)
     # instead of calling time.sleep — so the loop wakes promptly on SIGTERM.
     qe.sleep_remaining(qe.time.time(), 100.0, flag)
+
+
+def test_a_second_stop_signal_forces_the_stop():
+    import signal
+
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    stop = qe.StopFlag()
+    try:
+        stop.install()
+        signal.raise_signal(signal.SIGTERM)
+        assert (stop.requested, stop.forced) == (True, False)
+        signal.raise_signal(signal.SIGINT)
+        assert stop.forced is True
+        assert stop.wait_forced(5.0) is True
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)

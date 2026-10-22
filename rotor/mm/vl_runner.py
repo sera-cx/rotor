@@ -76,6 +76,8 @@ from rotor.updater import (
 )
 
 BOOT_CANCEL_RETRY_SECONDS = 300.0
+# Sera refuses to cancel an order younger than this (HTTP 429 cancel cooldown).
+SERA_CANCEL_COOLDOWN_SECONDS = 300.0
 DEFAULT_STATE_PATH = ".rotor_state.sqlite"
 # While pairs quote on carried-forward reference rates, repeat the warning at
 # most this often, so a weekend produces a handful of messages, not one per tick.
@@ -1061,6 +1063,8 @@ def run(
         state.replace_active(live)
 
     restart_after_update = False
+    # Whether shutdown cleanup left orders live (see _cancel_before_exit).
+    left_live = False
     # order id -> consecutive ticks its fills could not be read.
     read_failures: dict[str, int] = {}
     # Markets Sera rejected as inactive: not quoted until the next metadata
@@ -1313,6 +1317,10 @@ def run(
                         return 1
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
+            if stop.requested and cancel_on_exit:
+                # Shutting down to leave nothing resting: placing a fresh set now
+                # would only leave orders Sera will not let us cancel yet.
+                break
 
             # Phase 7: place exactly the fresh quote set. Every order is recorded
             # for settlement before it is sent; an order or VL batch Sera rejects
@@ -1371,9 +1379,15 @@ def run(
         # so the next process does not boot into stale-priced resting quotes that
         # could be picked off during the restart gap.
         if (cancel_on_exit or restart_after_update) and live and not dry_run:
-            live = _cancel_placements(client, live, log)
+            # A restart cancels once: the next process cancels leftovers at boot.
+            live = _cancel_before_exit(
+                client, live, log, stop=stop, notifier=notifier,
+                wait=cancel_on_exit and not restart_after_update,
+                order_ttl_seconds=order_ttl_seconds,
+            )
             if state is not None:
                 state.replace_active(live)
+            left_live = bool(live)
         if notifier is not None:
             notifier.notify_shutdown("VL mm stopped")
         if state is not None:
@@ -1387,7 +1401,52 @@ def run(
         except Exception as exc:
             log.error("auto-update restart failed: %s", exc)
             return 1
-    return 0
+    # --cancel-on-exit could not clear everything.
+    return 1 if left_live else 0
+
+
+def _cancel_before_exit(
+    client: SeraClient,
+    live: list[LivePlacement],
+    log: logging.Logger,
+    *,
+    stop: StopFlag,
+    notifier: TelegramNotifier | None,
+    wait: bool,
+    order_ttl_seconds: int,
+) -> list[LivePlacement]:
+    """Cancel tracked placements on shutdown; report any that stay live.
+
+    Sera refuses to cancel an order younger than its cancel cooldown, so with
+    `wait` rotor sleeps until the youngest remaining order is old enough and
+    tries once more (a second Ctrl-C or SIGTERM skips the wait). Anything still
+    live is logged and alerted with when it expires.
+    """
+    live = _cancel_placements(client, live, log)
+    youngest = max(
+        (order.placed_at for placement in live for order in placement.orders),
+        default=time.time(),
+    )
+    if live and wait and not stop.forced:
+        delay = youngest + SERA_CANCEL_COOLDOWN_SECONDS + 5.0 - time.time()
+        if delay > 0:
+            log.warning(
+                "waiting %.0fs for Sera's cancel cooldown before cancelling the last "
+                "orders (stop again to skip)", delay,
+            )
+            stop.wait_forced(delay)
+        if not stop.forced:
+            live = _cancel_placements(client, live, log)
+    if live:
+        count = sum(len(placement.orders) or 1 for placement in live)
+        message = (
+            f"{count} order(s) could not be cancelled before exit (Sera's cancel "
+            f"cooldown); they expire by about {_fmt_utc(youngest + order_ttl_seconds)}"
+        )
+        log.warning("%s", message)
+        if notifier is not None:
+            notifier.send_raw(f"⚠️ {message}", important=True)
+    return live
 
 
 def _refresh_runtimes(

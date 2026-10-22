@@ -255,8 +255,12 @@ poetry run rotor mm vl \
 Live mode requires `SERA_API_KEY`, `SERA_API_SECRET`, `SERA_BASE_URL`, and
 `SERA_PRIVATE_KEY`. `SERA_BASE_URL` must be `https://` (an `http://` endpoint is
 rejected, except `localhost` for development) because the maker signs orders
-against it. Use `--cancel-on-exit` when shutdown should try to cancel tracked
-live placements.
+against it. Use `--cancel-on-exit` when shutdown should cancel tracked live
+placements. Sera refuses to cancel an order in its first 5 minutes, so shutdown
+then waits until the youngest order is old enough and cancels it (up to about 5
+minutes; stop a second time to skip the wait). A stop that arrives mid-tick
+places no fresh set. Anything still live is logged and alerted with when it
+expires, and the loop exits with code 1.
 
 Only one instance may use a given state file at a time: Rotor takes an exclusive
 lock on `<state>.lock` at startup and refuses to start if another process holds

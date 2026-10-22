@@ -666,3 +666,70 @@ def test_filled_base_qty_sums_nested_trades_and_accepts_flat_shapes():
     assert vr._filled_base_qty({"quantity": "4"}) == Decimal("4")
     assert vr._filled_base_qty({"amount": "5"}) == Decimal("5")
     assert vr._filled_base_qty({}) == Decimal("0")
+
+
+class _ExitStop:
+    def __init__(self, *, forced: bool = False) -> None:
+        self.forced = forced
+        self.waits: list[float] = []
+
+    def wait_forced(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        return self.forced
+
+
+class _CooldownClient:
+    """Refuses cancels (Sera's cooldown) until `refusals` have been used up."""
+
+    def __init__(self, refusals: int) -> None:
+        self.refusals = refusals
+        self.cancels = 0
+
+    def cancel_order(self, order_id, uuid_int):
+        self.cancels += 1
+        if self.refusals:
+            self.refusals -= 1
+            return False
+        return True
+
+
+class _Alerts:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, bool]] = []
+
+    def send_raw(self, text, *, important=False):
+        self.sent.append((text, important))
+
+
+def _resting(placed_at: float) -> list[vr.LivePlacement]:
+    return [vr.LivePlacement(
+        kind="standalone", spent_token="USDC",
+        orders=[LiveOrder("bid", "o-1", 1, placed_at)], placed_at=placed_at,
+    )]
+
+
+def test_exit_waits_out_seras_cancel_cooldown_then_cancels(monkeypatch):
+    monkeypatch.setattr(vr.time, "time", lambda: 1000.0)
+    client, stop, alerts = _CooldownClient(refusals=1), _ExitStop(), _Alerts()
+
+    left = vr._cancel_before_exit(
+        client, _resting(placed_at=900.0), logging.getLogger("test"),
+        stop=stop, notifier=alerts, wait=True, order_ttl_seconds=600)
+
+    # Placed 100 s ago: wait the rest of the 300 s cooldown (plus 5 s), then cancel.
+    assert stop.waits == [205.0]
+    assert (left, client.cancels, alerts.sent) == ([], 2, [])
+
+
+def test_a_second_stop_skips_the_wait_and_reports_what_is_left(monkeypatch):
+    monkeypatch.setattr(vr.time, "time", lambda: 1000.0)
+    client, stop, alerts = _CooldownClient(refusals=1), _ExitStop(forced=True), _Alerts()
+
+    left = vr._cancel_before_exit(
+        client, _resting(placed_at=900.0), logging.getLogger("test"),
+        stop=stop, notifier=alerts, wait=True, order_ttl_seconds=600)
+
+    assert (len(left), client.cancels, stop.waits) == (1, 1, [])
+    [(text, important)] = alerts.sent
+    assert important and "1 order(s) could not be cancelled" in text
+    assert "expire by about 1970-01-01 00:25 UTC" in text

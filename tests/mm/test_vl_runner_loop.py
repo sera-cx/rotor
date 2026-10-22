@@ -139,6 +139,11 @@ class _StopFlag:
     def wait(self, _timeout: float) -> bool:
         return self.requested
 
+    forced = False
+
+    def wait_forced(self, _timeout: float) -> bool:
+        return self.forced
+
 
 class _FakeClient:
     vl_batch_min = 2
@@ -1385,6 +1390,50 @@ def test_run_keeps_quoting_and_alerts_when_an_update_cannot_be_used(monkeypatch)
     assert len(_markets_quoted_per_tick(client)) == 2
     alerts = notifier.containing("auto-update failed: pulled aaaa..bbbb")
     assert alerts and all(important for _text, important in alerts)
+
+
+def test_a_stop_mid_tick_with_cancel_on_exit_places_nothing_new(monkeypatch):
+    # Tick 1 places a set. A stop arrives during tick 2: its cancel-first clears
+    # tick 1's set and rotor exits without placing another.
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    clock = _fake_clock(monkeypatch, steps=[400.0, 400.0])
+    stop = vr.StopFlag()
+    monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+    real_balances = client.get_vault_balances
+
+    def stop_during_tick_2():
+        if clock["now"] > T0:
+            stop.request()
+        return real_balances()
+
+    client.balances = {"USDC": Decimal("100000"), "XSGD": Decimal("100000"),
+                       "EURC": Decimal("100000")}
+    monkeypatch.setattr(client, "get_vault_balances", stop_during_tick_2)
+
+    result = vr.run(config_path="vl.toml", cancel_on_exit=True, min_requote_seconds=0.0,
+                    state_path=":memory:")
+
+    assert result == 0
+    assert len(_markets_quoted_per_tick(client)) == 2
+    assert _markets_quoted_per_tick(client)[1] == set()
+    assert client.active_orders == set()
+
+
+def test_run_exits_1_when_cancel_on_exit_leaves_orders_live(monkeypatch):
+    client = _FakeClient(cancel_ok=False)
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _fake_clock(monkeypatch, steps=[1.0])
+
+    result = vr.run(config_path="vl.toml", cancel_on_exit=True, telegram=True,
+                    min_requote_seconds=0.0, state_path=":memory:")
+
+    assert result == 1
+    assert notifier.containing("could not be cancelled before exit")
 
 
 def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch):

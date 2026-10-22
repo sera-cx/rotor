@@ -153,6 +153,8 @@ class StopFlag:
     def __init__(self) -> None:
         """Initialize as not-yet-stopped."""
         self._event = threading.Event()
+        # A second signal: stop now, skipping any wait in shutdown cleanup.
+        self._forced = threading.Event()
 
     @property
     def requested(self) -> bool:
@@ -168,11 +170,23 @@ class StopFlag:
         # Returns True if the stop was requested during the wait, else False.
         return self._event.wait(max(0.0, timeout))
 
+    @property
+    def forced(self) -> bool:
+        """Return whether a second stop signal asked to skip cleanup waits."""
+        return self._forced.is_set()
+
+    def wait_forced(self, timeout: float) -> bool:
+        """Block up to `timeout` seconds, returning early on a second stop signal."""
+        return self._forced.wait(max(0.0, timeout))
+
     def install(self) -> None:
         """Install SIGINT/SIGTERM handlers that flip the stop flag."""
         def handler(_signum, _frame):
             # Signal handlers should do minimal work; setting the event both
-            # flips `requested` and wakes any in-progress `wait`.
+            # flips `requested` and wakes any in-progress `wait`. A second
+            # signal also cuts short a shutdown wait.
+            if self._event.is_set():
+                self._forced.set()
             self._event.set()
 
         # Ctrl-C and process termination both request graceful shutdown.
