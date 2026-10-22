@@ -145,6 +145,16 @@ class WiseRateSource:
             option.get("targetAmount"))
         return self._observation(base, quote, rate, body, option)
 
+    def mid_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        """Wise's own mid-market rate, from the same reply `sell_rate` reads."""
+        body = self._reply(base, quote, "sourceAmount", qty_base)
+        return PriceObservation(
+            source=self.name,
+            pair=_pair(base, quote),
+            rate=_positive_decimal(body.get("rate")),
+            ts=_parse_ts(body.get("rateTimestamp") or body.get("createdTime")),
+        )
+
     def _observation(
         self, base: str, quote: str, rate: Decimal, body: dict, option: dict
     ) -> PriceObservation:

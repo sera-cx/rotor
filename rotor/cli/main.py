@@ -90,9 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
                               "(default: each source's own window — wise ~10m, "
                               "daily FX sources ~48h)")
     p_mm_vl.add_argument("--halt-on-stale-reference", action="store_true",
-                         help="skip a pair once its reference is past the freshness window "
-                              "(default: keep quoting daily FX sources on their last "
-                              "published rate for up to 7 days, with a warning)")
+                         help="use Wise's live mid as soon as a pair's reference is past "
+                              "its freshness window (default: carry a daily FX source's "
+                              "last published rate for up to 7 days, with a warning)")
     p_mm_vl.add_argument("--dry-run", action="store_true",
                          help="print intended VL groups; do not sign or place orders")
     p_mm_vl.add_argument("--once", action="store_true",

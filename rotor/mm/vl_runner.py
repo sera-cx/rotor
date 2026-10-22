@@ -190,6 +190,8 @@ class TickReferences:
     quoted: dict[str, ReferencePrice] = field(default_factory=dict)
     # market -> why a pair produced no quote this tick.
     skipped: dict[str, Exception] = field(default_factory=dict)
+    # market -> why its own source failed, so it quoted on Wise's mid instead.
+    fallback: dict[str, Exception] = field(default_factory=dict)
 
 
 @dataclass
@@ -702,8 +704,8 @@ class DarkPairAlerts:
             if not alerted and now - since >= self.window:
                 alerted = True
                 if market not in alerted_elsewhere:
-                    reason = (str(error).splitlines() or [type(error).__name__])[0]
-                    dark.append(f"{market} for {_fmt_duration(now - since)}: {reason}")
+                    dark.append(
+                        f"{market} for {_fmt_duration(now - since)}: {_first_line(error)}")
             self._episodes[market] = (since, alerted)
         for market in sorted(refs.quoted):
             episode = self._episodes.pop(market, None)
@@ -772,7 +774,16 @@ class StaleReferenceAlerts:
         recovered: list[str] = []
         stopped: list[str] = []
         changed = False
+        switched: list[str] = []
+        for market, reason in sorted(refs.fallback.items(), key=lambda item: item[0]):
+            episode = self._episodes.get(market)
+            if episode is None or episode.status != "wise":
+                self._episodes[market] = StaleAlertState("wise", None, now)
+                switched.append(f"{market}: {_first_line(reason)}")
+                changed = True
         for market, ref in sorted(refs.quoted.items(), key=lambda item: item[0]):
+            if market in refs.fallback:
+                continue
             episode = self._episodes.get(market)
             if not ref.stale:
                 if episode is not None:
@@ -822,6 +833,15 @@ class StaleReferenceAlerts:
                 None,
                 False,
             ),
+            (
+                switched,
+                "🟡",
+                "These pairs' reference rates are unavailable, so they use Wise's "
+                "mid-market rate instead (it bounds return orders; quotes are at "
+                "Wise's prices either way):",
+                None,
+                True,
+            ),
             (recovered, "✅", "Reference rates updated again:", None, False),
             (
                 stopped,
@@ -855,6 +875,11 @@ class StaleReferenceAlerts:
             f"{market}: {ref.source} rate {_rate_date(ref.ts)}, "
             f"{_fmt_duration(ref.age_s)} old{until}"
         )
+
+
+def _first_line(error: Exception) -> str:
+    """An error's first line, for a compact alert."""
+    return (str(error).splitlines() or [type(error).__name__])[0]
 
 
 def _rate_date(ts: float) -> str:
@@ -1697,8 +1722,9 @@ def _build_tick_intents(
 ) -> list[OrderIntent]:
     """Build all order intents for one loop tick, leaving out `skip` markets.
 
-    Each pair is isolated: an unavailable reference, a rate past its carry
-    limit, or a quote that fails market minimums skips only that pair, so one
+    Each pair is isolated: a pair Wise cannot price (its own reference failing
+    falls back to Wise's mid), or a quote that fails market minimums, skips
+    only that pair, so one
     misbehaving market cannot sideline quoting on every other healthy market.
     When `refs` is given it records what each pair quoted on or why it skipped.
     """
@@ -1743,9 +1769,17 @@ def _intents_for_runtime(
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
     # Fetch a fresh mid for this pair (Wise, as a mid source, prices the size).
-    ref = runtime.oracle.get(
-        runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
-    )
+    try:
+        ref = runtime.oracle.get(
+            runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
+        )
+    except ReferenceUnavailable as exc:
+        # Quotes come from Wise anyway; the mid only bounds return orders, so a
+        # source that stopped (past its carry limit, or down) is replaced by
+        # Wise's live mid rather than taking the pair down.
+        ref = _wise_mid(runtime, exc, now=now)
+        if refs is not None:
+            refs.fallback[runtime.config.market] = exc
     # Build the size and a mid-based placeholder quote (its prices are replaced
     # by Wise's below; the mid still drives return orders).
     quote = dispatch_quote(runtime.algo, runtime.info, ref.rate)
@@ -1899,6 +1933,21 @@ def _within_limits(
         )
         out.append(replace(intent, qty_base=qty))
     return out
+
+
+def _wise_mid(runtime: PairRuntime, reason: Exception, *, now: float) -> ReferencePrice:
+    """Wise's mid-market rate for a pair whose own source failed with `reason`."""
+    wise = runtime.settlement
+    pair = f"{runtime.iso_base}/{runtime.iso_quote}"
+    try:
+        obs = wise.mid_rate(runtime.iso_base, runtime.iso_quote, runtime.config.qty_base)
+    except Exception as exc:
+        raise ReferenceUnavailable(
+            f"{reason}; Wise's mid failed too ({type(exc).__name__}: {exc})") from exc
+    age = now - obs.ts
+    if age > wise.default_max_age_s:
+        raise ReferenceUnavailable(f"{reason}; Wise's mid is {age:.0f}s old too")
+    return ReferencePrice(pair=pair, rate=obs.rate, ts=obs.ts, source=obs.source, age_s=age)
 
 
 def _at_wise_prices(

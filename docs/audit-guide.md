@@ -63,7 +63,12 @@ Pricing:
   weekends or holidays. The oracle marks that price `stale`, the runner alerts
   on it, and a `wise` quote is never carried. `--halt-on-stale-reference`
   disables carrying.
-- A failing, past-carry-limit, or sub-minimum pair is skipped in isolation; the
+- A pair whose own source fails (`ReferenceUnavailable`, including a rate past
+  its carry limit or any stale rate under `--halt-on-stale-reference`) uses
+  Wise's mid-market rate instead (`_wise_mid`, from the same reply as the sell
+  quote, at most 10 minutes old), recorded in `TickReferences.fallback` and
+  alerted once per episode. Only when Wise fails too is the pair skipped.
+- A failing (Wise down too) or sub-minimum pair is skipped in isolation; the
   other pairs still quote. A tick is fully skipped only when no pair produces a
   quote. A pair skipped on every tick for 15 minutes is alerted once
   (`DarkPairAlerts`, persisted in `dark_pairs`), and once more when it quotes.
@@ -296,9 +301,9 @@ Stop and investigate if you find:
   applied in the same transaction (a fill missed or counted twice).
 - A return order priced through its position's fill price, or sized above the
   normal order it replaces.
-- A stale source quote that still places orders outside the carry rules: a stale
-  `wise` quote, a daily rate past its carry limit, or any stale rate under
-  `--halt-on-stale-reference`.
+- A stale mid used outside the carry rules (a stale `wise` quote, a daily rate
+  past its carry limit, or any stale rate under `--halt-on-stale-reference`)
+  instead of being replaced by Wise's live mid.
 - Destructive Git commands in the updater.
 - Telegram or logging output that includes secrets or signatures.
 - Default logs that emit per-tick chatter or grow local log files.

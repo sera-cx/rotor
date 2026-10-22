@@ -112,8 +112,14 @@ class _SequencedSource:
     def buy_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
         return self._settlement(base, quote, 1 + self.buy_fee)
 
+    def mid_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
+        return self._settlement(base, quote, Decimal("1"))
+
     def _settlement(self, base: str, quote: str, factor: Decimal) -> PriceObservation:
         pair = (base.upper(), quote.upper())
+        if pair in self.always_fail:
+            # A pair marked as failing has no Wise rate either.
+            raise RuntimeError("source unavailable for pair")
         values = self.rates[pair]
         rate = values[min(max(self.calls.get(pair, 1) - 1, 0), len(values) - 1)]
         return PriceObservation(
@@ -705,6 +711,7 @@ def test_fire_once_runs_alert_when_one_pair_stops_quoting_and_when_it_is_back(
     assert [text for text, _ in alerts] == [
         "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
         "XSGD/USDC for 15m: SGD/USD: test-source failed "
+        "(RuntimeError: source unavailable for pair); Wise's mid failed too "
         "(RuntimeError: source unavailable for pair)"
     ]
     assert len(notifier.containing("Not quoting these pairs")) == 1
@@ -1227,16 +1234,24 @@ def test_debug_logging_never_logs_telegram_request_urls(caplog, tmp_path):
 
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):
     client = _FakeClient()
+    # Per-pair isolation, and Wise standing in for a failed source, mean a full
+    # tick-skip needs both pairs' sources and Wise to fail; tick 2 recovers.
     source = _SequencedSource(
         {
             ("SGD", "USD"): ["1.0000"],
             ("EUR", "USD"): ["2.0000"],
         },
-        # Per-pair isolation means a full tick-skip needs both pairs to fail.
-        fail_first_quotes=2,
+        always_fail={("SGD", "USD"), ("EUR", "USD")},
     )
     _wire_runner(monkeypatch, config=_config(), client=client, source=source)
     sleeps = _stop_after_sleeps(monkeypatch, 2)
+    count_sleep = vr.sleep_remaining
+
+    def recover(started, poll, stop=None):
+        source.always_fail = set()
+        count_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", recover)
 
     result = vr.run(
         config_path="vl.toml",
@@ -1473,7 +1488,9 @@ def test_run_keeps_quoting_on_a_weekend_rate_and_warns_once(monkeypatch, tmp_pat
     assert not notifier.containing("stalled")
 
 
-def test_run_with_halt_on_stale_reference_skips_weekend_rates(monkeypatch, tmp_path):
+def test_run_with_halt_on_stale_reference_quotes_on_wises_mid_not_weekend_rates(
+    monkeypatch, tmp_path,
+):
     client = _FakeClient()
     source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
@@ -1489,10 +1506,12 @@ def test_run_with_halt_on_stale_reference_skips_weekend_rates(monkeypatch, tmp_p
         state_path=tmp_path / "state.sqlite",
     )
 
-    assert result == 1
-    assert client.batch_places == []
-    assert client.standalone_places == []
+    # No quote rests on a weekend rate: the stale mids are replaced by Wise's
+    # live mid (quotes are at Wise's prices either way), with one alert.
+    assert result == 0
+    assert client.batch_places != []
     assert not notifier.containing("not updating")
+    assert len(notifier.containing("use Wise's mid-market rate instead")) == 1
 
 
 def test_fire_once_runs_announce_a_weekend_only_once(monkeypatch, tmp_path):
@@ -1531,7 +1550,34 @@ def test_tick_references_record_carried_and_skipped_pairs(monkeypatch):
     assert not isinstance(refs.skipped["EURC/USDC"], ReferenceTooStale)
 
 
-def test_halting_runtimes_skip_a_weekend_rate(monkeypatch):
+def test_a_rate_past_its_carry_limit_is_replaced_by_wises_mid_with_one_alert(
+    monkeypatch, tmp_path,
+):
+    # Nine days without a new daily rate: past the 7-day carry limit. The pairs
+    # keep quoting on Wise's mid, alerted once across fires, and a fresh rate
+    # is reported when it comes back.
+    client = _FakeClient()
+    source = _AgedSource(WEEKEND_RATES, age_s=9 * DAY)
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    def fire() -> int:
+        return vr.run(config_path="unused.toml", once=True, telegram=True,
+                      min_requote_seconds=0.0, state_path=tmp_path / "state.sqlite")
+
+    assert [fire(), fire()] == [0, 0]
+    assert len(notifier.containing("use Wise's mid-market rate instead")) == 1
+    assert not notifier.containing("Stopped quoting")
+    assert not notifier.containing("Not quoting these pairs")
+
+    source.age_s = 0.0
+    assert fire() == 0
+    assert len(notifier.containing("Reference rates updated again")) == 1
+
+
+def test_halting_runtimes_quote_on_wises_mid_instead_of_a_weekend_rate(monkeypatch):
     client = _FakeClient()
     source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
     config = _config()
@@ -1541,8 +1587,11 @@ def test_halting_runtimes_skip_a_weekend_rate(monkeypatch):
 
     intents = vr._build_tick_intents(config, runtimes, {}, expiration=1, log=LOG, refs=refs)
 
-    assert intents == []
-    assert isinstance(refs.skipped["XSGD/USDC"], ReferenceTooStale)
+    # The weekend rate is refused, and Wise's live mid stands in for it.
+    assert isinstance(refs.fallback["XSGD/USDC"], ReferenceTooStale)
+    assert refs.skipped == {}
+    assert refs.quoted["XSGD/USDC"].source == "wise"
+    assert {intent.market for intent in intents} == {"XSGD/USDC", "EURC/USDC"}
 
 
 def _stale_alerts(*, state=None, markets=("XSGD/USDC",)) -> vr.StaleReferenceAlerts:

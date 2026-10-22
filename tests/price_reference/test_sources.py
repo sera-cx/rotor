@@ -111,6 +111,20 @@ def test_wise_mid_is_halfway_between_its_sell_and_buy_rates_for_the_amount():
     assert obs.source == "wise"
 
 
+def test_wise_mid_comes_from_the_same_reply_as_the_sell_rate():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
+
+    wise = _wise(handler)
+    wise.sell_rate("SGD", "USD", Decimal("1000"))
+
+    assert wise.mid_rate("SGD", "USD", Decimal("1000")).rate == Decimal("0.78")
+    assert len(calls) == 1
+
+
 def test_wise_sends_a_token_only_when_one_is_set(monkeypatch):
     auth = []
 

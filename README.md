@@ -102,11 +102,15 @@ logs.
 Daily FX sources (`ecb`, `fed`, `bnm`) publish nothing on weekends or
 public holidays. Instead of going dark until they publish again, Rotor keeps
 quoting on a source's last published rate for up to 7 days past that rate's
-date. With `--telegram` it warns when pairs start quoting on carried rates,
-repeats the warning quietly every 6 hours, and reports when fresh rates return
-or a rate passes its limit and the pair stops. `wise` never carries a stale
-quote. Pass `--halt-on-stale-reference` to skip stale pairs instead, or change a
-source's limit with `<SOURCE>_MAX_CARRY_AGE_S`.
+date. Past that limit, or whenever a source is down, the pair's mid is
+replaced by Wise's live mid-market rate and it keeps quoting (quotes are at
+Wise's prices either way; the mid only bounds return orders). With `--telegram`
+it warns when pairs start quoting on carried rates, repeats the warning quietly
+every 6 hours, says when a pair switches to Wise's mid, and reports when fresh
+rates return. `wise` never carries a stale quote. Pass
+`--halt-on-stale-reference` to use Wise's mid as soon as a rate is stale
+instead of carrying it, or change a source's limit with
+`<SOURCE>_MAX_CARRY_AGE_S`.
 
 For autonomous source checkouts, add `--auto-update`. Rotor checks once per day,
 runs `git pull --ff-only` only on a clean worktree, stops the current loop after

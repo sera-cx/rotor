@@ -173,14 +173,20 @@ rate is carried forward: the pair keeps quoting on the last published rate until
 that rate is 7 days old (`<SOURCE>_MAX_CARRY_AGE_S` or
 `PRICE_REFERENCE_MAX_CARRY_AGE_S` to change; neither applies to `wise`). With `--telegram`, Rotor warns once
 on the important channel when pairs start quoting on carried rates, repeats the
-warning on the normal channel every 6 hours, and reports when fresh rates return
-or when a rate passes its limit and the pair stops quoting. These alert episodes
-are kept in the state database, so `--once` runs do not repeat them. A stale
-`wise` quote is never carried. Pass `--halt-on-stale-reference` to skip every
-stale pair instead.
+warning on the normal channel every 6 hours, and reports when fresh rates
+return. These alert episodes are kept in the state database, so `--once` runs
+do not repeat them. A stale `wise` quote is never carried.
 
-Pairs are isolated within a tick: if one pair's reference is unavailable or past
-its carry limit, or its quote fails market minimums, only that pair is skipped —
+A pair whose own source fails outright (down, or a rate past its carry limit)
+keeps quoting with its mid replaced by Wise's live mid-market rate, read from the same
+Wise reply as its quotes, with one important alert when it switches. Quotes are
+at Wise's prices either way; the mid only bounds return orders. Pass
+`--halt-on-stale-reference` to switch to Wise's mid as soon as a rate is stale
+instead of carrying it.
+
+Pairs are isolated within a tick: if Wise cannot price a pair (so neither its
+quotes nor a fallback mid exist), or its quote fails market minimums, only that
+pair is skipped —
 the other configured pairs still quote. A tick is fully skipped only when no pair
 produces a quote. With `--telegram`, a pair that has produced no quote for 15
 minutes in a row is alerted once with the reason (for example its price source
