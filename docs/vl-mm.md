@@ -276,7 +276,12 @@ reports that quoting resumed. The stall clock is kept in the state file, so
 `--once` fires share it: a fire that places nothing alerts once the stall has
 lasted that long across fires.
 
-On startup, Rotor reattaches existing open orders for the configured markets.
+On startup, Rotor reattaches the open orders on its configured markets that it
+placed (those in its state file or settlement ledger). Run one rotor per wallet:
+an open order on those markets that rotor did not place means another rotor, or
+someone else, is trading the wallet, so rotor refuses to start (with an
+important alert) and never touches that order. If one appears while rotor runs,
+it alerts once and leaves it alone.
 It cancels those reattached placements before the first quote tick by default.
 If cancellation is blocked by Sera's cooldown, Rotor waits 5 minutes and retries
 once before continuing with any remaining live placements still tracked. A

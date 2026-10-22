@@ -1436,14 +1436,75 @@ def test_run_exits_1_when_cancel_on_exit_leaves_orders_live(monkeypatch):
     assert notifier.containing("could not be cancelled before exit")
 
 
-def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch):
-    client = _FakeClient(open_orders=[{
-        "symbol": "XSGD/USDC",
-        "side": "bid",
-        "order_id": "old-order",
-        "uuid_int": "42",
-        "created_at": "2026-01-01T00:00:00Z",
-    }])
+def _remember(state_path, order_id: str, market: str = "XSGD/USDC") -> None:
+    """Record `order_id` as one this rotor placed, as a previous run would have."""
+    store = vr.StateStore(state_path)
+    try:
+        store.replace_active([vr.LivePlacement(
+            kind="standalone", spent_token="USDC",
+            orders=[vr.LiveOrder("bid", order_id, 42, 0.0, market)], placed_at=0.0,
+        )])
+    finally:
+        store.close()
+
+
+_OLD_ORDER = {
+    "symbol": "XSGD/USDC",
+    "side": "bid",
+    "order_id": "old-order",
+    "uuid_int": "42",
+    "created_at": "2026-01-01T00:00:00Z",
+}
+
+
+def test_run_refuses_to_start_next_to_orders_it_did_not_place(monkeypatch, tmp_path):
+    # Another rotor (or a person) is trading this wallet: rotor neither starts
+    # nor touches that trader's order, and says why.
+    client = _FakeClient(open_orders=[_OLD_ORDER])
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    # Should rotor start anyway, stop after one tick rather than run on.
+    _fake_clock(monkeypatch, steps=[1.0])
+
+    result = vr.run(config_path="vl.toml", telegram=True, state_path=tmp_path / "state.sqlite")
+
+    assert result == 1
+    assert not any(event[0].startswith("cancel") for event in client.events)
+    assert client.batch_places == [] and client.standalone_places == []
+    assert notifier.containing("1 open order(s) on this rotor's markets that it did not place")
+
+
+def test_run_leaves_a_foreign_order_alone_mid_run_and_alerts_once(monkeypatch):
+    # Rotor tracks nothing after a tick whose placements all fail; meanwhile
+    # someone else's order appears. Rotor does not adopt (and so cancel) it.
+    client = _FakeClient(reject_asks=True)
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    client.unsent_errors = [SeraError("INSUFFICIENT_EQUITY", "no USDC", 400)] * 3
+    clock = _fake_clock(monkeypatch, steps=[305.0, 305.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def someone_else_places(started, poll, stop=None):
+        client.open_orders = [_OLD_ORDER]
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", someone_else_places)
+
+    vr.run(config_path="vl.toml", telegram=True, min_requote_seconds=0.0,
+           state_path=":memory:")
+
+    assert ("cancel_order", "old-order", 42) not in client.events
+    assert len(notifier.containing("that it did not place")) == 1
+    assert clock["now"] > T0
+
+
+def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch, tmp_path):
+    client = _FakeClient(open_orders=[_OLD_ORDER])
+    _remember(tmp_path / "state.sqlite", "old-order")
     source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
     _wire_runner(
         monkeypatch,
@@ -1469,7 +1530,7 @@ def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch):
         auto_update=True,
         cancel_on_exit=True,
         log_level="ERROR",
-        state_path=":memory:",
+        state_path=tmp_path / "state.sqlite",
     )
 
     assert result == 0

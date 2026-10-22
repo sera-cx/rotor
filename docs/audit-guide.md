@@ -115,7 +115,10 @@ Live order lifecycle:
   once. The Telegram notifier exists before any startup step, so failures alert.
 - Dry-run never signs, places, or cancels.
 - Live mode unlocks the wallet before any signing path.
-- Rotor reattaches configured open orders on startup when possible.
+- Rotor reattaches only open orders it placed (`_known_order_ids`: tracked
+  orders plus the settlement ledger). Any other open order on a configured
+  market stops startup (exit 1, alert) and is alerted once mid-run; rotor never
+  adopts, and so never cancels, it.
 - Startup cancellation is default-on and runs before the first quote tick.
 - If boot cancellation leaves placements live, Rotor waits 5 minutes and retries
   once while keeping any remaining placements tracked.

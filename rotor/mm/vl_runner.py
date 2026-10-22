@@ -1043,13 +1043,26 @@ def run(
     # so a restart does not orphan or duplicate live quotes. In dry-run we never
     # touch live state.
     stored_live = [] if state is None else state.load_active(markets)
+    foreign: list[str] = []
     live: list[LivePlacement] = [] if dry_run else _load_live_placements(
         client,
         markets,
         log,
         fallback=stored_live,
         stop=stop,
+        known=_known_order_ids(state, stored_live),
+        foreign=foreign,
     )
+    if foreign:
+        # One rotor per wallet: a second one would fight this wallet's other
+        # trader over budgets and self-matching, so refuse to start.
+        message = _foreign_orders_message(client, foreign)
+        log.error("%s", message)
+        if notifier is not None:
+            notifier.send_raw(f"⛔ rotor did not start: {message}", important=True)
+        if state is not None:
+            state.close()
+        return 1
     if live and not dry_run:
         if once:
             # Fire-once (e.g. a Manus scheduler tick): do a single boot-cancel
@@ -1063,6 +1076,8 @@ def run(
         state.replace_active(live)
 
     restart_after_update = False
+    # Whether open orders someone else placed on this wallet were reported.
+    foreign_alerted = False
     # Whether shutdown cleanup left orders live (see _cancel_before_exit).
     left_live = False
     # order id -> consecutive ticks its fills could not be read.
@@ -1147,16 +1162,26 @@ def run(
             # Phase 0: if we have no tracked state, try to recover open orders
             # from Sera before quoting again (falls back to prior local state).
             if not dry_run and not live:
+                stored = state.load_active(markets) if state is not None else live
+                foreign = []
                 live = _load_live_placements(
                     client,
                     markets,
                     log,
                     announce=False,
-                    fallback=(state.load_active(markets) if state is not None else live),
+                    fallback=stored,
                     stop=stop,
+                    known=_known_order_ids(state, stored),
+                    foreign=foreign,
                 )
                 if state is not None:
                     state.replace_active(live)
+                if foreign and not foreign_alerted:
+                    message = _foreign_orders_message(client, foreign)
+                    log.error("%s", message)
+                    if notifier is not None:
+                        notifier.send_raw(f"⚠️ {message}", important=True)
+                foreign_alerted = bool(foreign)
             if dry_run:
                 tick_expiration = int(time.time()) + order_ttl_seconds
             else:
@@ -2593,12 +2618,19 @@ def _load_live_placements(
     retries: int = 2,
     retry_wait: float = 2.0,
     stop: StopFlag | None = None,
+    known: set[str] | None = None,
+    foreign: list[str] | None = None,
 ) -> list[LivePlacement]:
     """Reattach open orders from Sera for configured markets.
 
     A transient reattach failure is retried before falling back to local state:
     if orders were placed just before a crash and the boot reattach blips, a bare
     fallback to empty local state would orphan them (live on Sera, untracked).
+
+    With `known` (the order ids this rotor's state and ledger hold), only those
+    are reattached: an open order rotor did not place belongs to someone else
+    on this wallet (another rotor, say), and reattaching would cancel it. Its id
+    goes into `foreign` instead.
     """
     rows = None
     last_exc: Exception | None = None
@@ -2635,6 +2667,10 @@ def _load_live_placements(
         order_id = row.get("trade_id") or row.get("order_id")
         uuid_int = row.get("uuid_int")
         if side not in ("bid", "ask") or not order_id or not uuid_int:
+            continue
+        if known is not None and str(order_id) not in known:
+            if foreign is not None:
+                foreign.append(str(order_id))
             continue
         # Preserve server creation time when available for cooldown math.
         live_order = LiveOrder(
@@ -2679,6 +2715,30 @@ def _load_live_placements(
     if out and announce:
         log.debug("reattached %d open placement(s)", len(out))
     return out
+
+
+def _known_order_ids(state: StateStore | None, stored: list[LivePlacement]) -> set[str]:
+    """Order ids this rotor placed: its tracked orders and its settlement ledger.
+
+    Every order is in the ledger from before it is sent until it has expired
+    and settled, so an open order missing from both was not placed by rotor
+    on this state file.
+    """
+    known = {order.order_id for placement in stored for order in placement.orders}
+    if state is not None:
+        known |= {order.order_id for order in state.load_unsettled()}
+    return known
+
+
+def _foreign_orders_message(client: SeraClient, foreign: list[str]) -> str:
+    shown = ", ".join(foreign[:3]) + (", ..." if len(foreign) > 3 else "")
+    return (
+        f"wallet {client.owner_address} has {len(foreign)} open order(s) on this "
+        f"rotor's markets that it did not place ({shown}): another rotor, or "
+        "someone else, is trading this wallet. Run one rotor per wallet; rotor "
+        "leaves those orders alone. Stop the other trader or cancel them (they "
+        "also expire with their TTL), then start again."
+    )
 
 
 def _read_fills(

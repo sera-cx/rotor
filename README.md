@@ -82,7 +82,9 @@ poetry run rotor mm vl --config rotor/vl.config.toml --dry-run --once
 poetry run rotor mm vl --config rotor/vl.config.toml --poll 305
 ```
 
-Live mode always cancels reattached configured orders on boot. If Sera's cancel
+Run one rotor per wallet: rotor refuses to start if the wallet has open orders
+on its markets that it did not place. Live mode always cancels its own
+reattached orders on boot. If Sera's cancel
 cooldown is active, Rotor waits 5 minutes and retries before quoting.
 
 Rotor keeps a small state database at `.rotor_state.sqlite` by default. It
