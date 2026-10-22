@@ -56,8 +56,9 @@ class _PlacedOrder:
 class _StaticRateSource:
     name = "testnet-static"
 
-    def __init__(self, rate: Decimal) -> None:
+    def __init__(self, rate: Decimal, *, fee_bps: Decimal = Decimal("50")) -> None:
         self.rate = rate
+        self.fee = fee_bps / Decimal("10000")
 
     def quote(self, base: str, quote: str, *, amount=None) -> PriceObservation:
         base = base.upper()
@@ -69,14 +70,19 @@ class _StaticRateSource:
             ts=time.time(),
         )
 
-    # Testnet tokens have no real Wise market: settle at the static rate, no fee.
+    # Testnet tokens have no real Wise market: stand in for Wise's after-fee
+    # rates (where normal quotes sit) at the static rate +/- the scenario spread.
     default_max_age_s = 600.0
 
     def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
-        return self.quote(base, quote)
+        return self._at(base, quote, 1 - self.fee)
 
     def buy_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
-        return self.quote(base, quote)
+        return self._at(base, quote, 1 + self.fee)
+
+    def _at(self, base: str, quote: str, factor: Decimal) -> PriceObservation:
+        obs = self.quote(base, quote)
+        return PriceObservation(source=obs.source, pair=obs.pair, rate=obs.rate * factor, ts=obs.ts)
 
 
 class _RecordingClient:
@@ -368,11 +374,12 @@ def _install_runner_hooks(
     *,
     maker: _RecordingClient,
     mid: Decimal,
+    fixed_bps: Decimal,
     stop: _StopFlag,
     fill_after_first_tick,
     wait_between_ticks: float,
 ) -> None:
-    source = _StaticRateSource(mid)
+    source = _StaticRateSource(mid, fee_bps=fixed_bps)
     calls = 0
     # Tick 1 quotes and is filled; the filled order expires and its fill settles
     # into a position by tick 2 or 3, which then quotes the return order.
@@ -495,6 +502,7 @@ def test_testnet_vl_runner_fill_then_return_requote(
         monkeypatch,
         maker=maker,
         mid=mid,
+        fixed_bps=fixed_bps,
         stop=stop,
         fill_after_first_tick=fill_after_first_tick,
         wait_between_ticks=wait_between_ticks,

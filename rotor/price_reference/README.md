@@ -22,7 +22,7 @@ Available sources:
   after-fee rates for an exact amount, by the cheapest enabled transfer method
   that does not involve a Wise balance, are `sell_rate` (quote received per
   base converting base into quote) and `buy_rate` (quote paid per base buying
-  base). The runner keeps every pair's orders outside them. As a mid source
+  base). The runner places every pair's normal orders at them. As a mid source
   (`quote`), it returns the midpoint of the two. A reply is reused for 60
   seconds, and on a failed request the last reply comes back for the caller's
   freshness check.

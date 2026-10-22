@@ -3,8 +3,8 @@
 A fill moves inventory away from where the operator funded it. Rotor records
 that move as a per-market position and quotes it back on the opposite side:
 
-- The return order starts at the normal opposite quote at fill time (twice
-  `fixed_bps` from the fill price) and walks linearly to the fill price over the
+- The return order starts twice `fixed_bps` from the fill price and walks
+  linearly to the fill price over the
   return window (48h by default). This is a reverse Dutch auction: rotor asks
   for less profit the longer the position stays open.
 - After the window it holds at the fill price until it fills, however long that

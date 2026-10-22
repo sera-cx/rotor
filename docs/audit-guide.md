@@ -7,7 +7,8 @@ against code, tests, and Sera API responses.
 ## Scope
 
 Rotor currently exposes one runtime command: `rotor mm vl`. The quote logic is
-fixed-spread only. Telegram is optional and must never affect trading safety.
+Wise's after-fee prices for normal orders, with a return auction after fills.
+Telegram is optional and must never affect trading safety.
 
 ## Start Here
 
@@ -45,11 +46,12 @@ Pricing:
 - The source rate is quote-per-base and is the pair's mid. `ecb`/`fed`/`bnm`
   are published reference rates; `wise` is the midpoint of Wise's after-fee
   sell and buy rates for the pair's `qty_base`.
-- Every order, normal or return, is kept outside Wise's after-fee rates for its
-  own final size (`_outside_settlement`): bid <= Wise sell rate, ask >= Wise
-  buy cost, cheapest enabled method with no Wise balance on either end, rounded
-  away from mid. A failed or >10-minute-old Wise rate skips the pair; a bid
-  pushed below the market minimum is dropped.
+- Every normal order is priced at Wise's after-fee rate for its own final
+  size (`_at_wise_prices`, run before and again after trimming): bid = Wise sell
+  rate, ask = Wise buy cost, cheapest enabled method with no Wise balance on
+  either end, rounded away from mid. Return orders (`is_return`) keep their
+  auction price. A failed or >10-minute-old Wise rate skips the pair; a bid
+  below the market minimum at Wise's price is dropped.
 - Bids round down and asks round up.
 - Amounts round down.
 - Quotes fail closed when market minimums are not met.

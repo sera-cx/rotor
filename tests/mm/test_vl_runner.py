@@ -144,9 +144,9 @@ class _Wise:
 NOW = 1_800_000_000.0
 
 
-def _settled(intents, wise, info=None):
+def _priced(intents, wise, info=None):
     runtime = replace(_runtime(info), settlement=wise)
-    return vr._outside_settlement(intents, runtime, now=NOW, log=LOG)
+    return vr._at_wise_prices(intents, runtime, now=NOW, log=LOG)
 
 
 def _vl_config(*, return_bps: str = "2", budget: str = "1000") -> VLConfig:
@@ -239,7 +239,7 @@ def test_position_below_the_market_minimum_keeps_the_normal_order():
 
 
 # ---------------------------------------------------------------------------
-# Orders kept outside Wise's settlement rates
+# Normal orders priced at Wise's after-fee rates
 # ---------------------------------------------------------------------------
 
 def _quote(fixed_bps="25", mid="1.0000", qty="100"):
@@ -250,45 +250,52 @@ def _quote(fixed_bps="25", mid="1.0000", qty="100"):
     ]
 
 
-def test_each_side_takes_whichever_is_wider_of_fixed_bps_and_wises_after_fee_rate():
+def test_normal_quotes_sit_at_wises_after_fee_prices_whatever_fixed_bps_is():
     # Wise: selling SGD costs 24 bps, buying it 37 bps.
-    bid, ask = _settled(_quote("25"), _Wise())
-    assert (bid.price, ask.price) == (Decimal("0.9975"), Decimal("1.0037"))
-
-    bid, ask = _settled(_quote("50"), _Wise())
-    assert (bid.price, ask.price) == (Decimal("0.9950"), Decimal("1.0050"))
+    for fixed_bps in ("25", "50", "100"):
+        bid, ask = _priced(_quote(fixed_bps), _Wise())
+        assert (bid.price, ask.price) == (Decimal("0.9976"), Decimal("1.0037"))
 
 
 def test_wise_is_priced_for_each_orders_own_size():
     wise = _Wise()
     bid, ask = _quote()
-    _settled([replace(bid, qty_base=Decimal("40")), ask], wise)
+    _priced([replace(bid, qty_base=Decimal("40")), ask], wise)
 
     assert wise.priced == [("sell", Decimal("40")), ("buy", Decimal("100"))]
 
 
-def test_a_stale_daily_mid_cannot_quote_through_the_live_market():
+def test_quotes_follow_wises_live_rates_not_a_stale_daily_mid():
     # The central bank published 1.0000; the live market has since risen 1%.
-    bid, ask = _settled(_quote("50"), _Wise(live="1.0100"))
-    # The bid stays where the daily mid put it (just less competitive); the ask
-    # follows Wise up instead of selling below the live market.
-    assert (bid.price, ask.price) == (Decimal("0.9950"), Decimal("1.0138"))
+    bid, ask = _priced(_quote("50"), _Wise(live="1.0100"))
+    assert (bid.price, ask.price) == (Decimal("1.0075"), Decimal("1.0138"))
 
-    # The market has fallen 1%: the bid follows Wise down.
-    bid, ask = _settled(_quote("50"), _Wise(live="0.9900"))
-    assert (bid.price, ask.price) == (Decimal("0.9876"), Decimal("1.0050"))
+    # The market has fallen 1%.
+    bid, ask = _priced(_quote("50"), _Wise(live="0.9900"))
+    assert (bid.price, ask.price) == (Decimal("0.9876"), Decimal("0.9937"))
+
+
+def test_a_return_order_keeps_its_auction_price_and_asks_wise_nothing():
+    wise = _Wise()
+    bid, ask = _quote()
+    returning = replace(ask, price=Decimal("1.0001"), is_return=True)
+
+    priced = _priced([bid, returning], wise)
+
+    assert priced[1] is returning
+    assert wise.priced == [("sell", Decimal("100"))]
 
 
 def test_without_a_fresh_wise_rate_the_pair_does_not_quote():
     with pytest.raises(vr.ReferenceUnavailable, match="Wise settlement rate failed"):
-        _settled(_quote(), _Wise(fail=True))
+        _priced(_quote(), _Wise(fail=True))
     with pytest.raises(vr.ReferenceUnavailable, match="Wise settlement rate is 601s old"):
-        _settled(_quote(), _Wise(age=601.0))
+        _priced(_quote(), _Wise(age=601.0))
 
 
-def test_a_bid_wise_pushes_below_the_market_minimum_is_dropped():
-    # 100 XSGD at 0.9975 is 99.75 USDC; at Wise's 0.9900 it is 99.00.
-    sides = _settled(_quote("25"), _Wise(sell_fee="0.0100"), info=_market(min_bid_quote="99.5"))
+def test_a_bid_below_the_market_minimum_at_wises_price_is_dropped():
+    # 100 XSGD at Wise's 0.9900 is 99.00 USDC, under the 99.50 minimum.
+    sides = _priced(_quote("25"), _Wise(sell_fee="0.0100"), info=_market(min_bid_quote="99.5"))
 
     assert [intent.side for intent in sides] == ["ask"]
 

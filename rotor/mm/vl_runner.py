@@ -143,6 +143,8 @@ class OrderIntent:
     spent_token: str
     # Benchmark mid used to create this intent.
     benchmark_rate: Decimal
+    # A return order (priced by the return auction) rather than a normal quote.
+    is_return: bool = False
 
 
 @dataclass
@@ -1586,7 +1588,7 @@ def _build_runtimes(
         if pair.price_source not in source_cache:
             source_cache[pair.price_source] = load_price_reference_source(pair.price_source)
         source = source_cache[pair.price_source]
-        # Every pair, whatever its mid source, is kept outside Wise's after-fee rates.
+        # Every pair, whatever its mid source, quotes at Wise's after-fee prices.
         if "wise" not in source_cache:
             source_cache["wise"] = load_price_reference_source("wise")
         # Build one algo per pair because pair sizes/spreads may differ.
@@ -1744,7 +1746,8 @@ def _intents_for_runtime(
     ref = runtime.oracle.get(
         runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
     )
-    # Build the fixed-spread quote from the latest source mid.
+    # Build the size and a mid-based placeholder quote (its prices are replaced
+    # by Wise's below; the mid still drives return orders).
     quote = dispatch_quote(runtime.algo, runtime.info, ref.rate)
     # Debug-only per-pair quote trace for operators and audits.
     log.debug(
@@ -1760,14 +1763,18 @@ def _intents_for_runtime(
         ref.source,
         f" stale_age={ref.age_s:.0f}s" if ref.stale else "",
     )
-    # Flatten the two-sided quote into concrete order intents.
+    # Flatten the two-sided quote into concrete order intents, and price them
+    # at Wise's after-fee rates for their size.
     intents = _intents_from_quote(
         runtime.config.market, runtime.info, quote, expiration)
+    intents = _at_wise_prices(intents, runtime, now=now, log=log)
     if position is not None:
         intents = _with_return_order(
             intents, runtime, position, config, now=now, log=log)
     intents = _within_limits(intents, runtime.info, budgets, funds, log)
-    intents = _outside_settlement(intents, runtime, now=now, log=log)
+    # Sizes are final now; Wise's fees fall with size, so price them again
+    # (a reply for an unchanged size is reused, not re-requested).
+    intents = _at_wise_prices(intents, runtime, now=now, log=log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
     return intents
@@ -1894,29 +1901,32 @@ def _within_limits(
     return out
 
 
-def _outside_settlement(
+def _at_wise_prices(
     intents: list[OrderIntent],
     runtime: PairRuntime,
     *,
     now: float,
     log: logging.Logger,
 ) -> list[OrderIntent]:
-    """Keep each order outside what settling its own size through Wise costs.
+    """Price each normal order at what converting its own size through Wise costs.
 
-    A bid is never above Wise's after-fee rate for converting its size of base
-    into quote, and an ask never below Wise's after-fee cost of buying its size
-    of base. These rates follow Wise's live mid, so a daily mid that the market
-    has moved away from cannot put a quote through the live market. Whichever
-    of this and the order's own price is further from mid wins; sizes are final
-    (after budget and balance trimming, or a return order's position), because
-    Wise's fees fall with size. A bid pushed below the market's minimum
-    notional is dropped. A Wise failure, or a rate older than Wise's freshness
-    window, skips the pair.
+    A bid is placed at Wise's after-fee rate for converting its size of base
+    into quote, and an ask at Wise's after-fee cost of buying its size of base:
+    a taker gets what converting through Wise would give. Wise's rates follow
+    its live mid, so the quotes do too, whatever the daily reference says. Fees
+    fall with size, so this runs again once sizes are final (after budget and
+    balance trimming). Return orders keep their auction price: they walk back
+    to the fill price, which Wise's rate would stop them reaching. A bid that
+    falls below the market's minimum notional is dropped. A Wise failure, or a
+    rate older than Wise's freshness window, skips the pair.
     """
     wise = runtime.settlement
     info = runtime.info
     out: list[OrderIntent] = []
     for intent in intents:
+        if intent.is_return:
+            out.append(intent)
+            continue
         fetch = wise.sell_rate if intent.side == "bid" else wise.buy_rate
         try:
             obs = fetch(runtime.iso_base, runtime.iso_quote, intent.qty_base)
@@ -1931,10 +1941,7 @@ def _outside_settlement(
                 f"{runtime.iso_base}/{runtime.iso_quote}: Wise settlement rate is "
                 f"{age:.0f}s old"
             )
-        if intent.side == "bid":
-            price = min(intent.price, _quantize_price(info, obs.rate, "bid"))
-        else:
-            price = max(intent.price, _quantize_price(info, obs.rate, "ask"))
+        price = _quantize_price(info, obs.rate, intent.side)
         if price == intent.price:
             out.append(intent)
             continue
@@ -1947,13 +1954,13 @@ def _outside_settlement(
             )
         except ValueError as exc:
             log.warning(
-                "%s %s dropped: at Wise's settlement rate it is too small (%s)",
+                "%s %s dropped: at Wise's price it is too small (%s)",
                 intent.market, intent.side, exc,
             )
             continue
         log.debug(
-            "%s %s moved from %s to Wise's settlement rate %s for %s",
-            intent.market, intent.side, fmt(intent.price), fmt(price), fmt(intent.qty_base),
+            "%s %s at Wise's price %s for %s (mid-based %s)",
+            intent.market, intent.side, fmt(price), fmt(intent.qty_base), fmt(intent.price),
         )
         out.append(replace(intent, price=price))
     return out
@@ -2019,7 +2026,7 @@ def _with_return_order(
         fmt(position.net_base),
         fmt(position.price),
     )
-    returning = replace(normal, qty_base=qty, price=price)
+    returning = replace(normal, qty_base=qty, price=price, is_return=True)
     return [returning if intent is normal else intent for intent in intents]
 
 

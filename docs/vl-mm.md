@@ -1,12 +1,15 @@
 # Virtual Liquidity Market Maker
 
-`rotor mm vl` is a fixed-spread, cadence-based Sera VL runner. Each tick:
+`rotor mm vl` is a cadence-based Sera VL runner that quotes at Wise's after-fee
+prices. Each tick:
 
 1. Reads the fills of its live quotes and of every placed order not yet settled.
    Fully filled orders stop being tracked, and positions are brought up to date.
 2. Fetches the latest source mid for every configured pair.
-3. Builds one bid and one ask at `fixed_bps` from the mid. A market with an open
-   position quotes its return order on that side instead.
+3. Places one bid at Wise's after-fee rate for converting that order's size of
+   the base token into the quote token, and one ask at Wise's after-fee cost of
+   buying that size. A market with an open position quotes its return order on
+   that side instead.
 4. Cancels tracked old placements when the local cancel guard permits.
 5. Places the fresh quote set, using VL for eligible same-spent-token groups,
    recording every order for settlement before it is sent.
@@ -18,16 +21,16 @@ filled ask leaves it short of them. Rotor records that as a per-market
 **position** (net base quantity, size-weighted fill price, size-weighted fill
 time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
 
-- The return order replaces the normal order on that side. It starts at the
-  normal opposite quote at fill time (`2 x fixed_bps` from the fill price) and
+- The return order replaces the normal order on that side. It starts
+  `2 x fixed_bps` from the fill price and
   walks linearly to the fill price over `return_window_hours` (default 48): a
   reverse Dutch auction that asks for less profit the longer it waits.
 - After the window it **holds at the fill price indefinitely**. Rotor never
   returns a position at a loss against its fill price. Breakeven is measured on
   price alone; any fees or gas a deployment charges are not included.
-- Like every order, it is never inside Wise's after-fee rate for its size (see
-  Config), so in a market that moved against the position it can sit further out
-  than the auction alone would put it.
+- Unlike normal quotes, it is not priced at Wise: it walks inside Wise's
+  after-fee price, back toward the fill price, so the position can return to
+  neutral.
 - It never quotes closer to the latest mid than `return_bps`. If the market moved
   in rotor's favour, the order sits `return_bps` from mid instead of overpaying.
 - It never spends more than the normal order it replaces, so a larger position is
@@ -138,18 +141,19 @@ Rules:
 - A pair's source sets its mid. `ecb`, `fed`, and `bnm` publish daily
   reference rates; `wise` (for currencies none of them covers) uses the
   midpoint of Wise's after-fee sell and buy rates for the pair's `qty_base`.
-- Every pair is also kept outside Wise's after-fee rates for each order's own
-  size, after budget and balance trimming (a return order: its position's
-  size). A bid is never above what converting that much of the base token
-  through Wise pays, and an ask never below what buying it costs, by the
-  cheapest enabled transfer method that does not involve a Wise balance. Wise's
-  fees fall with size: about 25-80 bps on majors at a few thousand dollars.
-  Wise's rates are live, so a daily mid the market has moved away from cannot
-  put a quote through the market. A Wise rate older than 10 minutes, or no
+- Every pair's normal quotes are placed at Wise's after-fee prices for each
+  order's own final size (after budget and balance trimming): a bid at what
+  converting that much of the base token through Wise pays, an ask at what
+  buying it through Wise costs, by the cheapest enabled transfer method that
+  does not involve a Wise balance. A taker on Sera gets what converting through
+  Wise would give. Wise's fees fall with size: about 25-80 bps each way on majors
+  at a few thousand dollars. Wise's rates are live, so quotes follow the live
+  market whatever the daily mid says. A Wise rate older than 10 minutes, or no
   answer at all (a reply up to that old is reused), skips the pair.
-- `fixed_bps` (global or per pair) is the least distance a quote sits from mid:
-  each side takes whichever is further, `fixed_bps` or Wise. Lower it to quote
-  tighter wherever Wise allows; Wise's rate is the floor.
+- The mid sets how close a return order may come (`return_bps`) and how far its
+  auction starts; normal quotes do not use it.
+- `fixed_bps` (global or per pair) sets where a return order starts after a
+  fill: `2 x fixed_bps` from the fill price. It does not move normal quotes.
 - `return_bps` must be positive. It is the closest a return order quotes to mid.
 - `return_window_hours` must be positive (default 48).
 

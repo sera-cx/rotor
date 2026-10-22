@@ -100,10 +100,10 @@ class _SequencedSource:
         )
 
 
-    # Also stands in for Wise's after-fee settlement rates: fresh, at the latest
-    # rate quoted, with these fees (none by default, so they move no order).
-    sell_fee = Decimal("0")
-    buy_fee = Decimal("0")
+    # Also stands in for Wise's after-fee rates, where normal quotes are placed:
+    # fresh, at the latest rate quoted, 50 bps each way by default.
+    sell_fee = Decimal("0.0050")
+    buy_fee = Decimal("0.0050")
     default_max_age_s = 600.0
 
     def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
@@ -554,12 +554,10 @@ def test_a_mainnet_run_refuses_the_state_file_of_a_testnet_run(monkeypatch, tmp_
         store.close()
 
 
-def test_run_keeps_normal_and_return_orders_outside_wises_settlement_rates(
-    monkeypatch, tmp_path,
-):
-    # Buying SGD through Wise costs 80 bps, wider than the 50 bps quote. The
-    # normal ask and, after tick 1's XSGD bid fills, the return ask both sit at
-    # Wise's cost of buying that size back; bids keep their 50 bps.
+def test_run_quotes_at_wise_prices_and_returns_through_the_auction(monkeypatch, tmp_path):
+    # Wise: selling SGD costs 50 bps, buying it 80 bps. Normal quotes sit at
+    # those prices; after tick 1's XSGD bid fills at 0.9950, the return ask
+    # follows the auction instead, inside Wise's price, back toward the fill.
     client = _FakeClient(fill_first_xsgd_bid=True)
     source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
     source.buy_fee = Decimal("0.0080")
@@ -571,8 +569,8 @@ def test_run_keeps_normal_and_return_orders_outside_wises_settlement_rates(
 
     assert _xsgd_asks(client)[:2] == [
         (Decimal("10"), Decimal("1.0080")),
-        # The auction alone would ask 1.0025 for the 5 XSGD bought at 0.9950.
-        (Decimal("5"), Decimal("1.0080")),
+        # A quarter of the window gone: 0.9950 x (1 + 100 bps x 3/4).
+        (Decimal("5"), Decimal("1.0025")),
     ]
     xsgd_bids = [
         leg["price"] for batch in client.batch_places for leg in batch["legs"]

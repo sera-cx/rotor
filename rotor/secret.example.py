@@ -24,7 +24,7 @@ ROTOR_STATE_PATH = ".rotor_state.sqlite"
 # Price source: "wise", "ecb", "fed", or "bnm".
 # VL pairs configure their source in TOML; this value is the fallback.
 PRICE_REFERENCE_SOURCE = "wise"
-# Wise supplies the after-fee rates every pair is kept outside of. The token is
+# Wise supplies the after-fee prices every pair's normal quotes sit at. The token is
 # optional; it only raises Wise's rate limits.
 WISE_API_TOKEN = ""
 # Wise endpoint root; useful to override in tests or regional deployments.

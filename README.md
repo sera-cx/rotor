@@ -68,13 +68,12 @@ raises Wise's rate limits); `fed` (the official FRED API) needs a free
 daily reference rates, and `wise` (for currencies none of them covers) uses the
 midpoint of Wise's after-fee sell and buy rates for the pair's size.
 
-Every pair, whatever its source, is also kept outside Wise's after-fee rates
-for each order's own size: a bid is never above what converting that much of the
-base token through Wise pays, and an ask never below what buying it through Wise
-costs, by the cheapest enabled transfer method that does not involve a Wise
-balance. Each side takes whichever is further from mid: `fixed_bps` or Wise.
-Wise's rates are live, so a daily mid the market has moved away from cannot put
-a quote through the market.
+Every pair's normal quotes, whatever its source, are placed at Wise's after-fee
+prices for each order's own size: a bid at what converting that much of the base
+token through Wise pays, an ask at what buying it through Wise costs, by the
+cheapest enabled transfer method that does not involve a Wise balance. Wise's
+rates are live, so quotes follow the live market. The mid and `fixed_bps` shape
+the return orders that bring a position back after a fill.
 
 ## Run
 
