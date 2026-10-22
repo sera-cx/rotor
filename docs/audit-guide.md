@@ -40,6 +40,8 @@ poetry check
 Pricing:
 
 - All price, size, budget, and rate math uses `Decimal`.
+- Tokens are priced at their currency's reference rate (Sera's 1:1 stablecoin
+  assumption); rotor reads no token market price, so a depeg is not detected.
 - The source rate is quote-per-base. `wise` prices the pair's size via the Wise
   quotes API and returns the fee-inclusive effective rate for that amount; the
   other sources (`ecb`/`fed`/`bnm`/`mas`) are pure mid/reference rates.

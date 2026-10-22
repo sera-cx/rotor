@@ -68,6 +68,16 @@ orders, or orders placed by an older rotor version. A position on a market that 
 no longer configured is kept but not quoted. Deleting the state file forgets
 every position.
 
+### Stablecoin pegs
+
+Sera treats every stablecoin as worth exactly one unit of its currency, and
+rotor prices it the same way: each token is quoted at its currency's reference
+rate (AUDD at AUD, USDT at USD), never at its own market price, which rotor
+does not read. If a stablecoin loses its peg, rotor keeps bidding for it at the
+currency's rate, so sellers can sell it to rotor above its market price; the
+position that leaves is held at its fill price until the peg returns, and is
+not recovered if the token never re-pegs. Budgets cap what each tick can spend.
+
 ## Config
 
 ```toml
