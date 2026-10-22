@@ -25,7 +25,7 @@ export SERA_BASE_URL="https://api.testnet.sera.cx/api/v1"  # must be https
 export SERA_API_KEY="..."
 export SERA_API_SECRET="..."
 export SERA_PRIVATE_KEY="0x..."
-export WISE_API_TOKEN="..."   # for price_source = wise
+export WISE_API_TOKEN="..."   # optional: raises Wise rate limits for price_source = wise
 export FRED_API_KEY="..."     # for price_source = fed (free FRED API key)
 ```
 
@@ -61,9 +61,10 @@ qty_base = "1000"
 fixed_bps = "40"
 ```
 
-Supported FX sources are `wise`, `ecb`, `fed`, `bnm`, and `mas`. `ecb`, `bnm`,
-and `mas` are keyless; `wise` needs `WISE_API_TOKEN` and `fed` (the official
-FRED API) needs a free `FRED_API_KEY`. `wise` prices the pair's size through the
+Supported FX sources are `wise`, `ecb`, `fed`, `bnm`, and `mas`. `wise`, `ecb`,
+`bnm`, and `mas` work without a key (`WISE_API_TOKEN` is optional and only
+raises Wise's rate limits); `fed` (the official FRED API) needs a free
+`FRED_API_KEY`. `wise` prices the pair's size through the
 Wise quotes API, so its benchmark is the fee-inclusive effective rate for that
 amount; the other sources are pure mid rates.
 

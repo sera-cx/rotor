@@ -13,5 +13,5 @@ Files:
 
 Provider-specific FX reference notes live in `rotor/price_reference/README.md`;
 the current supported source names are `wise`, `ecb`, `fed`, `bnm`, and `mas`.
-`ecb`, `bnm`, and `mas` are keyless; `wise` needs `WISE_API_TOKEN` and `fed`
-needs a free `FRED_API_KEY`. Live source checks live in `tests/live/`.
+`wise`, `ecb`, `bnm`, and `mas` work without a key (`WISE_API_TOKEN` is
+optional); `fed` needs a free `FRED_API_KEY`. Live source checks live in `tests/live/`.

@@ -12,7 +12,7 @@ default), so it consumes them directly.
 
 Register each secret using the **exact** name from
 [`.env.manus.example`](../.env.manus.example) — copy the names verbatim. The
-required set for a live deployment using the `wise` price source is:
+required set for a live deployment is:
 
 | Secret name | Purpose |
 | --- | --- |
@@ -20,7 +20,7 @@ required set for a live deployment using the `wise` price source is:
 | `SERA_API_KEY` | Sera API key |
 | `SERA_API_SECRET` | Sera API secret |
 | `SERA_PRIVATE_KEY` | maker signing key (`0x…`) — most sensitive |
-| `WISE_API_TOKEN` | Wise quotes API token |
+| `WISE_API_TOKEN` | (optional) Wise quotes API token; raises rate limits |
 | `ROTOR_STATE_PATH` | (recommended) unresolved-state DB path; one per wallet and network |
 
 Add `FRED_API_KEY` only if a pair uses `price_source = fed`, and `TELEGRAM_*`
@@ -35,7 +35,7 @@ common case).
 **Verify in the sandbox** once secrets are set:
 
 ```bash
-poetry run python -c "from rotor.config import get_config as g; [print(n, 'OK' if g(n) else 'MISSING') for n in ['SERA_BASE_URL','SERA_API_KEY','SERA_API_SECRET','SERA_PRIVATE_KEY','WISE_API_TOKEN']]"
+poetry run python -c "from rotor.config import get_config as g; [print(n, 'OK' if g(n) else 'MISSING') for n in ['SERA_BASE_URL','SERA_API_KEY','SERA_API_SECRET','SERA_PRIVATE_KEY']]"
 ```
 
 ## Run mode — scheduled fire-once

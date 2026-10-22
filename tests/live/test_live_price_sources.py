@@ -3,9 +3,10 @@
 These hit real external endpoints, so they are skipped unless
 ``ROTOR_RUN_LIVE_PRICES=1``. Two groups:
 
-  * Public (keyless): ECB (XML), Bank Negara Malaysia, data.gov.sg (MAS).
-  * Credentialed: ``fed`` (FRED API — needs ``FRED_API_KEY``) and ``wise``
-    (needs ``WISE_API_TOKEN``); each is skipped unless its key is configured.
+  * Public (keyless): ECB (XML), Bank Negara Malaysia, data.gov.sg (MAS), and
+    Wise (anonymous quotes; ``WISE_API_TOKEN`` is used if set).
+  * Credentialed: ``fed`` (FRED API — needs ``FRED_API_KEY``); skipped unless
+    its key is configured.
 
 Run them with::
 
@@ -81,15 +82,16 @@ PUBLIC_CASES = [
     ("ecb", "EUR", "USD", Decimal("0.7"), Decimal("1.7")),
     ("bnm", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
     ("mas", "USD", "SGD", Decimal("0.9"), Decimal("2.0")),
+    # Wise prices anonymous quotes; WISE_API_TOKEN only raises its limits.
+    ("wise", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
 ]
 
 # Sources that need a credential. fed uses the FRED API (the legacy fredgraph.csv
-# scrape endpoint is bot-walled); wise needs its API token. Skipped unless the
-# corresponding key is configured.
+# scrape endpoint is bot-walled). Skipped unless the corresponding key is
+# configured.
 CREDENTIALED_CASES = [
     ("fed", "FRED_API_KEY", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
     ("fed", "FRED_API_KEY", "EUR", "USD", Decimal("0.7"), Decimal("1.7")),
-    ("wise", "WISE_API_TOKEN", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
 ]
 
 

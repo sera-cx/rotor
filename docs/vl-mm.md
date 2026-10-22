@@ -127,9 +127,10 @@ Rules:
   other pairs quote; rotor refuses to start only if Sera lists none of them.
   A running rotor re-checks this hourly (see [Sera Changes While
   Running](#sera-changes-while-running)).
-- `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `wise` needs
-  `WISE_API_TOKEN` and `fed` (the official FRED API) needs a free `FRED_API_KEY`;
-  `ecb`, `bnm`, and `mas` are keyless.
+- `price_source` is `wise`, `ecb`, `fed`, `bnm`, or `mas`. `fed` (the official
+  FRED API) needs a free `FRED_API_KEY`; the others work without a key.
+  `WISE_API_TOKEN` is optional: Wise prices anonymous quotes too, and a token
+  only raises its rate limits.
 - `wise` is amount-aware: it prices a Wise quote for the pair's `qty_base` and
   uses the **fee-inclusive effective rate** for the cheapest enabled payment
   method, so its benchmark already reflects Wise's conversion cost at that size.

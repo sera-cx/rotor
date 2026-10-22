@@ -18,7 +18,8 @@ Files:
 Available sources:
 
 - `wise`: Wise quotes API (`POST /v3/quotes`), priced for the worked amount.
-  Needs `WISE_API_TOKEN`. Unlike the reference feeds below, its rate is the
+  Works without a key; `WISE_API_TOKEN` is optional and only raises Wise's
+  rate limits. Unlike the reference feeds below, its rate is the
   **fee-inclusive effective rate** (`targetAmount / sourceAmount`) for the
   cheapest enabled payment method, so it moves with the trade size. Pin a method
   with `WISE_PAY_IN`/`WISE_PAY_OUT`; set a fallback size with
@@ -76,7 +77,7 @@ Environment config:
 
 ```bash
 export PRICE_REFERENCE_SOURCE="wise"   # wise, ecb, fed, bnm, or mas
-export WISE_API_TOKEN="..."            # required for the wise source
+export WISE_API_TOKEN="..."            # optional: higher Wise rate limits
 export WISE_PAY_IN="BALANCE"           # optional: pin Wise payment method
 export FRED_API_KEY="..."              # required for the fed source
 export FED_H10_SERIES_JSON='{"EUR":"DEXUSEU","MYR":"DEXMAUS","SGD":"DEXSIUS"}'

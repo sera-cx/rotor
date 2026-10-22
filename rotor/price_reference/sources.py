@@ -65,7 +65,8 @@ class WiseRateSource:
     `sourceAmount`, so the benchmark reflects Wise's fee for the actual amount,
     not just the mid-market rate. The effective quote-per-base rate is
     `targetAmount / sourceAmount` for the cheapest enabled payment option (or a
-    pinned `payIn`/`payOut`). Requires `WISE_API_TOKEN`.
+    pinned `payIn`/`payOut`). `WISE_API_TOKEN` is optional: Wise prices quotes
+    for anonymous callers too, with tighter rate limits.
     """
 
     # Source name carried into observations and logs.
@@ -121,10 +122,11 @@ class WiseRateSource:
         self, base: str, quote: str, *, amount: Decimal | None = None
     ) -> PriceObservation:
         """Create a Wise quote for `amount` and return the effective rate."""
-        # The quotes API is authenticated; a token is mandatory.
+        # Wise answers anonymous quote requests too; a token only raises limits.
         token = str(get_config(self.token_env, "") or "").strip()
-        if not token:
-            raise ValueError("WISE_API_TOKEN is required for the wise price source")
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         # Use the worked size; fall back to the configured default if absent.
         source_amount = _positive_decimal(
             amount if amount is not None else self.default_amount
@@ -132,10 +134,7 @@ class WiseRateSource:
         # Create an (un-profiled) quote priced for this exact source amount.
         response = self._http.post(
             f"{self.base_url}/v3/quotes",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json={
                 "sourceCurrency": base.upper(),
                 "targetCurrency": quote.upper(),

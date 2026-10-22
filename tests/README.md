@@ -32,8 +32,8 @@ Run non-mutating real testnet checks explicitly:
 ROTOR_RUN_TESTNET=1 poetry run python -m pytest -q tests/testnet
 ```
 
-Run the opt-in live FX source checks explicitly (set `FRED_API_KEY` /
-`WISE_API_TOKEN` to also cover those sources):
+Run the opt-in live FX source checks explicitly (set `FRED_API_KEY` to also
+cover the `fed` source):
 
 ```bash
 make live-prices   # ROTOR_RUN_LIVE_PRICES=1 pytest -q tests/live

@@ -127,13 +127,25 @@ def test_wise_source_uses_default_amount_when_none_given(monkeypatch):
     assert seen["body"]["sourceAmount"] == 500.0
 
 
-def test_wise_source_requires_token(monkeypatch):
+def test_wise_source_quotes_without_a_token(monkeypatch):
+    # Wise prices anonymous quote requests; the token is optional.
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json=_wise_quote_response([
+            {"payIn": "BANK_TRANSFER", "payOut": "BANK_TRANSFER",
+             "sourceAmount": 1000, "targetAmount": 740.0, "disabled": False},
+        ]))
+
     monkeypatch.delenv("WISE_API_TOKEN", raising=False)
     monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
-    src = WiseRateSource()
+    src = WiseRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
 
-    with pytest.raises(ValueError, match="WISE_API_TOKEN"):
-        src.quote("SGD", "USD")
+    obs = src.quote("SGD", "USD", amount=Decimal("1000"))
+
+    assert seen["auth"] is None
+    assert obs.rate == Decimal("0.74")
 
 
 def test_ecb_source_crosses_rates_through_eur():
