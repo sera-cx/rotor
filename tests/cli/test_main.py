@@ -141,3 +141,17 @@ def test_check_config_loads_the_runner_and_config_without_the_wallet(
     assert "config ok" in capsys.readouterr().out
     assert cli.main(["mm", "vl", "--config", str(bad), "--check-config"]) == 1
     assert "'mas' was removed" in capsys.readouterr().err
+
+
+def test_an_unexpected_unlock_failure_prints_only_its_type(monkeypatch, capsys):
+    secret = "0x" + "ab" * 32
+
+    def unlock():
+        raise RuntimeError(f"something about {secret}")
+
+    monkeypatch.setattr(wallet_key, "unlock", unlock)
+
+    assert cli.main(["mm", "vl", "--config", "vl.toml"]) == 1
+    err = capsys.readouterr().err
+    assert "could not unlock the wallet (RuntimeError)" in err
+    assert secret not in err

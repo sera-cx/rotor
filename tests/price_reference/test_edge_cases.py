@@ -269,3 +269,24 @@ def test_a_bnm_reply_without_dates_is_a_failed_read_not_a_fresh_rate():
 
     with pytest.raises(ValueError, match="no usable publication date"):
         src.quote("SGD", "USD")
+
+
+def test_a_fred_error_never_carries_the_api_key():
+    import traceback
+
+    from rotor.price_reference.sources import FedH10RateSource
+
+    secret = "fredkey0123456789abcdef01234567"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error_message": "boom"})
+
+    src = FedH10RateSource(
+        api_key=secret, http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(RuntimeError) as raised:
+        src.quote("SGD", "USD")
+
+    printed = "".join(traceback.format_exception(raised.value))
+    assert secret not in printed
+    assert "<FRED_API_KEY>" in printed and "HTTPStatusError" in printed

@@ -119,10 +119,11 @@ def _private_key_and_address(
         # Enforce the expected string shape before handing it to eth-account.
         _validate_private_key(private_key)
         account = Account.from_key(private_key)
-    except Exception as exc:
-        # Re-raise as the caller-selected public error type while preserving the
-        # original exception for debugging.
-        raise error_cls(f"{label} is not a valid private key") from exc
+    except Exception:
+        # Re-raise as the caller-selected public error type, dropping the
+        # original: its message can quote the key (int()'s "invalid literal"
+        # does), and a printed traceback would show it.
+        raise error_cls(f"{label} is not a valid private key") from None
     # Store the original private key string and the checksum address derived by
     # eth-account.
     return private_key, account.address
@@ -137,7 +138,8 @@ def _validate_private_key(private_key: str) -> None:
     # the zero key and derive a deterministic, non-controllable address.
     try:
         scalar = int(private_key, 16)
-    except ValueError as exc:
-        raise ValueError("private key must be 0x-prefixed 64-hex-char string") from exc
+    except ValueError:
+        # int()'s own message quotes the whole value; never chain it.
+        raise ValueError("private key must be 0x-prefixed 64-hex-char string") from None
     if not (1 <= scalar < SECP256K1_N):
         raise ValueError("private key is not a valid secp256k1 scalar in [1, n)")

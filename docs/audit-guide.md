@@ -183,6 +183,10 @@ Sera signing and API:
 - `SERA_API_KEY`/`SERA_API_SECRET` are trimmed, and one still holding whitespace
   or a control character is refused at startup by name, never by value (the
   HTTP library would otherwise quote the rejected header, secret included).
+- An invalid `SERA_PRIVATE_KEY` raises without a chained cause (`from None`),
+  since int()'s message would quote it; any other unlock failure prints only
+  its type. FRED takes its key in the URL, so FRED errors are re-raised with
+  the key replaced by `<FRED_API_KEY>`.
 - API keys stay in headers; private keys, bearer tokens, signatures, and API
   secrets must not appear in logs.
 

@@ -373,17 +373,25 @@ class FedH10RateSource:
             )
         # Request the most recent observations, newest first, and use the first
         # usable (non-".") value — the very latest day may be unpublished.
-        response = self._http.get(
-            self.base_url,
-            params={
-                "series_id": series,
-                "api_key": self.api_key,
-                "file_type": "json",
-                "sort_order": "desc",
-                "limit": 10,
-            },
-        )
-        response.raise_for_status()
+        try:
+            response = self._http.get(
+                self.base_url,
+                params={
+                    "series_id": series,
+                    "api_key": self.api_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 10,
+                },
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            # FRED takes the key in the URL, and httpx's errors quote the URL;
+            # these messages reach logs and Telegram alerts.
+            raise RuntimeError(
+                f"FRED {series} request failed ({type(exc).__name__}): "
+                + str(exc).replace(self.api_key, "<FRED_API_KEY>")
+            ) from None
         date, raw_rate = _parse_fred_observations(response.json(), series)
         rate = _positive_decimal(raw_rate)
         if self._usd_per_unit[currency]:

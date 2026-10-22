@@ -69,6 +69,11 @@ def _unlock_wallet() -> bool:
         # Avoid printing the bad private key value.
         print("error: invalid SERA_PRIVATE_KEY", file=sys.stderr)
         return False
+    except Exception as exc:
+        # Anything else: name the error type only; its message or traceback
+        # could carry the key.
+        print(f"error: could not unlock the wallet ({type(exc).__name__})", file=sys.stderr)
+        return False
 
 
 def build_parser() -> argparse.ArgumentParser:

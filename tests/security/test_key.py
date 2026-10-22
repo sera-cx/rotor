@@ -93,3 +93,25 @@ class TestTypedDataSigning:
         )
         recovered = Account.recover_message(signable, signature=signature)
         assert recovered.lower() == addr.lower()
+
+
+@pytest.mark.parametrize("bad", [
+    "0x" + "zz" * 32,          # right length, not hex: int() quotes it
+    "0x" + "00" * 32,          # the zero scalar
+    "0x" + "ff" * 32,          # past the curve order
+])
+def test_an_invalid_key_never_appears_in_the_error_or_its_traceback(monkeypatch, bad):
+    import traceback
+
+    from rotor import config as config_module
+
+    wallet_key.lock()
+    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
+    monkeypatch.setenv("SERA_PRIVATE_KEY", bad)
+
+    with pytest.raises(wallet_key.InvalidPrivateKey) as raised:
+        wallet_key.unlock()
+
+    printed = "".join(traceback.format_exception(raised.value))
+    assert bad not in printed and bad[2:] not in printed
+    assert "SERA_PRIVATE_KEY is not a valid private key" in printed
