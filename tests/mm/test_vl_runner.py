@@ -148,12 +148,13 @@ def _priced(intents, wise, info=None):
     return vr._at_wise_prices(intents, runtime, now=NOW, log=LOG)
 
 
-def _vl_config(*, return_bps: str = "2", budget: str = "1000") -> VLConfig:
+def _vl_config(*, return_bps: str = "2", budget: str = "1000", window: str = "48") -> VLConfig:
     return VLConfig(
         budgets=[BudgetConfig("USDC", Decimal(budget))],
         pairs=[],
         fixed_bps=Decimal("50"),
         return_bps=Decimal(return_bps),
+        return_window_hours=Decimal(window),
     )
 
 
@@ -166,12 +167,12 @@ def _normal_quote(mid: str = "1.0000") -> list[OrderIntent]:
     ]
 
 
-def _with_return(position, intents, *, now, info=None, return_bps="2"):
+def _with_return(position, intents, *, now, info=None, return_bps="2", window="48"):
     return vr._with_return_order(
         intents,
         _runtime(info),
         position,
-        _vl_config(return_bps=return_bps),
+        _vl_config(return_bps=return_bps, window=window),
         now=now,
         log=LOG,
     )
@@ -195,6 +196,19 @@ def test_short_position_swaps_the_bid_for_a_return_bid_and_keeps_the_ask():
     # Everything except size and price is the normal bid's.
     assert (bid.spent_token, bid.expiration, bid.benchmark_rate) == (
         intents[0].spent_token, intents[0].expiration, intents[0].benchmark_rate)
+
+
+def test_the_return_window_setting_sets_how_fast_the_auction_walks():
+    # 12 h into a 24 h window is halfway: 1.0050 x (1 - 100 bps x 0.5). (Mid
+    # 1.0100 keeps the return_bps limit out of the way.)
+    position = Position(Decimal("-40"), Decimal("1.0050"), 0.0)
+
+    bid, _ask = _with_return(position, _normal_quote("1.0100"), now=12 * HOUR, window="24")
+    assert bid.price == Decimal("0.9999")
+
+    # The default 48 h window is only a quarter through.
+    bid, _ask = _with_return(position, _normal_quote("1.0100"), now=12 * HOUR)
+    assert bid.price == Decimal("0.9974")
 
 
 def test_return_order_holds_at_the_fill_price_while_the_market_stays_away():

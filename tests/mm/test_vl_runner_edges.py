@@ -6,6 +6,7 @@ import logging
 import sqlite3
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from rotor.mm import vl_runner as vr
@@ -772,3 +773,36 @@ def test_placing_goes_ahead_after_a_few_seconds_if_a_cancel_lingers():
     vr._wait_until_gone(client, {"o-1"}, logging.getLogger("test"), stop=stop, polls=4)
 
     assert (client.calls, stop.waits) == (4, 4)
+
+
+class _FlakyOpenOrders:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    def get_open_orders(self):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise httpx.ConnectError("blip")
+        return [{"symbol": "XSGD/USDC", "side": "bid", "trade_id": "mine", "uuid_int": "7"}]
+
+
+def test_reattach_retries_a_blip_then_reads_sera():
+    client, stop = _FlakyOpenOrders(failures=2), _CountingStop()
+
+    placements = vr._load_live_placements(
+        client, {"XSGD/USDC"}, logging.getLogger("test"), stop=stop, known={"mine"})
+
+    assert (client.calls, stop.waits) == (3, 2)
+    assert [order.order_id for placement in placements for order in placement.orders] == ["mine"]
+
+
+def test_reattach_falls_back_to_local_state_when_sera_stays_unreachable():
+    stored = [vr.LivePlacement(kind="standalone", spent_token="USDC",
+                               orders=[LiveOrder("bid", "stored", 1, 0.0)], placed_at=0.0)]
+
+    placements = vr._load_live_placements(
+        _FlakyOpenOrders(failures=99), {"XSGD/USDC"}, logging.getLogger("test"),
+        stop=_CountingStop(), fallback=stored)
+
+    assert placements == stored

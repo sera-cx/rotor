@@ -129,6 +129,8 @@ class _SequencedSource:
 class _StopFlag:
     def __init__(self) -> None:
         self.requested = False
+        # Every wait the runner asked for, in seconds (returns at once here).
+        self.waits: list[float] = []
 
     def install(self) -> None:
         return None
@@ -136,7 +138,8 @@ class _StopFlag:
     def request(self) -> None:
         self.requested = True
 
-    def wait(self, _timeout: float) -> bool:
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
         return self.requested
 
     forced = False
@@ -187,6 +190,8 @@ class _FakeClient:
         self.send_errors: list[Exception] = []
         # Raised by send_vl_batch() before the batch reaches Sera, one per call.
         self.unsent_errors: list[Exception] = []
+        # Seconds Sera's clock is ahead of the local one (negative: behind).
+        self.server_offset = 0.0
         # Markets Sera rejects orders for as not active (still listed).
         self.inactive_markets: set[str] = set()
         self.inactive_rejections: list[str] = []
@@ -212,8 +217,9 @@ class _FakeClient:
 
     def expiration_from_server_time(self, order_ttl_seconds: int) -> int:
         self.events.append(("expiration", order_ttl_seconds))
-        # Sera's clock follows the local one, which tests may fake.
-        return int(time.time()) + order_ttl_seconds
+        # Sera's clock follows the local one (which tests may fake), offset
+        # by server_offset seconds.
+        return int(time.time() + self.server_offset) + order_ttl_seconds
 
     def sign_vl_batch(self, legs) -> SignedVLBatch:
         self._batch_count += 1
@@ -348,7 +354,10 @@ class _FakeClient:
         if not self.cancel_ok:
             return False
         self.active_orders.discard(order_id)
-        self.open_orders = [row for row in self.open_orders if row.get("order_id") != order_id]
+        self.open_orders = [
+            row for row in self.open_orders
+            if (row.get("trade_id") or row.get("order_id")) != order_id
+        ]
         return True
 
 
@@ -1486,9 +1495,10 @@ def _remember(state_path, order_id: str, market: str = "XSGD/USDC") -> None:
 
 
 _OLD_ORDER = {
+    # GET /orders' documented shape: trades[] rows keyed by trade_id.
     "symbol": "XSGD/USDC",
     "side": "bid",
-    "order_id": "old-order",
+    "trade_id": "old-order",
     "uuid_int": "42",
     "created_at": "2026-01-01T00:00:00Z",
 }
@@ -1949,3 +1959,70 @@ def test_an_unexpected_error_that_ends_the_loop_is_alerted(monkeypatch):
     assert alerts and all(important for _text, important in alerts)
     # Nothing was sent that the ledger could not record.
     assert client.batch_places == [] and client.standalone_places == []
+
+
+def test_the_cancel_guard_skips_a_tick_too_soon_after_placing(monkeypatch):
+    # With a 300 s guard, a tick 100 s after placing would wait 200 s, more
+    # than the 60 s rotor will wait, so it skips: no cancel, no new set.
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[100.0, 1.0])
+
+    vr.run(config_path="vl.toml", min_requote_seconds=300.0, state_path=":memory:")
+
+    assert [markets != set() for markets in _markets_quoted_per_tick(client)] == [True, False]
+    assert not any(event[0].startswith("cancel") for event in client.events)
+
+
+def test_the_cancel_guard_waits_out_a_short_remainder_then_requotes(monkeypatch):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[250.0, 1.0])
+    stop_flag = vr.StopFlag()  # the one fake _fake_clock installed
+
+    vr.run(config_path="vl.toml", min_requote_seconds=300.0, state_path=":memory:")
+
+    # 300 - 250 = 50 s left, under the 60 s limit: wait it out, then requote.
+    assert 50.0 in stop_flag.waits
+    assert [markets != set() for markets in _markets_quoted_per_tick(client)] == [True, True]
+
+
+def test_settlement_follows_seras_clock_not_the_local_one(monkeypatch, tmp_path):
+    # Sera's clock is 10,000 s behind the local one. 306 s after placing, the
+    # filled order has not expired by Sera's clock, so it is not settled yet
+    # (the local clock would wrongly say it expired hours ago); its visible
+    # fill still holds the return side.
+    client = _FakeClient(fill_first_xsgd_bid=True)
+    client.server_offset = -10_000.0
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, log_level="CRITICAL",
+           state_path=tmp_path / "state.sqlite")
+
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        assert store.load_positions() == {}
+    finally:
+        store.close()
+    assert _xsgd_asks(client)[1][0] == Decimal("5")
+
+
+def test_fire_once_never_waits_out_the_boot_cancel_cooldown(monkeypatch, tmp_path):
+    # Its own order from the last fire is still on Sera's cancel cooldown: a
+    # --once fire cancels once and exits, never blocking for 5 minutes.
+    client = _FakeClient(open_orders=[_OLD_ORDER], cancel_ok=False)
+    _remember(tmp_path / "state.sqlite", "old-order")
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    stop = _StopFlag()
+    monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+
+    result = vr.run(config_path="vl.toml", once=True, state_path=tmp_path / "state.sqlite")
+
+    assert result == 1
+    assert ("cancel_order", "old-order", 42) in client.events
+    assert vr.BOOT_CANCEL_RETRY_SECONDS not in stop.waits

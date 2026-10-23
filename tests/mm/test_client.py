@@ -999,3 +999,11 @@ def test_a_bad_sera_base_url_is_refused_without_echoing_it():
                    api_secret="s", base_url=pasted_key)
 
     assert pasted_key not in str(raised.value)
+
+
+def test_nothing_is_signed_before_bootstrap():
+    client = _make_client(_build_mock_routes())
+    client.markets_by_symbol = {}
+
+    with pytest.raises((RuntimeError, KeyError), match="bootstrap"):
+        client.sign_order("MYRC/USDC", "bid", Decimal("1"), Decimal("0.25"), 999)

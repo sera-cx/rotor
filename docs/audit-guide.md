@@ -304,6 +304,7 @@ Highest-signal files:
   was lost, a market deactivated mid-run, metadata refresh, and auto-update
   restart.
 - `tests/mm/test_positions.py`: position netting and the return-order price.
+- `tests/mm/test_grid.py`: price/size grid rounding and Sera's minimum order checks.
 - `tests/mm/test_vl_runner.py`: fill settlement statuses and exactly-once
   counting, return-order sizing, and ledger recording on placement.
 - `tests/mm/test_client.py`: local order building and signing, contract
