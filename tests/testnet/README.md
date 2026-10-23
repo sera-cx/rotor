@@ -38,7 +38,7 @@ ROTOR_RUN_TESTNET_E2E=1 \
 ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
 ROTOR_TESTNET_MARKET=XSGD/USDC \
 ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
-ROTOR_TESTNET_QTY_BASE=1 \
+ROTOR_TESTNET_QTY_BASE=20 \
 ROTOR_TESTNET_PRICE=1 \
 ROTOR_TESTNET_MAKER_PRIVATE_KEY=0x... \
 ROTOR_TESTNET_MAKER_API_KEY=... \
@@ -68,7 +68,7 @@ ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
 ROTOR_TESTNET_MARKET=XSGD/USDC \
 ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
 ROTOR_TESTNET_MID=1 \
-ROTOR_TESTNET_QTY_BASE=1 \
+ROTOR_TESTNET_QTY_BASE=20 \
 ROTOR_TESTNET_MAKER_PRIVATE_KEY=0x... \
 ROTOR_TESTNET_MAKER_API_KEY=... \
 ROTOR_TESTNET_MAKER_API_SECRET=... \
@@ -84,7 +84,9 @@ uses the taker wallet between ticks to fill one maker side. It verifies both
 `bid -> return ask` and `ask -> return bid` behavior, including fill polling,
 cancel-first requote, the return order's auction price and size (normal quotes
 sit at a stand-in Wise fee, `ROTOR_TESTNET_WISE_FEE_BPS`, default 20), and VL
-grouping when the configured markets share the spent token. Expect about 15
+grouping when the configured markets share the spent token. The size must meet
+both markets' minimums: Sepolia's `CADC/USDC` needs asks of at least 12.11
+CADC, so a size of 1 would skip that pair. Expect about 15
 minutes per direction: three ticks 305 s apart, then a wait for Sera's cancel
 cooldown on exit.
 

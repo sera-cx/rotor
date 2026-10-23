@@ -35,7 +35,7 @@ ECB_RATES_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
 FRED_API_KEY = ""
 FRED_API_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 FED_H10_SERIES_JSON = {"EUR": "DEXUSEU", "MYR": "DEXMAUS", "SGD": "DEXSIUS"}
-# Bank Negara Malaysia publishes MYR-crossed exchange rates here.
+# Bank Negara Malaysia publishes MYR-crossed FX rates here.
 BNM_EXCHANGE_RATE_BASE_URL = "https://api.bnm.gov.my/public/exchange-rate"
 
 # Optional mapping for tokens whose market symbols differ from ISO currency

@@ -18,4 +18,5 @@ Files and folders:
   single-instance lock on the SQLite state, drops orders Sera reports as gone,
   and (with `--telegram`) alerts on a quoting stall and while pairs quote on
   carried-forward daily rates.
-- `exchange/`: Sera REST client, EIP-712 payload helpers, and typed API errors.
+- `exchange/`: Sera REST client, EIP-712 payload helpers, and typed API errors
+  (the package name is historical; Sera is a settlement layer).

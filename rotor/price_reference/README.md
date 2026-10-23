@@ -36,7 +36,7 @@ Available sources:
   EUR, GBP, NZD in the H.10 release) and `DEX<cc>US` is units per U.S. dollar;
   a series named neither way is rejected at startup. `FED_H10_SERIES_JSON`
   replaces the built-in list.
-- `bnm`: Bank Negara Malaysia OpenAPI exchange rates, crossed through MYR. Keyless.
+- `bnm`: Bank Negara Malaysia OpenAPI FX rates, crossed through MYR. Keyless.
   `ecb` and `bnm` each publish one list of every currency; it is fetched at
   most once a minute (`DAILY_REUSE_S`) and shared by all pairs, and a failed
   fetch is remembered as long, so a hung feed costs one timeout per tick.

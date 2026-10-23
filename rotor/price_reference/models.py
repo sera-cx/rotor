@@ -20,7 +20,7 @@ class PriceObservation:
     source: str
     # ISO pair in BASE/QUOTE form, e.g. SGD/USD.
     pair: str
-    # Quote-per-base exchange rate represented as Decimal for exact arithmetic.
+    # Quote-per-base FX rate represented as Decimal for exact arithmetic.
     rate: Decimal
     # Observation timestamp as POSIX seconds for freshness checks.
     ts: float
