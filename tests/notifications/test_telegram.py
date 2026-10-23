@@ -179,7 +179,9 @@ def test_async_send_invokes_bot():
     with patch.dict("sys.modules", {"telegram": fake_telegram}):
         assert n._send("hello", channel="normal") is True
     fake_telegram.Bot.assert_called_once_with("tok")
-    fake_bot.send_message.assert_awaited_once_with(chat_id="c", text="hello")
+    # The normal channel is the quiet one: no push notification.
+    fake_bot.send_message.assert_awaited_once_with(
+        chat_id="c", text="hello", disable_notification=True)
 
 
 def test_async_send_missing_dependency_degrades(caplog):
@@ -190,3 +192,20 @@ def test_async_send_missing_dependency_degrades(caplog):
             assert n._send("hello", channel="normal") is True
     assert any(
         "python-telegram-bot not installed" in r.message for r in caplog.records)
+
+
+def test_only_the_important_channel_notifies():
+    n = TelegramNotifier(token="t", normal_chat_id="normal", important_chat_id="loud")
+    n._dry_run = False
+    with patch.object(n, "_async_send", new=AsyncMock()) as send:
+        n.send_raw("boom", important=True)
+    assert [(c.args[1], c.kwargs["silent"]) for c in send.call_args_list] == [
+        ("normal", True), ("loud", False)]
+
+
+def test_an_important_message_is_sent_once_when_there_is_one_chat():
+    n = TelegramNotifier(token="t", normal_chat_id="normal", important_chat_id="")
+    n._dry_run = False
+    with patch.object(n, "_async_send", new=AsyncMock()) as send:
+        n.send_raw("boom", important=True)
+    assert [(c.args[1], c.kwargs["silent"]) for c in send.call_args_list] == [("normal", False)]

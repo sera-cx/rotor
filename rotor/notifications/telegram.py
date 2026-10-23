@@ -3,11 +3,12 @@
 A small three-channel notifier the market-maker runners can use to push
 operational alerts to a phone:
 
-  * NORMAL channel    — routine lifecycle chatter (startup, requotes,
-                        shutdown). Silent / read-at-your-own-pace.
-  * IMPORTANT channel — errors and anything that needs a human now. Loud
-                        push notification + sound. Falls back to the normal
-                        channel when no important chat is configured.
+  * NORMAL channel    — routine lifecycle messages (startup, shutdown,
+                        recoveries). Sent silently (no push notification).
+  * IMPORTANT channel — errors and anything that needs a human now. The
+                        only channel that pushes a notification. With no
+                        important chat configured, important messages go
+                        once to the normal chat, with the notification.
   * DEBUG channel     — heartbeat keep-alive only. Falls back to the normal
                         channel when no debug chat is configured.
 
@@ -184,6 +185,10 @@ class TelegramNotifier:
         # Debug messages are not duplicated into normal/important channels.
         if debug:
             self._send(text, channel="debug")
+        elif important and not self._important_chat_id:
+            # With no separate important chat both channels are the same chat:
+            # one message, with the important channel's notification.
+            self._send(text, channel="important")
         else:
             # Important messages still go to normal so the full timeline exists
             # in one channel.
@@ -231,7 +236,8 @@ class TelegramNotifier:
         try:
             # The public notifier API is sync, so run the async Telegram send
             # inside a short-lived event loop.
-            asyncio.run(self._async_send(text, chat_id))
+            # Only the important channel pushes a notification.
+            asyncio.run(self._async_send(text, chat_id, silent=channel != "important"))
             return True
         except Exception as e:
             # Telegram failures must NOT take down the MM loop.
@@ -244,7 +250,7 @@ class TelegramNotifier:
             )
             return False
 
-    async def _async_send(self, text: str, chat_id: str) -> None:
+    async def _async_send(self, text: str, chat_id: str, *, silent: bool = False) -> None:
         """Perform the actual `python-telegram-bot` `send_message` call.
 
         The `import telegram` is local so the rest of the package imports
@@ -262,4 +268,4 @@ class TelegramNotifier:
         bot = telegram.Bot(self._token)
         async with bot:
             # Plain-text send; no markdown/HTML parsing is requested.
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(chat_id=chat_id, text=text, disable_notification=silent)

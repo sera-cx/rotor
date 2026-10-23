@@ -1400,19 +1400,9 @@ def run(
             if state is not None:
                 state.replace_active(live)
             if placed:
-                # A fresh quote set went out: reset the stall watchdog.
+                # A fresh quote set went out: reset the stall watchdog. (No
+                # message per tick: the stall alert reports a run of failures.)
                 watchdog.quoted()
-                if notifier is not None:
-                    notifier.notify_quote(
-                        "VL",
-                        bid="-",
-                        ask="-",
-                        qty=str(len(intents)),
-                        benchmark="multi",
-                    )
-            elif notifier is not None:
-                notifier.notify_error(
-                    "place VL quote", RuntimeError("VL placement failed"))
             if once:
                 return 0 if placed else 1
             sleep_remaining(tick_started, poll_seconds, stop)
