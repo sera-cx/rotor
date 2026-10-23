@@ -4,8 +4,9 @@ VL market-making runtime and shared quote helpers.
 
 Files and folders:
 
-- `quote_engine.py`: shared helpers for building the fixed-spread algo/client,
-  formatting log values, handling signals, and tracking live orders.
+- `grid.py`: Sera's price/size grids and minimum order checks (pure Decimal).
+- `quote_engine.py`: shared helpers for building the client, formatting log
+  values, handling signals, and tracking live orders.
 - `vl_config.py`: TOML loader and validator for VL strategy config.
 - `positions.py`: pure position netting from fills and the return-order price
   (reverse Dutch auction to the fill price, then hold).

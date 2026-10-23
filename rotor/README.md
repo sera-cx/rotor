@@ -7,7 +7,6 @@ Files and folders:
 - `config.py`: environment-first config helpers with `.env` loading and optional
   untracked `rotor/secret.py` fallback.
 - `secret.example.py`: safe template for Python file-based local config.
-- `algo/`: pure fixed-spread quote logic.
 - `cli/`: argparse command tree for `rotor mm vl`.
 - `mm/`: VL runner, TOML config loader, and Sera exchange integration.
 - `notifications/`: optional Telegram lifecycle/error notifications.

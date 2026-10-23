@@ -6,13 +6,12 @@ import importlib
 
 PUBLIC_MODULES = [
     "rotor",
-    "rotor.algo",
-    "rotor.algo.simple_market_making",
     "rotor.cli.main",
     "rotor.config",
     "rotor.mm.exchange.client",
     "rotor.mm.exchange.eip712",
     "rotor.mm.exchange.errors",
+    "rotor.mm.grid",
     "rotor.mm.quote_engine",
     "rotor.mm.vl_config",
     "rotor.mm.vl_runner",

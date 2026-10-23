@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from rotor.algo import BPS
+from rotor.mm.grid import BPS
 
 
 @dataclass(frozen=True)

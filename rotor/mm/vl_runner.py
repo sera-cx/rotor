@@ -26,14 +26,6 @@ try:  # pragma: no cover - POSIX-only single-instance lock.
 except ImportError:  # pragma: no cover - non-POSIX fallback (no flock).
     fcntl = None
 
-from rotor.algo import QuoteSet
-
-# Return orders use the same grid rounding and minimum checks as normal quotes.
-from rotor.algo.simple_market_making import (
-    _quantize_price,
-    _quantize_qty,
-    _validate_minimums,
-)
 from rotor.config import get_config
 from rotor.mm.exchange import errors
 from rotor.mm.exchange.client import (
@@ -43,20 +35,16 @@ from rotor.mm.exchange.client import (
     VLBatchResult,
     VLLeg,
 )
+from rotor.mm.grid import quantize_price, quantize_qty, validate_minimums
 from rotor.mm.positions import Position, apply_fill, return_price
 from rotor.mm.quote_engine import (
     LiveOrder,
     StopFlag,
     all_requote_safe,
-    build_algo,
     build_client,
     fmt,
-    fmt_optional,
     parse_ts,
     sleep_remaining,
-)
-from rotor.mm.quote_engine import (
-    quote as dispatch_quote,
 )
 from rotor.mm.vl_config import PairConfig, VLConfig, load_vl_config
 from rotor.notifications import TelegramNotifier
@@ -130,8 +118,6 @@ class PairRuntime:
     config: PairConfig
     # Sera market metadata from the bootstrapped client.
     info: object
-    # Pure quote algorithm configured for this pair.
-    algo: object
     # Freshness-checking price oracle for this pair's reference source.
     oracle: ReferencePriceOracle
     # ISO currency symbols used by the reference oracle.
@@ -1745,17 +1731,11 @@ def _build_runtimes(
         # Every pair, whatever its mid source, quotes at Wise's after-fee prices.
         if "wise" not in source_cache:
             source_cache["wise"] = load_price_reference_source("wise")
-        # Build one algo per pair because pair sizes/spreads may differ.
-        algo = build_algo(
-            qty_base=pair.qty_base,
-            fixed_bps=pair.fixed_bps,
-        )
         # Store all runtime dependencies needed by the tick builder.
         runtimes.append(
             PairRuntime(
                 config=pair,
                 info=info,
-                algo=algo,
                 oracle=ReferencePriceOracle(
                     source, max_age_s=max_reference_age_s, carry_stale=carry_stale),
                 iso_base=iso_base,
@@ -1909,27 +1889,18 @@ def _intents_for_runtime(
         ref = _wise_mid(runtime, exc, now=now)
         if refs is not None:
             refs.fallback[runtime.config.market] = exc
-    # Build the size and a mid-based placeholder quote (its prices are replaced
-    # by Wise's below; the mid still drives return orders).
-    quote = dispatch_quote(runtime.algo, runtime.info, ref.rate)
-    # Debug-only per-pair quote trace for operators and audits.
+    # Debug-only per-pair trace for operators and audits.
     log.debug(
-        "%s algo=%s benchmark=%s fixed_bps=%s bid=%s ask=%s qty=%s "
-        "src=%s%s",
+        "%s mid=%s src=%s qty=%s%s",
         runtime.config.market,
-        runtime.algo.name,
-        fmt(quote.benchmark_rate),
-        fmt(quote.fixed_bps),
-        fmt_optional(quote.bid_price),
-        fmt_optional(quote.ask_price),
-        fmt(quote.qty_base),
+        fmt(ref.rate),
         ref.source,
+        fmt(runtime.config.qty_base),
         f" stale_age={ref.age_s:.0f}s" if ref.stale else "",
     )
-    # Flatten the two-sided quote into concrete order intents, and price them
-    # at Wise's after-fee rates for their size.
-    intents = _intents_from_quote(
-        runtime.config.market, runtime.info, quote, expiration)
+    # One bid and one ask of the configured size, priced at Wise's after-fee
+    # rates for that size.
+    intents = _normal_intents(runtime, ref.rate, expiration)
     intents = _at_wise_prices(intents, runtime, now=now, log=log)
     if position is not None:
         intents = _with_return_order(
@@ -1943,41 +1914,37 @@ def _intents_for_runtime(
     return intents
 
 
-def _intents_from_quote(
-    market: str,
-    info,
-    quote: QuoteSet,
-    expiration: int,
-) -> list[OrderIntent]:
-    """Convert a quote set into zero, one, or two order intents."""
-    out: list[OrderIntent] = []
-    if quote.bid_price is not None:
+def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list[OrderIntent]:
+    """One bid and one ask of the pair's size; prices are set at Wise's rates next.
+
+    A size below the market's minimum (checked at mid) skips the pair.
+    """
+    info = runtime.info
+    qty = quantize_qty(info, runtime.config.qty_base)
+    validate_minimums(info, qty, mid, None)
+    validate_minimums(info, qty, None, mid)
+    return [
         # A bid spends quote tokens and buys base.
-        out.append(
-            OrderIntent(
-                market=market,
-                side="bid",
-                qty_base=quote.qty_base,
-                price=quote.bid_price,
-                expiration=expiration,
-                spent_token=info.quote_symbol.upper(),
-                benchmark_rate=quote.benchmark_rate,
-            )
-        )
-    if quote.ask_price is not None:
+        OrderIntent(
+            market=runtime.config.market,
+            side="bid",
+            qty_base=qty,
+            price=mid,
+            expiration=expiration,
+            spent_token=info.quote_symbol.upper(),
+            benchmark_rate=mid,
+        ),
         # An ask spends/sells base tokens and receives quote.
-        out.append(
-            OrderIntent(
-                market=market,
-                side="ask",
-                qty_base=quote.qty_base,
-                price=quote.ask_price,
-                expiration=expiration,
-                spent_token=info.base_symbol.upper(),
-                benchmark_rate=quote.benchmark_rate,
-            )
-        )
-    return out
+        OrderIntent(
+            market=runtime.config.market,
+            side="ask",
+            qty_base=qty,
+            price=mid,
+            expiration=expiration,
+            spent_token=info.base_symbol.upper(),
+            benchmark_rate=mid,
+        ),
+    ]
 
 
 def _read_funds(client: SeraClient, log: logging.Logger) -> dict[str, Decimal] | None:
@@ -2041,9 +2008,9 @@ def _within_limits(
             )
             continue
         # A bid spends quote tokens (qty x price); an ask spends base tokens (qty).
-        qty = _quantize_qty(info, limit if intent.side == "ask" else limit / intent.price)
+        qty = quantize_qty(info, limit if intent.side == "ask" else limit / intent.price)
         try:
-            _validate_minimums(
+            validate_minimums(
                 info,
                 qty,
                 intent.price if intent.side == "bid" else None,
@@ -2119,12 +2086,12 @@ def _at_wise_prices(
                 f"{runtime.iso_base}/{runtime.iso_quote}: Wise settlement rate is "
                 f"{age:.0f}s old"
             )
-        price = _quantize_price(info, obs.rate, intent.side)
+        price = quantize_price(info, obs.rate, intent.side)
         if price == intent.price:
             out.append(intent)
             continue
         try:
-            _validate_minimums(
+            validate_minimums(
                 info,
                 intent.qty_base,
                 price if intent.side == "bid" else None,
@@ -2182,14 +2149,14 @@ def _with_return_order(
         window_seconds=float(config.return_window_hours) * 3600.0,
     )
     # Bids round down and asks round up, so rounding never crosses the fill price.
-    price = _quantize_price(info, target, side)
+    price = quantize_price(info, target, side)
     if price <= 0:
         return intents
     # A bid spends quote tokens (qty x price); an ask spends base tokens (qty).
     limit = normal.qty_base if side == "ask" else normal.qty_base * normal.price / price
-    qty = _quantize_qty(info, min(abs(position.net_base), limit))
+    qty = quantize_qty(info, min(abs(position.net_base), limit))
     try:
-        _validate_minimums(
+        validate_minimums(
             info,
             qty,
             price if side == "bid" else None,

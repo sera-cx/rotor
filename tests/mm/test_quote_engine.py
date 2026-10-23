@@ -27,18 +27,6 @@ def _market() -> MarketInfo:
     )
 
 
-def test_build_algo_returns_simple_algo():
-    algo = qe.build_algo(
-        qty_base=Decimal("100"),
-        fixed_bps=Decimal("8"),
-    )
-
-    quote = qe.quote(algo, _market(), Decimal("1"))
-    assert algo.name == "simple_market_making"
-    assert quote.bid_price == Decimal("0.9992")
-    assert quote.ask_price == Decimal("1.0008")
-
-
 def test_build_client_dry_run_uses_zero_address_when_wallet_locked(monkeypatch):
     wallet_key.lock()
     monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
@@ -90,8 +78,6 @@ def test_parse_ts_returns_none_for_bad_values():
 
 def test_fmt_helpers_are_compact():
     assert qe.fmt(Decimal("100.000")) == "100"
-    assert qe.fmt_optional(None) == "-"
-    assert qe.fmt_optional(Decimal("1.2300")) == "1.23"
 
 
 def test_stop_flag_request_and_wait():

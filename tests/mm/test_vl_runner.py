@@ -107,7 +107,6 @@ def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
             fixed_bps=Decimal("50"),
         ),
         info=info or _market(),
-        algo=None,
         oracle=None,
         iso_base="SGD",
         iso_quote="USD",

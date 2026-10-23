@@ -25,6 +25,7 @@ from rotor.mm.exchange.client import (
     SignedVLBatch,
     VLBatchResult,
 )
+from rotor.mm.grid import quantize_price
 from rotor.mm.positions import return_price
 from rotor.mm.quote_engine import StopFlag
 from rotor.price_reference.models import PriceObservation
@@ -572,13 +573,13 @@ def test_testnet_vl_runner_fill_then_return_requote(
             position, mid, fixed_bps=fixed_bps, return_bps=return_bps,
             now=order.placed_at, window_seconds=48 * 3600.0,
         )
-        return vr._quantize_price(target_info, target, return_side)
+        return quantize_price(target_info, target, return_side)
 
     later = [
         order for order in maker.placed_orders
         if order.market == target_market and order.side == return_side and order.tick > 1
     ]
-    normal_price = vr._quantize_price(
+    normal_price = quantize_price(
         target_info,
         mid * (1 + wise_fee_bps / 10000 if return_side == "ask" else 1 - wise_fee_bps / 10000),
         return_side,

@@ -10,11 +10,6 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 
-from rotor.algo import (
-    QuoteSet,
-    SimpleMarketMakingAlgo,
-    SimpleMarketMakingConfig,
-)
 from rotor.config import get_config
 from rotor.mm.exchange.client import SeraClient
 from rotor.security import key as wallet_key
@@ -38,26 +33,6 @@ class LiveOrder:
     market: str = ""
     # Original base-token size when locally known; used to prune full fills.
     qty_base: Decimal | None = None
-
-
-def build_algo(
-    *,
-    qty_base: Decimal,
-    fixed_bps: Decimal,
-) -> SimpleMarketMakingAlgo:
-    """Build the fixed-spread quote algo used by the VL runner."""
-    return SimpleMarketMakingAlgo(
-        SimpleMarketMakingConfig(qty_base=qty_base, fixed_bps=fixed_bps)
-    )
-
-
-def quote(
-    algo,
-    info,
-    benchmark_rate: Decimal,
-) -> QuoteSet:
-    """Build a simple fixed-spread quote around the latest benchmark mid."""
-    return algo.quote(info, benchmark_rate)
 
 
 def build_client(*, dry_run: bool, log: logging.Logger) -> SeraClient:
@@ -134,12 +109,6 @@ def fmt(value: Decimal) -> str:
     """Format a Decimal compactly for logs."""
     # normalize() removes exponent noise; "f" keeps fixed-point output.
     return format(value.normalize(), "f")
-
-
-def fmt_optional(value: Decimal | None) -> str:
-    """Format a possibly-absent Decimal for logs."""
-    # A dash makes intentionally missing quote sides easy to scan in logs.
-    return "-" if value is None else fmt(value)
 
 
 class StopFlag:

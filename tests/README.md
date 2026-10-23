@@ -4,7 +4,6 @@ Pytest coverage for the package.
 
 Folders:
 
-- `algo/`: pure fixed-spread quote tests.
 - `cli/`: parser, command dispatch, and wallet gating tests.
 - `mm/`: Sera client, EIP-712, VL config, and VL runner tests.
 - `notifications/`: optional Telegram notifier tests.

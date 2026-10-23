@@ -20,7 +20,7 @@ Read these files in order:
 4. `rotor/mm/vl_config.py`
 5. `rotor/mm/vl_runner.py`
 6. `rotor/mm/positions.py`
-7. `rotor/mm/quote_engine.py`
+7. `rotor/mm/grid.py` and `rotor/mm/quote_engine.py`
 8. `rotor/mm/exchange/client.py`
 9. `rotor/mm/exchange/eip712.py`
 10. `rotor/security/key.py`
@@ -276,7 +276,6 @@ Logging:
 ## Focused Test Map
 
 ```bash
-poetry run python -m pytest -q tests/algo
 poetry run python -m pytest -q tests/cli
 poetry run python -m pytest -q tests/mm
 poetry run python -m pytest -q tests/notifications
