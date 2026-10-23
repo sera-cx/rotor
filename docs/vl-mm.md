@@ -105,9 +105,9 @@ price_source = "wise"
 qty_base = "2000"
 
 [[pair]]
-market = "EURC/USDC"
+market = "JPYC/USDC"
 price_source = "ecb"
-qty_base = "1000"
+qty_base = "300000"
 fixed_bps = "40"
 ```
 
@@ -129,13 +129,14 @@ Rules:
   bids on `X/USDC` and no asks until a fill leaves it holding `X`. If the
   balances cannot be read, budgets alone apply.
 - Markets cannot be duplicated, including inverse duplicates.
-- Sera lists each pair in one orientation (e.g. `USDC/EURC`, not `EURC/USDC`);
-  use the symbol `GET /markets` returns. A configured market Sera does not list
+- Sera lists each pair in one orientation, and it can differ between networks
+  (Sepolia lists `USDC/EURC` and `CADC/USDC`; mainnet lists `EURC/USDC` and
+  `USDC/CADC`); use the symbol that network's `GET /markets` returns. A configured market Sera does not list
   is skipped with a warning (and a Telegram alert with `--telegram`) while the
   other pairs quote; rotor refuses to start only if Sera lists none of them.
   A running rotor re-checks this hourly (see [Sera Changes While
   Running](#sera-changes-while-running)).
-- `price_source` is `wise`, `ecb`, `fed`, or `bnm` (`mas` was removed: MAS
+- `price_source` is `wise` (the default), `ecb`, `fed`, or `bnm` (`mas` was removed: MAS
   publishes no public daily rate API; ECB and BNM both publish SGD). `fed` (the official
   FRED API) needs a free `FRED_API_KEY`; the others work without a key.
   `WISE_API_TOKEN` is optional: Wise prices anonymous quotes too, and a token

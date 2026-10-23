@@ -119,3 +119,33 @@ def test_dotenv_does_not_truncate_unquoted_value_with_hash(monkeypatch, tmp_path
     )
 
     assert get_config("ROTOR_SECRET_WITH_HASH") == "ab cd #ef"
+
+
+def test_a_real_prefixed_variable_beats_a_dotenv_line_even_a_blank_one(monkeypatch, tmp_path):
+    # .env.example ships blank SERA_* lines and suggests ROTOR_ENV_PREFIX there.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SERA_API_KEY", raising=False)
+    monkeypatch.delenv("ROTOR_ENV_PREFIX", raising=False)
+    monkeypatch.setenv("MANUS_SERA_API_KEY", "from-manus")
+    monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
+    (tmp_path / ".env").write_text("ROTOR_ENV_PREFIX=MANUS_\nSERA_API_KEY=\n", encoding="utf-8")
+
+    assert get_config("SERA_API_KEY") == "from-manus"
+    # .env no longer leaks into the process environment.
+    assert "SERA_API_KEY" not in __import__("os").environ
+
+
+@pytest.mark.parametrize(("line", "value"), [
+    ('KEY="https://api.sera.cx/api/v1"  # mainnet', "https://api.sera.cx/api/v1"),
+    ("KEY='tok en'#note", "tok en"),
+    ('KEY="quoted"', "quoted"),
+    ('KEY="unterminated # still verbatim', '"unterminated # still verbatim'),
+    ('KEY="a" b', '"a" b'),
+])
+def test_a_comment_after_a_quoted_value_is_dropped(monkeypatch, tmp_path, line, value):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("KEY", raising=False)
+    monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
+    (tmp_path / ".env").write_text(line + "\n", encoding="utf-8")
+
+    assert get_config("KEY") == value

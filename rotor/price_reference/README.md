@@ -85,7 +85,6 @@ The bot maps token markets to fiat ISO pairs before pricing:
 Environment config:
 
 ```bash
-export PRICE_REFERENCE_SOURCE="wise"   # wise, ecb, fed, or bnm
 export WISE_API_TOKEN="..."            # optional: higher Wise rate limits
 export FRED_API_KEY="..."              # required for the fed source
 export FED_H10_SERIES_JSON='{"EUR":"DEXUSEU","MYR":"DEXMAUS","SGD":"DEXSIUS"}'
@@ -97,7 +96,6 @@ The same `KEY=VALUE` lines can be placed in a root `.env`. Optional local
 `rotor/secret.py` config remains a Python fallback:
 
 ```python
-PRICE_REFERENCE_SOURCE = "wise"
 WISE_API_TOKEN = "..."
 WISE_BASE_URL = "https://api.wise.com"
 ECB_RATES_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"

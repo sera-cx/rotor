@@ -12,8 +12,8 @@ from rotor.price_reference.sources import (
 )
 
 
-def load_price_reference_source(name: str | None = None) -> RateSource:
-    """Return one explicitly named FX source.
+def load_price_reference_source(name: str) -> RateSource:
+    """Return the FX source a pair's `price_source` names.
 
     Each source applies its own default staleness window (intraday for Wise,
     daily for the official references). An operator can override any source's
@@ -22,9 +22,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
     comes from `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`;
     Wise is intraday and never carries a stale quote, so neither applies to it.
     """
-    # CLI-provided names override config; default to Wise for fresher live-ish
-    # FX data when no explicit source is configured.
-    source_name = str(name or get_config("PRICE_REFERENCE_SOURCE", "wise")).lower()
+    source_name = str(name).lower()
     if source_name == "wise":
         # Base URL is configurable so tests/deployments can point at mocks or
         # alternate Wise environments.
@@ -40,7 +38,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
             max_age_s=_max_age_override("ECB"),
             max_carry_age_s=_max_carry_age_override("ECB"),
         )
-    if source_name in {"fed", "h10", "fed_h10"}:
+    if source_name == "fed":
         return FedH10RateSource(
             base_url=_url("FRED_API_BASE_URL", "https://api.stlouisfed.org/fred/series/observations"),
             api_key=str(get_config("FRED_API_KEY", "") or ""),
@@ -58,7 +56,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
             max_carry_age_s=_max_carry_age_override("BNM"),
         )
     # Keep accepted source names closed so misspellings fail loudly.
-    raise ValueError("PRICE_REFERENCE_SOURCE must be one of: wise, ecb, fed, bnm")
+    raise ValueError(f"price source {name!r} must be one of: wise, ecb, fed, bnm")
 
 
 def _max_age_override(prefix: str) -> float | None:

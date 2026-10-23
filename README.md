@@ -12,6 +12,9 @@ until it fills. See [docs/vl-mm.md](docs/vl-mm.md#returning-fills).
 
 ## Install
 
+Rotor needs Poetry 2 or newer (Poetry 1.x cannot read its `pyproject.toml`);
+check with `poetry --version`, and upgrade with `pipx install 'poetry>=2'`.
+
 ```bash
 poetry install
 ```
@@ -55,9 +58,9 @@ price_source = "wise"
 qty_base = "2000"
 
 [[pair]]
-market = "EURC/USDC"
+market = "JPYC/USDC"
 price_source = "ecb"
-qty_base = "1000"
+qty_base = "300000"
 fixed_bps = "40"
 ```
 

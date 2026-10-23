@@ -68,11 +68,14 @@ ehthumbs.db
 Thumbs.db
 desktop.ini
 
-# rotor-specific
+# rotor-specific: anything that can hold a key or secret
 rotor/secret.py
-rotor/secret_local.py
+rotor/secret_*.py
 .env
-.env.local
+.env.*
+!.env.example
+!.env.manus.example
+wallet.enc*
 *.pem
 *.key
 

@@ -21,9 +21,7 @@ SERA_PRIVATE_KEY = ""
 # Tiny unresolved-state DB. This is not trade history.
 ROTOR_STATE_PATH = ".rotor_state.sqlite"
 
-# Price source: "wise", "ecb", "fed", or "bnm".
-# VL pairs configure their source in TOML; this value is the fallback.
-PRICE_REFERENCE_SOURCE = "wise"
+# Each [[pair]] picks its price source in the TOML config (`wise` when omitted).
 # Wise supplies the after-fee prices every pair's normal quotes sit at. The token is
 # optional; it only raises Wise's rate limits.
 WISE_API_TOKEN = ""
