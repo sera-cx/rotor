@@ -600,6 +600,41 @@ def test_get_order_fills_follows_pagination():
     client.close()
 
 
+def _paged_client(handler) -> SeraClient:
+    client = SeraClient(owner_address=OWNER, signer=_stub_signer, api_key="k",
+                        api_secret="s", base_url="https://api.sera.cx/api/v1")
+    client._http.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    client._sleep = lambda _seconds: None
+    return client
+
+
+def test_get_order_fills_fails_rather_than_undercount_past_its_page_cap():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [{"quantity": "1"}] * 100})
+
+    with pytest.raises(RuntimeError, match="more than 200 fills"):
+        _paged_client(handler).get_order_fills("o1", max_pages=2)
+
+
+def test_get_open_orders_reads_every_page_up_to_total():
+    offsets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offset = int(request.url.params["offset"])
+        offsets.append(offset)
+        rows = [{"trade_id": f"t{offset + i}"} for i in range(2 if offset < 4 else 1)]
+        return httpx.Response(200, json={"trades": rows, "total": 5})
+
+    client = _paged_client(handler)
+
+    assert [row["trade_id"] for row in client.get_open_orders(page_limit=2)] == [
+        "t0", "t1", "t2", "t3", "t4"]
+    assert offsets == [0, 2, 4]
+    with pytest.raises(RuntimeError, match="more than 4 open orders"):
+        client.get_open_orders(page_limit=2, max_pages=2)
+
+
 def test_from_response_cooldown_classification_prefers_typed_code():
     # Typed cancel-cooldown code → cooldown.
     cooldown = errors_mod.from_response(

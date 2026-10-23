@@ -128,7 +128,9 @@ Live order lifecycle:
   positions, and open stale-reference alerts; resolved rows are pruned instead of
   retained as history. Positions persist until returned.
 - Each live cadence replaces the tracked quote set; old placements are cancelled
-  before fresh placements.
+  before fresh placements, and rotor then waits (up to about 5 s,
+  `_wait_until_gone`) until Sera no longer lists them, because Sera applies a
+  cancel after acknowledging it and a VL batch holds its budget until then.
 - If the newest tracked order clears the cancel-cooldown guard within 60 seconds,
   the tick waits for it; otherwise the tick is skipped.
 - Cancel cooldowns keep local tracking for later retry, but an order Sera reports
@@ -179,7 +181,8 @@ Sera signing and API:
   array-typed fields left for `eth-account`).
 - `uuid_int` packing rejects out-of-range executor and leg values.
 - Cancel signatures use the packed order id or VL batch id expected by Sera.
-- Order fills are paginated, so a high-fill order's quantity is not undercounted.
+- Order fills and open orders are paginated. Past the page cap (5,000 fills,
+  10,000 open orders) the read fails instead of returning a partial list.
 - API-key requests are paced to Sera's documented per-wallet limits (reads
   10/s, trades 5/s, cancels 2/s). A rate-limit 429 is retried (twice, honouring
   Retry-After); a 503 is retried only for requests safe to repeat (GETs,

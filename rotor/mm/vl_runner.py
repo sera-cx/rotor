@@ -78,6 +78,10 @@ from rotor.updater import (
 BOOT_CANCEL_RETRY_SECONDS = 300.0
 # Sera refuses to cancel an order younger than this (HTTP 429 cancel cooldown).
 SERA_CANCEL_COOLDOWN_SECONDS = 300.0
+# After cancelling, how often (and how long apart) rotor checks that the old
+# orders are gone before placing new ones: about 5 s at most.
+CANCEL_SETTLE_POLLS = 10
+CANCEL_SETTLE_INTERVAL_SECONDS = 0.5
 # A position smaller than this share of the normal order on its return side
 # keeps that full normal quote rather than shrinking the side to a dust-sized
 # return order (which can rest for days at its fill price).
@@ -1338,6 +1342,7 @@ def run(
             # fresh ones so the new quotes cannot self-match (STP_BLOCKED) the
             # old ones. If any cancel is still on cooldown, skip this tick.
             if live:
+                cancelled = {order.order_id for placement in live for order in placement.orders}
                 live = _cancel_placements(client, live, log)
                 if state is not None:
                     state.replace_active(live)
@@ -1346,6 +1351,9 @@ def run(
                         return 1
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
+                # Sera answers a cancel before applying it; until it does, the
+                # old batch still holds its budget and could block the new one.
+                _wait_until_gone(client, cancelled, log, stop=stop)
             if stop.requested and cancel_on_exit:
                 # Shutting down to leave nothing resting: placing a fresh set now
                 # would only leave orders Sera will not let us cancel yet.
@@ -2727,6 +2735,38 @@ def _load_live_placements(
     if out and announce:
         log.debug("reattached %d open placement(s)", len(out))
     return out
+
+
+def _wait_until_gone(
+    client: SeraClient,
+    order_ids: set[str],
+    log: logging.Logger,
+    *,
+    stop: StopFlag,
+    polls: int = CANCEL_SETTLE_POLLS,
+    interval: float = CANCEL_SETTLE_INTERVAL_SECONDS,
+) -> None:
+    """Wait (briefly) until cancelled orders no longer show as open on Sera.
+
+    Sera acknowledges a cancel before applying it, and a VL batch keeps its
+    budget frozen until then. Earn wallets hold exactly their budget, so new
+    quotes placed at once can be refused for lack of funds. After `polls`
+    reads rotor places anyway; a refusal then affects only that placement.
+    """
+    for _ in range(polls):
+        try:
+            open_ids = {
+                str(row.get("trade_id") or row.get("order_id"))
+                for row in client.get_open_orders()
+            }
+        except Exception as exc:
+            log.debug("could not confirm cancels before placing: %s", exc)
+            return
+        if not open_ids & order_ids:
+            return
+        if stop.wait(interval):
+            return
+    log.debug("%d cancelled order(s) still open; placing anyway", len(open_ids & order_ids))
 
 
 def _known_order_ids(state: StateStore | None, stored: list[LivePlacement]) -> set[str]:

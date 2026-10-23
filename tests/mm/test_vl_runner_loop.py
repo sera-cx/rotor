@@ -348,6 +348,7 @@ class _FakeClient:
         if not self.cancel_ok:
             return False
         self.active_orders.discard(order_id)
+        self.open_orders = [row for row in self.open_orders if row.get("order_id") != order_id]
         return True
 
 
@@ -1235,6 +1236,40 @@ def test_debug_logging_never_logs_telegram_request_urls(caplog, tmp_path):
     finally:
         for name, level in levels.items():
             logging.getLogger(name).setLevel(level)
+
+
+def test_run_places_the_new_set_only_after_the_cancelled_one_is_gone(monkeypatch):
+    # Sera keeps listing tick 1's batch as open for two reads after rotor
+    # cancels it; tick 2 places only once it is gone.
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+    lingering = {"reads": 0}
+    real_cancel = client.cancel_vl_batch
+
+    def cancel_but_linger(vl_batch_id):
+        ok = real_cancel(vl_batch_id)
+        lingering["rows"] = [{"trade_id": oid} for oid in client.batch_orders[vl_batch_id]]
+        lingering["reads"] = 2
+        return ok
+
+    def open_orders():
+        client.events.append(("open_orders",))
+        if lingering["reads"]:
+            lingering["reads"] -= 1
+            return list(lingering["rows"])
+        return []
+
+    monkeypatch.setattr(client, "cancel_vl_batch", cancel_but_linger)
+    monkeypatch.setattr(client, "get_open_orders", open_orders)
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
+
+    events = [event[0] for event in client.events]
+    cancel = events.index("cancel_vl")
+    place = events.index("place_vl", cancel)
+    assert events[cancel:place].count("open_orders") == 3
 
 
 def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):

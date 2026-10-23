@@ -621,20 +621,41 @@ class SeraClient:
                 )
         return out
 
-    def get_open_orders(self, status: str = "pending") -> list[dict]:
-        """List current open orders for this wallet."""
-        # Authenticated endpoint scoped by owner address and status.
-        body = self._request(
-            "GET",
-            "/orders",
-            params={"owner_address": self.owner_address, "status": status, "limit": 500},
-        )
-        # Older/newer API responses may use trades or orders. A reply with
-        # neither list (an HTML page, an empty body) is not an empty book.
-        for key in ("orders", "trades"):
-            if isinstance(body.get(key), list):
-                return list(body[key])
-        raise RuntimeError("GET /orders returned no orders list")
+    def get_open_orders(
+        self, status: str = "pending", *, page_limit: int = 500, max_pages: int = 20
+    ) -> list[dict]:
+        """List every open order for this wallet, following pagination.
+
+        Callers treat the result as the whole book (orders missing from it are
+        no longer tracked), so a partial list is an error, not an answer.
+        """
+        out: list[dict] = []
+        for page in range(max_pages):
+            # Authenticated endpoint scoped by owner address and status.
+            body = self._request(
+                "GET",
+                "/orders",
+                params={
+                    "owner_address": self.owner_address,
+                    "status": status,
+                    "limit": page_limit,
+                    "offset": page * page_limit,
+                },
+            )
+            # Older/newer API responses may use trades or orders. A reply with
+            # neither list (an HTML page, an empty body) is not an empty book.
+            rows = next(
+                (body[key] for key in ("orders", "trades") if isinstance(body.get(key), list)),
+                None,
+            )
+            if rows is None:
+                raise RuntimeError("GET /orders returned no orders list")
+            out.extend(rows)
+            total = body.get("total")
+            done = len(out) >= total if isinstance(total, int) else len(rows) < page_limit
+            if done or not rows:
+                return out
+        raise RuntimeError(f"GET /orders has more than {max_pages * page_limit} open orders")
 
     def get_order_fills(
         self, order_id: str, *, page_limit: int = 100, max_pages: int = 50
@@ -663,15 +684,11 @@ class SeraClient:
             if len(items) < page_limit:
                 return out
             offset += page_limit
-        # Reaching the cap means there may be more fills than we paged; surface it
-        # so an operator can investigate rather than silently undercounting.
-        self._log.warning(
-            "get_order_fills hit max_pages=%d for order %s (%d fills read)",
-            max_pages,
-            order_id,
-            len(out),
-        )
-        return out
+        # Reaching the cap means there may be more fills than we paged. An
+        # undercount would settle permanently, so the read fails instead (the
+        # order stays unsettled and its market sits out, with an alert).
+        raise RuntimeError(
+            f"GET /fills/{order_id} has more than {max_pages * page_limit} fills")
 
     def _market(self, symbol: str) -> MarketInfo:
         """Return cached market metadata or fail if bootstrap has not loaded it."""

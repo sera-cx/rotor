@@ -733,3 +733,41 @@ def test_a_second_stop_skips_the_wait_and_reports_what_is_left(monkeypatch):
     [(text, important)] = alerts.sent
     assert important and "1 order(s) could not be cancelled" in text
     assert "expire by about 1970-01-01 00:25 UTC" in text
+
+
+class _SlowCancels:
+    """Lists cancelled orders as open for the first `reads` reads."""
+
+    def __init__(self, reads: int) -> None:
+        self.reads = reads
+        self.calls = 0
+
+    def get_open_orders(self):
+        self.calls += 1
+        return [{"trade_id": "o-1"}] if self.calls <= self.reads else [{"trade_id": "other"}]
+
+
+class _CountingStop:
+    def __init__(self) -> None:
+        self.waits = 0
+
+    def wait(self, _timeout: float) -> bool:
+        self.waits += 1
+        return False
+
+
+def test_new_quotes_wait_until_seras_cancels_have_taken_effect():
+    client, stop = _SlowCancels(reads=2), _CountingStop()
+
+    vr._wait_until_gone(client, {"o-1"}, logging.getLogger("test"), stop=stop)
+
+    # Open on two reads, gone on the third: two short waits in between.
+    assert (client.calls, stop.waits) == (3, 2)
+
+
+def test_placing_goes_ahead_after_a_few_seconds_if_a_cancel_lingers():
+    client, stop = _SlowCancels(reads=99), _CountingStop()
+
+    vr._wait_until_gone(client, {"o-1"}, logging.getLogger("test"), stop=stop, polls=4)
+
+    assert (client.calls, stop.waits) == (4, 4)
