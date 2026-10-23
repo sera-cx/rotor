@@ -28,7 +28,9 @@ from rotor.mm.exchange.client import (
 from rotor.mm.grid import quantize_price
 from rotor.mm.positions import return_price
 from rotor.mm.quote_engine import StopFlag
+from rotor.price_reference.config import load_token_to_iso
 from rotor.price_reference.models import PriceObservation
+from rotor.price_reference.symbols import market_to_iso_pair
 
 
 def _flag(name: str) -> bool:
@@ -63,17 +65,17 @@ class _PlacedOrder:
 class _StaticRateSource:
     name = "testnet-static"
 
-    def __init__(self, rate: Decimal, *, wise_fee_bps: Decimal) -> None:
-        self.rate = rate
+    def __init__(self, rates: dict[str, Decimal], *, wise_fee_bps: Decimal) -> None:
+        # Mid per ISO pair ("MYR/USD"), one for each configured market.
+        self.rates = rates
         self.fee = wise_fee_bps / Decimal("10000")
 
     def quote(self, base: str, quote: str, *, amount=None) -> PriceObservation:
-        base = base.upper()
-        quote = quote.upper()
+        pair = f"{base.upper()}/{quote.upper()}"
         return PriceObservation(
             source=self.name,
-            pair=f"{base}/{quote}",
-            rate=self.rate,
+            pair=pair,
+            rate=self.rates[pair],
             ts=time.time(),
         )
 
@@ -393,13 +395,17 @@ def _install_runner_hooks(
     monkeypatch,
     *,
     maker: _RecordingClient,
-    mid: Decimal,
+    mids: dict[str, Decimal],
     wise_fee_bps: Decimal,
     stop: _StopFlag,
     fill_after_first_tick,
     wait_between_ticks: float,
 ) -> None:
-    source = _StaticRateSource(mid, wise_fee_bps=wise_fee_bps)
+    token_to_iso = load_token_to_iso()
+    source = _StaticRateSource(
+        {"/".join(market_to_iso_pair(market, token_to_iso)): mid for market, mid in mids.items()},
+        wise_fee_bps=wise_fee_bps,
+    )
     calls = 0
     # Tick 1 quotes and is filled. Tick 2 quotes the fill back as a return order
     # (from its visible fill, or its settled position once it expired); tick 3
@@ -439,6 +445,8 @@ def test_testnet_vl_runner_fill_then_return_requote(
     target_market = _market(_required_value("ROTOR_TESTNET_MARKET", purpose))
     sibling_market = _market(_required_value("ROTOR_TESTNET_SECOND_MARKET", purpose))
     mid = _decimal("ROTOR_TESTNET_MID", _value("ROTOR_TESTNET_PRICE"), purpose)
+    # Near each market's real rate: testnet bots take quotes far from it.
+    second_mid = _decimal("ROTOR_TESTNET_SECOND_MID", str(mid), purpose)
     qty_base = _decimal("ROTOR_TESTNET_QTY_BASE", None, purpose)
     fixed_bps = _decimal("ROTOR_TESTNET_FIXED_BPS", "50", purpose)
     # Normal quotes sit at this stand-in Wise fee; kept apart from fixed_bps so
@@ -527,7 +535,7 @@ def test_testnet_vl_runner_fill_then_return_requote(
     _install_runner_hooks(
         monkeypatch,
         maker=maker,
-        mid=mid,
+        mids={target_market: mid, sibling_market: second_mid},
         wise_fee_bps=wise_fee_bps,
         stop=stop,
         fill_after_first_tick=fill_after_first_tick,

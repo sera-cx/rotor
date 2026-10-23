@@ -39,7 +39,8 @@ ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
 ROTOR_TESTNET_MARKET=MYRT/USDC \
 ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
 ROTOR_TESTNET_QTY_BASE=20 \
-ROTOR_TESTNET_PRICE=1 \
+ROTOR_TESTNET_PRICE=0.245 \
+ROTOR_TESTNET_SECOND_PRICE=0.714 \
 ROTOR_TESTNET_MAKER_PRIVATE_KEY=0x... \
 ROTOR_TESTNET_MAKER_API_KEY=... \
 ROTOR_TESTNET_MAKER_API_SECRET=... \
@@ -62,6 +63,13 @@ the taker trades with it instead of the maker. `MYRT/USDC` and `CADC/USDC` had
 no outside orders as of 2026-10-23; a `POST /swap/quote` answering
 `no_liquidity` both ways is a quick check.
 
+Price the test orders near each market's real rate too. Something on testnet
+takes mispriced quotes within seconds: in a 2026-10-23 run, an outside wallet
+sold MYRT into a maker bid at 0.998 (MYR is worth about 0.245 USD) and its
+leftover order then filled the taker. The examples use MYR/USD 0.245 and
+CAD/USD 0.714, with a 1% stand-in Wise fee and a 1.5% `fixed_bps` so neither the
+normal quotes nor the return orders land inside a reasonable reference price.
+
 Real placement can leave live testnet orders behind if cancel cooldowns, funding
 problems, or API failures intervene. The E2E test is therefore skipped unless
 both `ROTOR_RUN_TESTNET_E2E=1` and `ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1` are set.
@@ -74,7 +82,10 @@ ROTOR_RUN_TESTNET_SCENARIOS=1 \
 ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
 ROTOR_TESTNET_MARKET=MYRT/USDC \
 ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
-ROTOR_TESTNET_MID=1 \
+ROTOR_TESTNET_MID=0.245 \
+ROTOR_TESTNET_SECOND_MID=0.714 \
+ROTOR_TESTNET_WISE_FEE_BPS=100 \
+ROTOR_TESTNET_FIXED_BPS=150 \
 ROTOR_TESTNET_QTY_BASE=20 \
 ROTOR_TESTNET_MAKER_PRIVATE_KEY=0x... \
 ROTOR_TESTNET_MAKER_API_KEY=... \
@@ -86,7 +97,8 @@ poetry run pytest -q tests/testnet/test_vl_runner_scenarios.py
 ```
 
 The live scenario harness runs the actual VL runner with a deterministic
-test-only mid source, lets the maker place its normal two-sided quote set, then
+test-only mid source (`ROTOR_TESTNET_MID` for the first market,
+`ROTOR_TESTNET_SECOND_MID` for the second, defaulting to the first), lets the maker place its normal two-sided quote set, then
 uses the taker wallet between ticks to fill one maker side. It verifies both
 `bid -> return ask` and `ask -> return bid` behavior, including fill polling,
 cancel-first requote, the return order's auction price and size (normal quotes
