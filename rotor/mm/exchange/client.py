@@ -768,10 +768,10 @@ def _order_wire(
         # Owner and side identify who trades and direction.
         "owner_address": owner_address,
         "side": side,
-        # Plain decimal strings: str() of a Decimal such as 5E+3 keeps the
-        # exponent, which Sera rejects (INVALID_DECIMAL_FORMAT).
-        "amount": format(qty_base, "f"),
-        "price": format(price, "f"),
+        # Canonical decimal strings: Sera rejects an exponent (5E+3) or
+        # trailing zeros (20.000000) as INVALID_DECIMAL_FORMAT.
+        "amount": _canonical_decimal(qty_base),
+        "price": _canonical_decimal(price),
         # Rotor only places limit orders.
         "order_type": "limit",
         # Market token addresses identify the pair; Sera interprets direction
@@ -783,6 +783,11 @@ def _order_wire(
         "uuid_int": str(uuid_int),
         "expiration": int(expiration),
     }
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    """Write `value` as Sera's canonical decimal: "20", "1.00796", "0.000001"."""
+    return format(value.normalize(), "f")
 
 
 def _parse_healthy_executor_id(health: Any) -> int:

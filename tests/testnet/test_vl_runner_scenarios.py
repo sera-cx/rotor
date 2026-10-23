@@ -112,6 +112,11 @@ class _RecordingClient:
     def __getattr__(self, name: str):
         return getattr(self.inner, name)
 
+    def close(self) -> None:
+        # The runner closes its client on exit; the test still needs it to
+        # clean up, and closes `inner` itself afterwards.
+        pass
+
     def sign_vl_batch(self, legs) -> SignedVLBatch:
         batch = self.inner.sign_vl_batch(legs)
         self._legs[batch.vl_batch_id] = list(legs)
@@ -551,6 +556,8 @@ def test_testnet_vl_runner_fill_then_return_requote(
                 taker.cancel_order(taker_record.order_id, taker_record.uuid_int)
             except Exception:  # pragma: no cover - filled taker orders may not cancel.
                 pass
+        maker.inner.close()
+        taker.close()
 
     # The fill settled into a position at the maker order's price.
     maker_order = _first_order(maker, market=target_market, side=maker_side)
@@ -560,7 +567,9 @@ def test_testnet_vl_runner_fill_then_return_requote(
     finally:
         store.close()
     assert position is not None, "the maker fill did not settle into a position"
-    assert position.net_base == (qty_base if maker_side == "bid" else -qty_base)
+    assert position.net_base == (qty_base if maker_side == "bid" else -qty_base), (
+        "the maker's position is not the taker's one fill: other resting orders on "
+        f"{target_market} probably traded with the maker (see tests/testnet/README.md)")
     assert position.price == maker_order.price
 
     # Later ticks quoted it back at the return auction's price for when each

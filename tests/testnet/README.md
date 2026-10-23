@@ -36,7 +36,7 @@ Optional two-wallet maker/taker E2E:
 ROTOR_RUN_TESTNET=1 \
 ROTOR_RUN_TESTNET_E2E=1 \
 ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
-ROTOR_TESTNET_MARKET=XSGD/USDC \
+ROTOR_TESTNET_MARKET=MYRT/USDC \
 ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
 ROTOR_TESTNET_QTY_BASE=20 \
 ROTOR_TESTNET_PRICE=1 \
@@ -55,6 +55,13 @@ both sides. `ROTOR_TESTNET_SECOND_PRICE`, `ROTOR_TESTNET_TAKER_PRICE`,
 `ROTOR_TESTNET_TAKER_QTY_BASE`, `ROTOR_TESTNET_ORDER_TTL`, and
 `ROTOR_TESTNET_FILL_WAIT_SECONDS` are optional overrides.
 
+Pick markets nobody else trades on testnet, so the taker fills the maker and
+not someone else's resting order. Sepolia's `XSGD/USDC` has an outside book near
+the real SGD rate: at a test price of 1 the maker's bid crosses it at once, and
+the taker trades with it instead of the maker. `MYRT/USDC` and `CADC/USDC` had
+no outside orders as of 2026-10-23; a `POST /swap/quote` answering
+`no_liquidity` both ways is a quick check.
+
 Real placement can leave live testnet orders behind if cancel cooldowns, funding
 problems, or API failures intervene. The E2E test is therefore skipped unless
 both `ROTOR_RUN_TESTNET_E2E=1` and `ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1` are set.
@@ -65,7 +72,7 @@ Optional live runner scenarios:
 ROTOR_RUN_TESTNET=1 \
 ROTOR_RUN_TESTNET_SCENARIOS=1 \
 ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
-ROTOR_TESTNET_MARKET=XSGD/USDC \
+ROTOR_TESTNET_MARKET=MYRT/USDC \
 ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
 ROTOR_TESTNET_MID=1 \
 ROTOR_TESTNET_QTY_BASE=20 \

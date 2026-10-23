@@ -80,6 +80,9 @@ def from_response(status_code: int, body: dict) -> SeraError:
         code = envelope.get("error_code") or envelope.get("code")
         # Accept both old/new message key spellings defensively.
         msg = envelope.get("detail") or envelope.get("message") or ""
+        # Validation errors name the field and the value Sera refused.
+        if envelope.get("field"):
+            msg += f" ({envelope['field']}={envelope.get('submitted')!r})"
     else:
         # Non-dict detail bodies still get surfaced as text.
         code = None

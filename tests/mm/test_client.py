@@ -630,6 +630,24 @@ def test_order_amounts_go_on_the_wire_as_plain_decimals():
     assert (order.wire["amount"], order.wire["price"]) == ("5000", "0.25")
 
 
+def test_order_amounts_go_on_the_wire_without_trailing_zeros():
+    # A size taken from fills keeps their 18 decimals through the grid
+    # rounding, and Sera rejects "20.000000" as INVALID_DECIMAL_FORMAT.
+    client = _make_client(_build_mock_routes())
+    client.bootstrap()
+
+    order = client.build_order(
+        "MYRC/USDC", "ask", Decimal("20.000000"), Decimal("1.007960"), 999)
+    fine = client.build_order(
+        "MYRC/USDC", "ask", Decimal("0.000001"), Decimal("1E+2"), 999)
+
+    assert (order.wire["amount"], order.wire["price"]) == ("20", "1.00796")
+    assert (fine.wire["amount"], fine.wire["price"]) == ("0.000001", "100")
+    assert order.struct == client.build_order(
+        "MYRC/USDC", "ask", Decimal("20"), Decimal("1.00796"), 999,
+        order_id=order.order_id).struct
+
+
 def test_get_order_fills_fails_rather_than_undercount_past_its_page_cap():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"items": [{"quantity": "1"}] * 100})
@@ -671,6 +689,16 @@ def test_from_response_cooldown_classification_prefers_typed_code():
     # No typed code: fall back to the message substring.
     legacy = errors_mod.from_response(429, {"detail": "please wait, cooldown active"})
     assert isinstance(legacy, errors_mod.SeraCancelCooldown)
+
+
+def test_from_response_names_the_refused_field():
+    # Sera's 422 body as captured from testnet.
+    exc = errors_mod.from_response(422, {"detail": {
+        "detail": "Invalid request", "error_code": "INVALID_DECIMAL_FORMAT",
+        "field": "amount", "submitted": "20.000000", "normalized": "20"}})
+
+    assert str(exc) == (
+        "INVALID_DECIMAL_FORMAT: Invalid request (amount='20.000000') (HTTP 422)")
 
 
 def test_non_json_error_response_becomes_typed_error():
