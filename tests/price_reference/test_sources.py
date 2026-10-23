@@ -284,7 +284,39 @@ def test_bnm_source_crosses_rates_through_myr_and_averages_when_middle_missing()
 
     assert src.quote("SGD", "USD").rate == Decimal("3.01") / Decimal("4.05")
     assert src.quote("AED", "USD").rate == Decimal("1.1025") / Decimal("4.05")
-    # The latest session's list, not the per-currency endpoint (11:30 session).
-    assert paths == ["/public/exchange-rate", "/public/exchange-rate"]
+    # The latest session's list, not the per-currency endpoint (11:30 session),
+    # read once for both pairs.
+    assert paths == ["/public/exchange-rate"]
     with pytest.raises(ValueError, match="BNM publishes no XYZ rate"):
         src.quote("XYZ", "USD")
+
+
+def test_a_daily_feed_is_read_once_per_minute_for_all_pairs_and_so_is_a_failure(monkeypatch):
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr("rotor.price_reference.sources.time.time", lambda: clock["now"])
+    calls = {"n": 0, "fail": True}
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <Envelope><Cube><Cube time="2026-06-09">
+      <Cube currency="USD" rate="1.10"/><Cube currency="SGD" rate="1.45"/>
+      <Cube currency="JPY" rate="170"/>
+    </Cube></Cube></Envelope>"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["fail"]:
+            raise httpx.ReadTimeout("ECB hung")
+        return httpx.Response(200, text=xml)
+
+    src = EcbRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    # A hung feed costs one timeout for every pair in the tick, not one each.
+    for pair in (("SGD", "USD"), ("JPY", "USD")):
+        with pytest.raises(httpx.ReadTimeout):
+            src.quote(*pair)
+    assert calls["n"] == 1
+
+    clock["now"] += 61
+    calls["fail"] = False
+    src.quote("SGD", "USD")
+    src.quote("JPY", "USD")
+    assert calls["n"] == 2

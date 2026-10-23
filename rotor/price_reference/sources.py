@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import time
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from xml.etree import ElementTree
@@ -29,6 +30,11 @@ DAILY_MAX_AGE_S = 48 * 60 * 60.0    # 48 hours
 # really died still stops being quoted. Intraday sources declare no carry: a
 # stale Wise quote means the feed is broken, not closed.
 DAILY_MAX_CARRY_AGE_S = 7 * 24 * 60 * 60.0  # 7 days
+
+# A daily source's whole rate list is fetched at most this often, so one tick
+# reads it once for all its pairs instead of once per pair. A failed fetch is
+# remembered as long, so a hung feed costs one timeout per tick, not one per pair.
+DAILY_REUSE_S = 60.0
 
 # Default HTTP read/connect timeout for source fetches. Generous enough for slow
 # public endpoints (e.g. FRED's CSV graph) while staying well under the poll
@@ -249,15 +255,14 @@ class EcbRateSource:
         )
         # Allow tests to inject a fake client; otherwise create a bounded client.
         self._http = http or httpx.Client(timeout=timeout)
+        self._feed = _Reuse(DAILY_REUSE_S)
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
     ) -> PriceObservation:
         """Fetch ECB daily rates and cross through EUR into quote-per-base."""
-        # ECB publishes one XML document containing multiple currency rates.
-        response = self._http.get(self.url)
-        response.raise_for_status()
-        date, rates = _parse_ecb_xml(response.text)
+        # ECB publishes one XML document containing every currency's rate.
+        date, rates = self._feed.get(self._fetch)
         # The parser always seeds EUR=1 and fills other currencies from XML.
         base_rate = rates[base.upper()]
         quote_rate = rates[quote.upper()]
@@ -270,6 +275,11 @@ class EcbRateSource:
             ts=_published_ts(date),
             raw={"date": date, "rate_base": str(base_rate), "rate_quote": str(quote_rate)},
         )
+
+    def _fetch(self) -> tuple[str, dict[str, Decimal]]:
+        response = self._http.get(self.url)
+        response.raise_for_status()
+        return _parse_ecb_xml(response.text)
 
 
 class FedH10RateSource:
@@ -438,6 +448,7 @@ class BnmRateSource:
             else float(max_carry_age_s)
         )
         self._http = http or httpx.Client(timeout=timeout)
+        self._session = _Reuse(DAILY_REUSE_S)
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
@@ -448,7 +459,7 @@ class BnmRateSource:
         # One read of BNM's latest session gives both currencies. The
         # per-currency endpoint defaults to the 11:30 interbank session, which
         # covers only a few currencies (no AED, CNY, or IDR, for one).
-        rows = self._latest_session()
+        rows = self._session.get(self._latest_session)
         base_myr, base_raw = _myr_per_currency(rows, base)
         quote_myr, quote_raw = _myr_per_currency(rows, quote)
         return PriceObservation(
@@ -481,6 +492,28 @@ def _myr_per_currency(rows: dict[str, dict], currency: str) -> tuple[Decimal, di
     if row is None:
         raise ValueError(f"BNM publishes no {currency} rate")
     return _parse_bnm_rate(row), row
+
+
+class _Reuse:
+    """The last result (or error) of a fetch, reused for `seconds`."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._at: float | None = None
+        self._value: Any = None
+        self._error: Exception | None = None
+
+    def get(self, fetch: Callable[[], Any]) -> Any:
+        now = time.time()
+        if self._at is None or now - self._at >= self.seconds:
+            self._at = now
+            try:
+                self._value, self._error = fetch(), None
+            except Exception as exc:
+                self._value, self._error = None, exc
+        if self._error is not None:
+            raise self._error
+        return self._value
 
 
 def _pair(base: str, quote: str) -> str:
