@@ -156,7 +156,14 @@ Rules:
   auction starts; normal quotes do not use it.
 - `fixed_bps` (global or per pair) sets where a return order starts after a
   fill: `2 x fixed_bps` from the fill price. It does not move normal quotes.
-- `return_bps` must be positive. It is the closest a return order quotes to mid.
+- `return_bps` is the closest a return order quotes to mid. Both spreads must
+  be more than 0 and less than 10000.
+- Every `[[budget]]` token must be traded by a configured market; a typo there
+  is rejected instead of silently leaving that token uncapped.
+- `--order-ttl` must be at least 120 seconds: Sera sweeps orders due to expire
+  within 60 seconds every 30 seconds.
+- Price-source URLs (`WISE_BASE_URL`, `ECB_RATES_URL`, `FRED_API_BASE_URL`,
+  `BNM_EXCHANGE_RATE_BASE_URL`) must be `https://`, like `SERA_BASE_URL`.
 - `return_window_hours` must be positive (default 48).
 
 See `rotor/price_reference/README.md` for provider-specific endpoint and

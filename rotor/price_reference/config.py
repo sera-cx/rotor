@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from rotor.config import get_config, get_config_json
+from rotor.config import get_config, get_config_json, require_https
 from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
@@ -29,30 +29,20 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
         # Base URL is configurable so tests/deployments can point at mocks or
         # alternate Wise environments.
         return WiseRateSource(
-            base_url=str(get_config("WISE_BASE_URL", "https://api.wise.com")),
+            base_url=_url("WISE_BASE_URL", "https://api.wise.com"),
             token_env="WISE_API_TOKEN",
             max_age_s=_max_age_override("WISE"),
         )
     if source_name == "ecb":
         # ECB is configured by a single XML feed URL.
         return EcbRateSource(
-            url=str(
-                get_config(
-                    "ECB_RATES_URL",
-                    "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
-                )
-            ),
+            url=_url("ECB_RATES_URL", "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"),
             max_age_s=_max_age_override("ECB"),
             max_carry_age_s=_max_carry_age_override("ECB"),
         )
     if source_name in {"fed", "h10", "fed_h10"}:
         return FedH10RateSource(
-            base_url=str(
-                get_config(
-                    "FRED_API_BASE_URL",
-                    "https://api.stlouisfed.org/fred/series/observations",
-                )
-            ),
+            base_url=_url("FRED_API_BASE_URL", "https://api.stlouisfed.org/fred/series/observations"),
             api_key=str(get_config("FRED_API_KEY", "") or ""),
             series_by_currency=(
                 get_config_json("FED_H10_SERIES_JSON", None)
@@ -63,12 +53,7 @@ def load_price_reference_source(name: str | None = None) -> RateSource:
         )
     if source_name == "bnm":
         return BnmRateSource(
-            base_url=str(
-                get_config(
-                    "BNM_EXCHANGE_RATE_BASE_URL",
-                    "https://api.bnm.gov.my/public/exchange-rate",
-                )
-            ),
+            base_url=_url("BNM_EXCHANGE_RATE_BASE_URL", "https://api.bnm.gov.my/public/exchange-rate"),
             max_age_s=_max_age_override("BNM"),
             max_carry_age_s=_max_carry_age_override("BNM"),
         )
@@ -80,6 +65,11 @@ def _max_age_override(prefix: str) -> float | None:
     """Return a per-source (then global) staleness override in seconds, if set."""
     # A source-specific window wins over the global one; both are optional.
     return _seconds_override(f"{prefix}_MAX_AGE_S", "PRICE_REFERENCE_MAX_AGE_S")
+
+
+def _url(name: str, default: str) -> str:
+    """A source URL from config; https only, since tokens and prices travel on it."""
+    return require_https(name, str(get_config(name, default) or default))
 
 
 def _max_carry_age_override(prefix: str) -> float | None:

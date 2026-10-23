@@ -441,7 +441,7 @@ def test_testnet_vl_runner_fill_then_return_requote(
     wise_fee_bps = _decimal("ROTOR_TESTNET_WISE_FEE_BPS", "20", purpose)
     return_bps = _decimal("ROTOR_TESTNET_RETURN_BPS", "1", purpose)
     budget_amount = _decimal("ROTOR_TESTNET_BUDGET_AMOUNT", "1000000", purpose)
-    ttl_seconds = _int("ROTOR_TESTNET_ORDER_TTL", "90", purpose)
+    ttl_seconds = _int("ROTOR_TESTNET_ORDER_TTL", "120", purpose)
     fill_wait = _float("ROTOR_TESTNET_FILL_WAIT_SECONDS", "20", purpose)
     wait_between_ticks = _float(
         "ROTOR_TESTNET_SCENARIO_BETWEEN_TICKS_SECONDS",

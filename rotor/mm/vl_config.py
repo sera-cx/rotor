@@ -80,10 +80,8 @@ def load_vl_config(path: str | Path) -> VLConfig:
 def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfig:
     """Validate a parsed VL config dict."""
     # Global strategy defaults apply to each pair unless the pair overrides.
-    fixed_bps = _decimal(raw, "fixed_bps", Decimal("8"))
-    return_bps = _decimal(raw, "return_bps", Decimal("2"))
-    if return_bps <= 0:
-        raise ValueError(f"{source}: return_bps must be > 0")
+    fixed_bps = _bps(raw, "fixed_bps", Decimal("8"), source=source)
+    return_bps = _bps(raw, "return_bps", Decimal("2"), source=source)
     return_window_hours = _decimal(raw, "return_window_hours", Decimal("48"))
     if return_window_hours <= 0:
         raise ValueError(f"{source}: return_window_hours must be > 0")
@@ -99,6 +97,15 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
     # Reject inverse duplicates because they would compete for the same market
     # exposure from opposite directions.
     _validate_unique_markets(pairs, source=source)
+    # A budget on a token no market spends (a typo, say) would never be applied,
+    # so the cap the operator meant to set would silently not exist.
+    traded = {token for pair in pairs for token in parse_market_symbol(pair.market)}
+    for budget in budgets:
+        if budget.token not in traded:
+            raise ValueError(
+                f"{source}: budget token {budget.token} is not traded by any configured "
+                f"market ({', '.join(sorted(traded))}); check its spelling"
+            )
     return VLConfig(
         budgets=budgets,
         pairs=pairs,
@@ -179,7 +186,7 @@ def _parse_pairs(
                 market=market,
                 price_source=price_source,
                 qty_base=qty_base,
-                fixed_bps=_decimal(row, "fixed_bps", default_fixed_bps),
+                fixed_bps=_bps(row, "fixed_bps", default_fixed_bps, source=f"{source}: {market}"),
             )
         )
     return out
@@ -213,12 +220,23 @@ def _list_table(value) -> list[dict[str, Any]]:
 
 
 def _decimal(row: dict[str, Any], key: str, default: Decimal | None) -> Decimal:
-    """Read a Decimal config value with an optional default."""
+    """Read a finite Decimal config value with an optional default."""
     value = row.get(key, default)
     if value is None:
         raise ValueError(f"missing required {key}")
     try:
         # Convert through str to avoid binary float artifacts.
-        return Decimal(str(value))
+        out = Decimal(str(value))
     except Exception as exc:
         raise ValueError(f"{key} must be decimal, got {value!r}") from exc
+    if not out.is_finite():
+        raise ValueError(f"{key} must be a finite number, got {value!r}")
+    return out
+
+
+def _bps(row: dict[str, Any], key: str, default: Decimal, *, source: str) -> Decimal:
+    """Read a basis-point spread: more than 0 and less than 10000 (100%)."""
+    value = _decimal(row, key, default)
+    if not 0 < value < 10000:
+        raise ValueError(f"{source}: {key} must be more than 0 and less than 10000, got {value}")
+    return value

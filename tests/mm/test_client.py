@@ -609,6 +609,17 @@ def _paged_client(handler) -> SeraClient:
     return client
 
 
+def test_order_amounts_go_on_the_wire_as_plain_decimals():
+    # A config size written as 5e3 parses (and quantizes) to an exponent form.
+    client = _make_client(_build_mock_routes())
+    client.bootstrap()
+
+    order = client.build_order(
+        "MYRC/USDC", "bid", Decimal("5E+3").quantize(Decimal("1E+1")), Decimal("2.5E-1"), 999)
+
+    assert (order.wire["amount"], order.wire["price"]) == ("5000", "0.25")
+
+
 def test_get_order_fills_fails_rather_than_undercount_past_its_page_cap():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"items": [{"quantity": "1"}] * 100})
@@ -968,3 +979,13 @@ def test_bootstrap_refuses_mainnet_token_metadata_that_disagrees_with_the_pins(m
 
     with pytest.raises(RuntimeError, match=match):
         client.bootstrap()
+
+
+def test_a_bad_sera_base_url_is_refused_without_echoing_it():
+    pasted_key = "0x" + "ab" * 32
+
+    with pytest.raises(ValueError, match="SERA_BASE_URL must be an https:// URL") as raised:
+        SeraClient(owner_address=OWNER, signer=_stub_signer, api_key="k",
+                   api_secret="s", base_url=pasted_key)
+
+    assert pasted_key not in str(raised.value)

@@ -13,6 +13,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 _DOTENV_LOADED = False
 
@@ -36,6 +37,25 @@ def get_config(name: str, default: Any = None) -> Any:
     # The caller controls the final fallback, which keeps defaults visible at
     # each call site.
     return default
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
+
+
+def require_https(name: str, url: str) -> str:
+    """Return `url` if it is https:// (plain http only for localhost), else raise.
+
+    The message names the setting but never echoes its value, which could be a
+    secret pasted into the wrong variable.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme == "https" or (scheme == "http" and (parts.hostname or "") in _LOCAL_HOSTS):
+        return url
+    raise ValueError(
+        f"{name} must be an https:// URL (plain http only for localhost); "
+        f"got {'an ' + scheme + '://' if scheme else 'a value with no scheme'}"
+    )
 
 
 def get_config_json(name: str, default: Any = None) -> Any:

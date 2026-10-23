@@ -59,7 +59,7 @@ def test_parse_vl_config_defaults_return_bps_to_two():
 
 
 def test_parse_vl_config_rejects_non_positive_return_bps():
-    with pytest.raises(ValueError, match="return_bps must be > 0"):
+    with pytest.raises(ValueError, match="return_bps must be more than 0"):
         parse_vl_config(_config(return_bps="0"))
 
 
@@ -147,3 +147,23 @@ def test_the_documented_example_config_sets_what_it_shows(doc):
     assert cfg.fixed_bps == Decimal("50")
     assert cfg.return_bps == Decimal("2")
     assert [pair.fixed_bps for pair in cfg.pairs] == [Decimal("50"), Decimal("40")]
+
+
+def test_a_budget_on_a_token_no_market_trades_is_a_typo_not_a_silent_no_op():
+    with pytest.raises(ValueError, match="budget token USDCC is not traded by any configured market"):
+        parse_vl_config(_config(budget=[{"token": "USDCC", "amount": "5000"}]))
+
+
+@pytest.mark.parametrize(("where", "value"), [
+    ("global", "0"), ("global", "-10"), ("global", "10000"), ("global", "NaN"),
+    ("pair", "Infinity"), ("pair", "12000"),
+])
+def test_spreads_must_be_finite_and_between_0_and_10000_bps(where, value):
+    raw = _config()
+    if where == "global":
+        raw["fixed_bps"] = value
+    else:
+        raw["pair"][0]["fixed_bps"] = value
+
+    with pytest.raises(ValueError, match="fixed_bps must be"):
+        parse_vl_config(raw)

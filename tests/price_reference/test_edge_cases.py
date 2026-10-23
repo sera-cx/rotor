@@ -290,3 +290,20 @@ def test_a_fred_error_never_carries_the_api_key():
     printed = "".join(traceback.format_exception(raised.value))
     assert secret not in printed
     assert "<FRED_API_KEY>" in printed and "HTTPStatusError" in printed
+
+
+@pytest.mark.parametrize(("name", "source"), [
+    ("WISE_BASE_URL", "wise"), ("ECB_RATES_URL", "ecb"),
+    ("FRED_API_BASE_URL", "fed"), ("BNM_EXCHANGE_RATE_BASE_URL", "bnm"),
+])
+def test_price_sources_refuse_plain_http_urls(monkeypatch, name, source):
+    # The Wise token and every price travel on these URLs.
+    monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
+    monkeypatch.setenv(name, "http://rates.example.com/secret-path")
+
+    with pytest.raises(ValueError, match=f"{name} must be an https:// URL") as raised:
+        load_price_reference_source(source)
+    assert "secret-path" not in str(raised.value)
+
+    monkeypatch.setenv(name, "http://localhost:8080/mock")
+    assert load_price_reference_source(source) is not None

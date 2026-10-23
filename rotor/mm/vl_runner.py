@@ -78,6 +78,9 @@ from rotor.updater import (
 BOOT_CANCEL_RETRY_SECONDS = 300.0
 # Sera refuses to cancel an order younger than this (HTTP 429 cancel cooldown).
 SERA_CANCEL_COOLDOWN_SECONDS = 300.0
+# Sera sweeps, every 30 s, orders due to expire within 60 s, so a shorter TTL
+# leaves an order almost no time on the book.
+MIN_ORDER_TTL_SECONDS = 120
 # After cancelling, how often (and how long apart) rotor checks that the old
 # orders are gone before placing new ones: about 5 s at most.
 CANCEL_SETTLE_POLLS = 10
@@ -947,6 +950,12 @@ def run(
     for name in ("httpx", "httpcore", "telegram"):
         logging.getLogger(name).setLevel(logging.WARNING)
     log = logging.getLogger("rotor.mm.vl")
+    if order_ttl_seconds < MIN_ORDER_TTL_SECONDS:
+        log.error(
+            "--order-ttl %ds is too short: Sera sweeps orders within 60 s of expiry "
+            "every 30 s; use at least %ds", order_ttl_seconds, MIN_ORDER_TTL_SECONDS,
+        )
+        return 1
     # Created first so a failed startup can alert and its waits can be stopped.
     notifier = TelegramNotifier(log=log) if telegram else None
     stop = StopFlag()

@@ -9,15 +9,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
+from rotor.config import require_https
 from rotor.mm.exchange import eip712, errors
 from rotor.mm.exchange.known_tokens import KNOWN_TOKENS
 
-# Hosts for which an http:// base URL is tolerated (local dev/mocks only).
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
 # The Sera contract each known network's signatures must name. A /config that
 # names another contract for one of these chains is refused at bootstrap, so a
 # wrong or hostile SERA_BASE_URL cannot point signatures elsewhere.
@@ -799,9 +797,10 @@ def _order_wire(
         # Owner and side identify who trades and direction.
         "owner_address": owner_address,
         "side": side,
-        # Human-decimal inputs are stringified to preserve Decimal precision.
-        "amount": str(qty_base),
-        "price": str(price),
+        # Plain decimal strings: str() of a Decimal such as 5E+3 keeps the
+        # exponent, which Sera rejects (INVALID_DECIMAL_FORMAT).
+        "amount": format(qty_base, "f"),
+        "price": format(price, "f"),
         # Rotor only places limit orders.
         "order_type": "limit",
         # Market token addresses identify the pair; Sera interprets direction
@@ -962,17 +961,8 @@ def _clean_credential(name: str, value: str) -> str:
 
 
 def _require_secure_base_url(base_url: str) -> None:
-    """Reject a non-TLS Sera base URL except for localhost dev/mocks."""
-    scheme = urlsplit(base_url).scheme.lower()
-    host = urlsplit(base_url).hostname or ""
-    if scheme == "https":
-        return
-    if scheme == "http" and host in _LOCAL_HOSTS:
-        return
-    raise ValueError(
-        "SERA_BASE_URL must use https:// (the maker signs orders against this "
-        f"endpoint); got {base_url!r}"
-    )
+    """Reject a non-TLS Sera base URL (the maker signs orders against it)."""
+    require_https("SERA_BASE_URL", base_url)
 
 
 def _parse_vl_group(value) -> VLGroup | None:

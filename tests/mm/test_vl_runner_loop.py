@@ -1864,3 +1864,13 @@ def test_stale_alerts_still_log_without_telegram(caplog):
         _stale_alerts().update(_refs(), notifier=None, log=LOG, now=0.0)
 
     assert "Reference rates are not updating" in caplog.text
+
+
+def test_run_refuses_an_order_ttl_sera_would_sweep_at_once(monkeypatch, caplog):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+
+    assert vr.run(config_path="vl.toml", order_ttl_seconds=60, state_path=":memory:") == 1
+    assert "--order-ttl 60s is too short" in caplog.text
+    assert client.events == []
