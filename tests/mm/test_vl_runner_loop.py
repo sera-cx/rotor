@@ -942,7 +942,9 @@ def test_run_does_not_send_orders_the_wallet_cannot_fund(monkeypatch, caplog):
     assert len(client.batch_places) == 2
     assert client.standalone_places == []
     assert not [event for event in client.events if event[0] == "rejected"]
-    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+    # Only the one startup line (network and wallet) is a warning.
+    assert [record.getMessage()[:22] for record in caplog.records
+            if record.levelno >= logging.WARNING] == ["VL mm started on Sepol"]
 
 
 def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):
@@ -1874,3 +1876,79 @@ def test_run_refuses_an_order_ttl_sera_would_sweep_at_once(monkeypatch, caplog):
     assert vr.run(config_path="vl.toml", order_ttl_seconds=60, state_path=":memory:") == 1
     assert "--order-ttl 60s is too short" in caplog.text
     assert client.events == []
+
+
+def test_a_dry_run_shows_its_intended_orders_at_the_default_log_level(monkeypatch, caplog):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    with caplog.at_level(logging.WARNING):
+        assert vr.run(config_path="vl.toml", dry_run=True, once=True) == 0
+
+    assert caplog.text.count("dry-run intent") == 4
+    assert client.batch_places == [] and client.standalone_places == []
+
+
+def test_startup_says_which_network_and_wallet_it_trades_on(monkeypatch):
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _fake_clock(monkeypatch, steps=[1.0])
+
+    vr.run(config_path="vl.toml", telegram=True, min_requote_seconds=0.0, state_path=":memory:")
+
+    assert notifier.containing(f"VL mm started on Sepolia testnet as {client.owner_address}")
+
+
+def test_a_stop_during_an_update_check_exits_instead_of_restarting(monkeypatch):
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    stop = _StopFlag()
+    monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+
+    class StoppedWhilePulling:
+        def __init__(self, *, interval_seconds: float) -> None:
+            pass
+
+        def run_if_due(self, _log):
+            stop.request()  # SIGTERM arrives during the git pull
+            return GitUpdateResult(status="updated", message="pulled")
+
+    restarts: list[bool] = []
+    monkeypatch.setattr(vr, "DailyGitUpdater", StoppedWhilePulling)
+    monkeypatch.setattr(vr, "restart_current_process", lambda: restarts.append(True))
+
+    assert vr.run(config_path="vl.toml", auto_update=True, state_path=":memory:") == 0
+    assert restarts == []
+
+
+def test_an_unexpected_error_that_ends_the_loop_is_alerted(monkeypatch):
+    import sqlite3
+
+    import pytest
+
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+
+    def disk_full(self, orders):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(vr.StateStore, "add_unsettled", disk_full)
+
+    with pytest.raises(sqlite3.OperationalError):
+        vr.run(config_path="vl.toml", telegram=True, min_requote_seconds=0.0,
+               state_path=":memory:")
+
+    alerts = notifier.containing("rotor stopped on an unexpected error")
+    assert alerts and all(important for _text, important in alerts)
+    # Nothing was sent that the ledger could not record.
+    assert client.batch_places == [] and client.standalone_places == []

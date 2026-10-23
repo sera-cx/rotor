@@ -358,16 +358,31 @@ def test_a_failed_refresh_keeps_the_last_good_metadata():
     client = _make_client(routes)
     client.bootstrap()
     # The running bot's hourly refresh reads a new batch limit, then a /markets
-    # reply rotor cannot parse. Nothing from that half-read refresh is kept.
+    # reply with no markets list. Nothing from that half-read refresh is kept.
     routes["GET /config"]["limits"] = {"vl_batch": {"min": 3, "max": 5}}
-    routes["GET /markets"] = {"markets": [{"symbol": "MYRC/USDC"}]}
+    routes["GET /markets"] = {"detail": "<html>maintenance</html>"}
 
-    with pytest.raises(KeyError):
+    with pytest.raises(RuntimeError, match="no markets list"):
         client.bootstrap()
 
     assert (client.vl_batch_min, client.vl_batch_max) == (2, 50)
     assert set(client.markets_by_symbol) == {"MYRC/USDC"}
     assert client.markets_by_symbol["MYRC/USDC"].price_step == Decimal("0.000001")
+
+
+def test_one_malformed_market_row_is_skipped_not_fatal(caplog):
+    routes = _build_mock_routes()
+    good = routes["GET /markets"]["markets"][0]
+    routes["GET /markets"] = {"markets": [
+        {**good, "symbol": "XSGD/USDC", "base_decimals": None},
+        good,
+    ]}
+    client = _make_client(routes)
+
+    client.bootstrap()
+
+    assert set(client.markets_by_symbol) == {"MYRC/USDC"}
+    assert "skipping malformed GET /markets row 'XSGD/USDC'" in caplog.text
 
 
 def test_bootstrap_uses_domain_fallback_when_config_omits_eip712_domain():

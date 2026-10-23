@@ -16,6 +16,10 @@
 # the next scheduled fire should retry.
 set -euo pipefail
 
+# Run from the repo root wherever the scheduler starts us: poetry finds the
+# project there, and the default config and state paths are relative to it.
+cd "$(dirname "$0")/.."
+
 CONFIG="${ROTOR_CONFIG:-rotor/vl.config.toml}"
 ORDER_TTL="${ROTOR_ORDER_TTL:-600}"
 LOG_LEVEL="${ROTOR_LOG_LEVEL:-WARNING}"

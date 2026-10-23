@@ -171,6 +171,8 @@ Sera signing and API:
 - Bootstrap refuses a `/config` that names any contract other than the known
   Sera contract for mainnet (chain 1) or Sepolia (chain 11155111); an unknown
   chain is allowed with a warning.
+- A malformed `/markets` row is skipped with a warning (a configured market in
+  it is then reported as unlisted); a reply with no markets list fails bootstrap.
 - On mainnet, bootstrap also refuses `/markets` metadata that disagrees with
   `rotor/mm/exchange/known_tokens.py`: a market symbol that does not match its
   two tokens, a pinned symbol at another address or decimals, or a pinned
@@ -241,7 +243,9 @@ Autonomous updates:
   no network/wallet/state) before a restart; otherwise the old version keeps
   running and the check is retried next interval.
 - A restart stops the loop, runs normal shutdown cleanup, and re-execs the same
-  command.
+  command. A stop signal received during the update check wins: rotor exits
+  instead. A failed pull's reason is passed on with any URL credentials
+  replaced by `<credentials>`.
 
 Telegram:
 
@@ -259,6 +263,12 @@ Telegram:
 Logging:
 
 - Default live logs are `WARNING` with compact one-line output.
+- Startup logs (WARNING) and sends one line naming the network and wallet.
+  A dry run logs its intended orders at WARNING, since that is its output.
+- An order whose fills are still pending/confirming an hour after expiry is
+  warned about once (`STUCK_SETTLEMENT_SECONDS`).
+- An unexpected error that ends the loop is logged and sent as an important
+  alert before rotor exits.
 - Routine per-tick quote, placement, cancellation, and reattach traces are
   `DEBUG` only.
 - Rotor does not create log files by itself.

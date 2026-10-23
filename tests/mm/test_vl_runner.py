@@ -790,3 +790,26 @@ def test_legs_left_below_the_batch_minimum_go_out_standalone():
     assert client.batches == [["XSGD/USDC", "JPYC/USDC"]]
     assert client.standalone == ["XSGD/USDC"]
     assert [placement.kind for placement in placed] == ["standalone"]
+
+
+def test_fills_stuck_settling_an_hour_after_expiry_are_reported_once(caplog):
+    store = vr.StateStore(":memory:")
+    store.add_unsettled([_unsettled()])
+    client = _FillsClient({"o-1": [_fill("40", status="confirming")]})
+    stuck: set[str] = set()
+
+    def tick(server_now):
+        unsettled = store.load_unsettled()
+        fills, _failed, _unknown = vr._read_fills(client, ["o-1"])
+        return vr._positions_for_quoting(
+            store, unsettled, fills, server_now=server_now, log=LOG, stuck=stuck)
+
+    with caplog.at_level(logging.WARNING):
+        tick(1000 + 3599)          # under an hour past expiry: quiet
+        positions = tick(1000 + 3600)
+        tick(1000 + 7200)          # still stuck: not repeated
+
+    assert caplog.text.count("fills still settling 1h 0m after expiry") == 1
+    # The fill still holds the return side while it settles.
+    assert positions["XSGD/USDC"].net_base == Decimal("-40")
+    assert store.load_unsettled() != []

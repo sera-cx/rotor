@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 DEFAULT_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
@@ -93,6 +94,9 @@ class DailyGitUpdater:
             )
         except Exception as exc:  # pragma: no cover - defensive guard.
             result = GitUpdateResult(status="failed", message=str(exc))
+        if result.status == "failed" and result.output:
+            # Say why (no upstream branch, auth, a conflict), not only that it failed.
+            result = replace(result, message=f"{result.message}: {_redact_urls(result.output)}")
         result = self._restart_only_if_it_starts(result)
         log_update_result(log, result)
         return result
@@ -317,6 +321,11 @@ def _combined_output(result: GitCommandResult, *, limit: int = 500) -> str:
     """Combine stdout/stderr and cap log-sized output."""
     text = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
     return text[-limit:]
+
+
+def _redact_urls(text: str) -> str:
+    """Git output can name a remote with credentials in it; never pass those on."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1<credentials>@", text)
 
 
 def _short_sha(value: str | None) -> str:

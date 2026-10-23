@@ -81,6 +81,9 @@ SERA_CANCEL_COOLDOWN_SECONDS = 300.0
 # Sera sweeps, every 30 s, orders due to expire within 60 s, so a shorter TTL
 # leaves an order almost no time on the book.
 MIN_ORDER_TTL_SECONDS = 120
+# An order whose fills are still pending/confirming this long after it expired
+# is reported once: settlement looks stuck, and its fill is not yet stored.
+STUCK_SETTLEMENT_SECONDS = 3600.0
 # After cancelling, how often (and how long apart) rotor checks that the old
 # orders are gone before placing new ones: about 5 s at most.
 CANCEL_SETTLE_POLLS = 10
@@ -1039,12 +1042,17 @@ def run(
             important=True,
         )
     budget.clear()
+    # Say which network and wallet this run trades on: a testnet run with
+    # mainnet expectations (or the reverse) should be obvious at a glance.
+    started = (
+        f"VL mm started on {_network_name(client)}"
+        f"{'' if dry_run else ' as ' + client.owner_address} pairs={len(runtimes)} "
+        f"budgets={','.join(sorted(config.budget_tokens))}"
+        f"{' (dry-run)' if dry_run else ''}"
+    )
+    log.warning("%s", started)
     if notifier is not None:
-        notifier.notify_startup(
-            f"VL mm started pairs={len(runtimes)} "
-            f"budgets={','.join(sorted(config.budget_tokens))}"
-            f"{' (dry-run)' if dry_run else ''}"
-        )
+        notifier.notify_startup(started)
         if skipped:
             notifier.send_raw(
                 "⚠️ Not quoting "
@@ -1095,6 +1103,8 @@ def run(
     restart_after_update = False
     # Whether open orders someone else placed on this wallet were reported.
     foreign_alerted = False
+    # Orders already reported as stuck in settlement.
+    stuck_settlements: set[str] = set()
     # Whether shutdown cleanup left orders live (see _cancel_before_exit).
     left_live = False
     # order id -> consecutive ticks its fills could not be read.
@@ -1240,6 +1250,7 @@ def run(
                             server_now=tick_expiration - order_ttl_seconds,
                             log=log,
                             unknown=unknown_orders,
+                            stuck=stuck_settlements,
                         )
                 except Exception as exc:
                     log.warning("skip tick: fill polling failed: %s", exc)
@@ -1406,6 +1417,13 @@ def run(
             if once:
                 return 0 if placed else 1
             sleep_remaining(tick_started, poll_seconds, stop)
+    except Exception as exc:
+        # Anything that ends the loop unexpectedly (a state file that cannot be
+        # written, say) stops rotor: say so loudly, not only "VL mm stopped".
+        log.exception("rotor stopped on an unexpected error")
+        if notifier is not None:
+            notifier.notify_error("rotor stopped on an unexpected error", exc)
+        raise
     finally:
         # A --once fire that placed nothing checks for a stall shared across fires.
         if once and not dry_run and not watchdog.quoted_this_run:
@@ -1431,7 +1449,11 @@ def run(
         # Release the HTTP connection pool (best-effort; fakes may lack close()).
         with contextlib.suppress(Exception):
             client.close()
-    if restart_after_update:
+    if restart_after_update and stop.requested:
+        # A stop that arrived while the update was being checked wins: the
+        # operator asked rotor to exit, not to come back as a new version.
+        log.warning("stop requested during auto-update; exiting instead of restarting")
+    elif restart_after_update:
         try:
             restart_current_process()
         except Exception as exc:
@@ -2768,6 +2790,12 @@ def _wait_until_gone(
     log.debug("%d cancelled order(s) still open; placing anyway", len(open_ids & order_ids))
 
 
+def _network_name(client: SeraClient) -> str:
+    """A readable name for the chain the client bootstrapped against."""
+    chain = int((client.eip712_domain or {}).get("chainId") or 0)
+    return {1: "Ethereum mainnet", 11155111: "Sepolia testnet"}.get(chain, f"chain {chain}")
+
+
 def _known_order_ids(state: StateStore | None, stored: list[LivePlacement]) -> set[str]:
     """Order ids this rotor placed: its tracked orders and its settlement ledger.
 
@@ -2901,6 +2929,7 @@ def _positions_for_quoting(
     server_now: float,
     log: logging.Logger,
     unknown: set[str] = frozenset(),
+    stuck: set[str] | None = None,
 ) -> dict[str, Position]:
     """Settle every final order into the stored positions, then add fills in flight.
 
@@ -2921,6 +2950,19 @@ def _positions_for_quoting(
         settled = _settled_fill_qty(rows)
         if settled is None or server_now < order.expiration + SETTLE_GRACE_SECONDS:
             in_flight.append((order, _visible_fill_qty(rows)))
+            if (
+                settled is None
+                and stuck is not None
+                and order.order_id not in stuck
+                and server_now >= order.expiration + STUCK_SETTLEMENT_SECONDS
+            ):
+                stuck.add(order.order_id)
+                log.warning(
+                    "%s %s order %s: fills still settling %s after expiry; its "
+                    "return side is held, but the fill is not stored until it settles",
+                    order.market, order.side, order.order_id,
+                    _fmt_duration(server_now - order.expiration),
+                )
             continue
         before, after = state.settle_order(order, settled)
         if order.order_id in unknown:
@@ -3072,12 +3114,17 @@ def _log_groups(
     *,
     dry_run: bool,
 ) -> None:
-    """Log the placement path and economics for every order intent."""
+    """Log the placement path and economics for every order intent.
+
+    A dry run's whole output is these lines, so they are warnings there (seen
+    at the default level); in live mode they are debug traces.
+    """
+    emit = log.warning if dry_run else log.debug
     for spent_token, intents, use_vl in groups:
         # Path tells whether this intent will be placed via VL or standalone.
         path = "VL" if use_vl else "standalone"
         for intent in intents:
-            log.debug(
+            emit(
                 "%sintent %s %s side=%s spent=%s price=%s qty=%s",
                 "dry-run " if dry_run else "",
                 path,

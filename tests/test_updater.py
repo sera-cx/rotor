@@ -268,3 +268,17 @@ def test_a_skipped_update_is_a_warning(caplog):
         )
 
     assert "auto-update skipped: checkout is detached" in caplog.text
+
+
+def test_a_failed_pull_says_why_without_credentials(tmp_path):
+    def failed_pull(**_kwargs) -> GitUpdateResult:
+        return GitUpdateResult(
+            status="failed", message="git pull --ff-only failed",
+            output="fatal: unable to access 'https://oauth2:glpat-SECRET@lab.example/rotor.git/'",
+        )
+
+    updater = DailyGitUpdater(repo_path=tmp_path, running_commit="a" * 40, puller=failed_pull)
+    result = updater.run_if_due(logging.getLogger("tests.updater"), now=1.0)
+
+    assert "unable to access 'https://<credentials>@lab.example/rotor.git/'" in result.message
+    assert "glpat-SECRET" not in result.message

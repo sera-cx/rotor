@@ -297,32 +297,19 @@ class SeraClient:
         executor_id = _parse_healthy_executor_id(health)
 
         # Market metadata drives amount/price grids and signed token addresses.
-        markets = self._request("GET", "/markets", authed=False).get("markets", [])
+        markets = self._request("GET", "/markets", authed=False).get("markets")
+        if not isinstance(markets, list):
+            raise RuntimeError("GET /markets returned no markets list")
         markets_by_symbol: dict[str, MarketInfo] = {}
         for m in markets:
-            # Parse each row defensively, defaulting optional precision metadata.
-            info = MarketInfo(
-                symbol=m["symbol"],
-                base_symbol=m["base_symbol"],
-                quote_symbol=m["quote_symbol"],
-                base_address=m["base_address"],
-                quote_address=m["quote_address"],
-                base_decimals=int(m["base_decimals"]),
-                quote_decimals=int(m["quote_decimals"]),
-                tick_precision=int(m.get("tick_precision", 6)),
-                quantity_precision=int(m.get("quantity_precision", 2)),
-                price_step=(
-                    Decimal(str(m["price_step"]))
-                    if m.get("price_step") is not None else None
-                ),
-                amount_step=(
-                    Decimal(str(m["amount_step"]))
-                    if m.get("amount_step") is not None else None
-                ),
-                rounding_mode=str(m.get("rounding_mode", "")),
-                min_bid_quote_amount=Decimal(str(m.get("min_bid_quote_amount", "0"))),
-                min_ask_amount=Decimal(str(m.get("min_ask_amount", "0"))),
-            )
+            try:
+                info = _parse_market(m)
+            except Exception as exc:
+                # One malformed row must not take every market down; a configured
+                # market in it is then reported as unlisted, and skipped.
+                symbol = m.get("symbol") if isinstance(m, dict) else None
+                self._log.warning("skipping malformed GET /markets row %r: %s", symbol, exc)
+                continue
             # Cache by exact Sera symbol for fast lookup during quoting.
             markets_by_symbol[info.symbol] = info
         _check_market_tokens(markets_by_symbol, int(domain["chainId"]))
@@ -884,6 +871,32 @@ def _coerce_int(value: Any) -> int:
             return int(text, 16)
         return int(text, 10)
     return int(value)
+
+
+def _parse_market(m: dict) -> MarketInfo:
+    """One GET /markets row as MarketInfo; raises on a missing or malformed field."""
+    return MarketInfo(
+        symbol=m["symbol"],
+        base_symbol=m["base_symbol"],
+        quote_symbol=m["quote_symbol"],
+        base_address=m["base_address"],
+        quote_address=m["quote_address"],
+        base_decimals=int(m["base_decimals"]),
+        quote_decimals=int(m["quote_decimals"]),
+        tick_precision=int(m.get("tick_precision", 6)),
+        quantity_precision=int(m.get("quantity_precision", 2)),
+        price_step=(
+            Decimal(str(m["price_step"]))
+            if m.get("price_step") is not None else None
+        ),
+        amount_step=(
+            Decimal(str(m["amount_step"]))
+            if m.get("amount_step") is not None else None
+        ),
+        rounding_mode=str(m.get("rounding_mode", "")),
+        min_bid_quote_amount=Decimal(str(m.get("min_bid_quote_amount", "0"))),
+        min_ask_amount=Decimal(str(m.get("min_ask_amount", "0"))),
+    )
 
 
 def _check_market_tokens(markets: dict[str, MarketInfo], chain_id: int) -> None:
