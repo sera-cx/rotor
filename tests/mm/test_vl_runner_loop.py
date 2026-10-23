@@ -1623,9 +1623,6 @@ class _RecordingNotifier:
     def notify_shutdown(self, text: str) -> None:
         self.messages.append((text, False))
 
-    def notify_quote(self, market: str, **_kwargs) -> None:
-        return None
-
     def notify_error(self, context: str, error: object) -> None:
         self.messages.append((f"error: {context}: {error}", True))
 

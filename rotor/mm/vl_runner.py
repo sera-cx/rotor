@@ -15,6 +15,7 @@ import logging
 import re
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
@@ -165,7 +166,7 @@ class LivePlacement:
     vl_batch_id: str | None = None
     # Immediate fills returned by placement, when Sera provides them.
     fills: list[dict] | None = None
-    # Maps order id to source intent so fills can choose the next tight side.
+    # Maps order id to the intent it was placed from (its side and price).
     intent_by_order_id: dict[str, OrderIntent] | None = None
 
 
@@ -238,7 +239,6 @@ class StateStore:
                 qty_base TEXT
             )
         """)
-        self._ensure_active_order_columns()
         # Superseded by positions; its rows were one-tick signals, safe to drop.
         self._db.execute("DROP TABLE IF EXISTS pending_returns")
         # Every order rotor placed, until its fills are final and counted.
@@ -312,14 +312,6 @@ class StateStore:
                 f"this run is {_describe_identity(identity)}. Set ROTOR_STATE_PATH to "
                 "a separate state file for each wallet and network"
             )
-
-    def _ensure_active_order_columns(self) -> None:
-        columns = {
-            str(row[1])
-            for row in self._db.execute("PRAGMA table_info(active_orders)").fetchall()
-        }
-        if "qty_base" not in columns:
-            self._db.execute("ALTER TABLE active_orders ADD COLUMN qty_base TEXT")
 
     def _acquire_single_instance_lock(self) -> None:
         """Take an exclusive advisory lock so only one rotor uses this state."""
@@ -2514,56 +2506,45 @@ def _cancel_placements(
     remaining: list[LivePlacement] = []
     for placement in placements:
         if placement.kind == "vl" and placement.vl_batch_id:
-            try:
-                # VL batches are cancelled by batch id instead of each child.
-                ok = client.cancel_vl_batch(placement.vl_batch_id)
-            except Exception as exc:
-                if _is_order_gone(exc):
-                    # Already gone (expired/filled/unknown): drop it so it cannot
-                    # wedge the cancel-first loop forever.
-                    log.warning("VL batch %s already gone; dropping: %s",
-                                placement.vl_batch_id, exc)
-                    continue
-                # Other (retryable) errors keep the placement tracked for retry.
-                log.warning("cancel VL batch failed %s: %s",
-                            placement.vl_batch_id, exc)
-                remaining.append(placement)
-                continue
-            if ok:
-                log.debug("cancelled VL batch %s", placement.vl_batch_id)
-            else:
-                # Cooldown is not fatal; runner will wait and retry later.
-                log.debug("cancel cooldown VL batch %s", placement.vl_batch_id)
+            # VL batches are cancelled by batch id instead of each child.
+            batch_id = placement.vl_batch_id
+            cancel = lambda batch_id=batch_id: client.cancel_vl_batch(batch_id)  # noqa: E731
+            if not _cancel_one(cancel, f"VL batch {batch_id}", log):
                 remaining.append(placement)
             continue
-
-        # Standalone placements cancel each live order separately.
-        leftover: list[LiveOrder] = []
-        for order in placement.orders:
-            try:
-                ok = client.cancel_order(order.order_id, order.uuid_int)
-            except Exception as exc:
-                if _is_order_gone(exc):
-                    # Order no longer exists on Sera; stop tracking it.
-                    log.warning("order %s %s already gone; dropping: %s",
-                                order.side, order.order_id, exc)
-                    continue
-                # Keep failed orders in the placement so tracking is not lost.
-                log.warning("cancel failed %s %s: %s",
-                            order.side, order.order_id, exc)
-                leftover.append(order)
-                continue
-            if ok:
-                log.debug("cancelled %s %s", order.side, order.order_id)
-            else:
-                # Cooldown means this order is still live.
-                log.debug("cancel cooldown %s %s", order.side, order.order_id)
-                leftover.append(order)
+        # Standalone placements cancel each live order separately; only the
+        # orders still live stay tracked.
+        leftover = [
+            order for order in placement.orders
+            if not _cancel_one(
+                lambda order=order: client.cancel_order(order.order_id, order.uuid_int),
+                f"{order.side} order {order.order_id}",
+                log,
+            )
+        ]
         if leftover:
-            # Mutate the placement to contain only orders that still need tracking.
             placement.orders = leftover
             remaining.append(placement)
     return remaining
+
+
+def _cancel_one(cancel: Callable[[], bool], what: str, log: logging.Logger) -> bool:
+    """Cancel one order or batch; return whether it no longer needs tracking.
+
+    Gone on Sera (expired, filled, unknown) counts as done, so a stuck cancel
+    cannot wedge the cancel-first loop forever. A cooldown or any other
+    (retryable) error keeps it tracked for the next try.
+    """
+    try:
+        ok = cancel()
+    except Exception as exc:
+        if _is_order_gone(exc):
+            log.warning("%s already gone; dropping: %s", what, exc)
+            return True
+        log.warning("cancel %s failed: %s", what, exc)
+        return False
+    log.debug("%s %s", "cancelled" if ok else "cancel cooldown", what)
+    return ok
 
 
 def _is_order_gone(exc: Exception) -> bool:
@@ -2625,7 +2606,7 @@ def _load_live_placements(
     fallback: list[LivePlacement] | None = None,
     retries: int = 2,
     retry_wait: float = 2.0,
-    stop: StopFlag | None = None,
+    stop: StopFlag,
     known: set[str] | None = None,
     foreign: list[str] | None = None,
 ) -> list[LivePlacement]:
@@ -2649,11 +2630,8 @@ def _load_live_placements(
             break
         except Exception as exc:
             last_exc = exc
-            if attempt < retries:
-                if stop is not None and stop.wait(retry_wait):
-                    break
-                if stop is None:
-                    time.sleep(retry_wait)
+            if attempt < retries and stop.wait(retry_wait):
+                break
     if rows is None:
         log.warning(
             "could not reattach open VL orders after %d attempt(s): %s",

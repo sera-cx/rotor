@@ -47,7 +47,6 @@ class TelegramNotifier:
 
         notifier = TelegramNotifier()          # reads tokens from config
         notifier.notify_startup("XSGD/USDC mm started, qty=100")
-        notifier.notify_quote("XSGD/USDC", bid="0.7400", ask="0.7460", qty="100")
         notifier.notify_error("place bid", exc)
         notifier.heartbeat()                    # self-rate-limited keep-alive
         notifier.notify_shutdown("XSGD/USDC mm stopped")
@@ -122,31 +121,6 @@ class TelegramNotifier:
         """Announce that the market maker is shutting down (normal channel)."""
         # Shutdown is routine and therefore normal-channel only.
         self.send_raw(f"🔴 {text}")
-
-    def notify_quote(
-        self,
-        market: str,
-        *,
-        bid: str | None,
-        ask: str | None,
-        qty: str,
-        benchmark: str | None = None,
-    ) -> None:
-        """Report a freshly placed quote set (normal channel).
-
-        The MM loop places one fresh quote set per cadence tick, so this is
-        bounded by the configured poll interval.
-        """
-        # Local time is sufficient for operator readability.
-        timestamp = time.strftime("%H:%M:%S")
-        # Include benchmark only when the runner provides it.
-        bench = f"\nbenchmark {benchmark}" if benchmark else ""
-        # Missing sides are displayed as dashes for aggregate VL reports.
-        self.send_raw(
-            f"📈 {market} quote\n"
-            f"bid {bid or '-'}  ask {ask or '-'}  qty {qty}{bench}\n"
-            f"at {timestamp}"
-        )
 
     def notify_error(self, context: str, error: object) -> None:
         """Report an operational error to the normal AND important channels."""

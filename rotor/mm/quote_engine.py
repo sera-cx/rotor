@@ -37,10 +37,9 @@ class LiveOrder:
 
 def build_client(*, dry_run: bool, log: logging.Logger) -> SeraClient:
     """Build the Sera client using Rotor's configured credentials."""
-    # Dry-run should not require a private key unless balance-aware code already
-    # unlocked it for balance reads; use zero address otherwise.
+    # Dry-run never unlocks the wallet (the CLI skips it), so it needs no key.
     if dry_run:
-        owner = wallet_key.wallet_address() if wallet_key.is_unlocked() else ZERO_ADDRESS
+        owner = ZERO_ADDRESS
 
         def signer(_domain, _types, _message):
             # A dry-run must never sign; this fails loudly if a code path tries.

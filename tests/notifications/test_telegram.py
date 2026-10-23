@@ -112,15 +112,6 @@ def test_notify_error_routes_important(notifier):
     assert "place bid" in send.call_args_list[0].args[0]
 
 
-def test_notify_quote_normal_channel(notifier):
-    with patch.object(notifier, "_send") as send:
-        notifier.notify_quote("XSGD/USDC", bid="0.74",
-                              ask="0.75", qty="100", benchmark="0.745")
-    send.assert_called_once()
-    body = send.call_args.args[0]
-    assert "XSGD/USDC" in body and "0.74" in body and "0.75" in body
-
-
 def test_notify_startup_and_shutdown(notifier):
     with patch.object(notifier, "_send") as send:
         notifier.notify_startup("started")

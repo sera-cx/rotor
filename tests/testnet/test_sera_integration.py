@@ -181,7 +181,6 @@ def test_testnet_bootstrap_loads_public_config_health_and_markets():
     client = _client()
 
     client.bootstrap()
-    limits = client.get_config_limits()
 
     assert client.eip712_domain
     assert client.eip712_domain.get("chainId")
@@ -190,7 +189,6 @@ def test_testnet_bootstrap_loads_public_config_health_and_markets():
     assert client.markets_by_symbol
     assert client.vl_batch_min >= 1
     assert client.vl_batch_max >= client.vl_batch_min
-    assert "vl_batch" in limits
 
 
 def test_testnet_server_time_returns_recent_unix_timestamp():

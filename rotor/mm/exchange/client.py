@@ -560,22 +560,6 @@ class SeraClient:
             # Same cooldown behavior as single-order cancellation.
             return False
 
-    def get_config_limits(self) -> dict[str, dict[str, int]]:
-        """Return public API limits, refreshing from `GET /config`."""
-        # Refreshing limits lets long-running clients adapt to server changes.
-        cfg = self._request("GET", "/config", authed=False)
-        limits = dict(cfg.get("limits") or {})
-        vl_limits = dict(limits.get("vl_batch") or {})
-        if vl_limits:
-            # Update local guards and return normalized ints to callers.
-            self.vl_batch_min = int(vl_limits.get("min", self.vl_batch_min))
-            self.vl_batch_max = int(vl_limits.get("max", self.vl_batch_max))
-            limits["vl_batch"] = {
-                "min": self.vl_batch_min,
-                "max": self.vl_batch_max,
-            }
-        return limits
-
     def get_server_time(self) -> int:
         """Return Sera's current Unix timestamp from `GET /system/time`."""
         body = self._request("GET", "/system/time", authed=False)

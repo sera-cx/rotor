@@ -498,6 +498,7 @@ def test_load_live_placements_groups_vl_batches_and_filters_markets():
         Client(),
         {"XSGD/USDC"},
         logging.getLogger("test"),
+        stop=vr.StopFlag(),
     )
 
     assert [placement.kind for placement in placements] == ["standalone", "vl"]

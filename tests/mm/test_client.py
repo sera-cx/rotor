@@ -447,7 +447,7 @@ def test_bootstrap_rejects_unsafe_health_state(health, match):
         client.bootstrap()
 
 
-def test_get_config_limits_refreshes_vl_limits():
+def test_bootstrap_reads_vl_batch_limits_from_config():
     routes = _build_mock_routes({
         "GET /config": {
             "chain_id": 11155111,
@@ -458,12 +458,7 @@ def test_get_config_limits_refreshes_vl_limits():
     client = _make_client(routes)
     client.bootstrap()
 
-    limits = client.get_config_limits()
-
-    assert limits["vl_batch"] == {"min": 4, "max": 9}
-    assert client.vl_batch_min == 4
-    assert client.vl_batch_max == 9
-
+    assert (client.vl_batch_min, client.vl_batch_max) == (4, 9)
 
 def test_server_time_is_public_and_drives_expiration():
     routes = _build_mock_routes({"GET /system/time": {"timestamp": "1713168000"}})

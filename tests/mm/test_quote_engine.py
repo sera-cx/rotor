@@ -38,17 +38,15 @@ def test_build_client_dry_run_uses_zero_address_when_wallet_locked(monkeypatch):
         client._signer({}, {}, {})
 
 
-def test_build_client_dry_run_uses_unlocked_wallet_address(monkeypatch):
+def test_build_client_dry_run_needs_no_wallet_and_cannot_sign(monkeypatch):
     wallet_key.lock()
-    private_key = "0x" + ("aa" * 32)
-    monkeypatch.setenv("SERA_PRIVATE_KEY", private_key)
-    wallet_key.unlock()
+    monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
 
-    try:
-        client = qe.build_client(dry_run=True, log=__import__("logging").getLogger("test"))
-        assert client.owner_address == wallet_key.wallet_address().lower()
-    finally:
-        wallet_key.lock()
+    client = qe.build_client(dry_run=True, log=__import__("logging").getLogger("test"))
+
+    assert client.owner_address == qe.ZERO_ADDRESS
+    with pytest.raises(RuntimeError, match="dry-run signer should never be called"):
+        client._signer({}, {}, {})
 
 
 def test_all_requote_safe_uses_boundary(monkeypatch):
