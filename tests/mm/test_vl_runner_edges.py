@@ -753,3 +753,11 @@ def test_reattach_falls_back_to_local_state_when_sera_stays_unreachable():
         stop=_CountingStop(), fallback=stored)
 
     assert placements == stored
+
+
+def test_a_bare_404_on_a_cancel_is_not_proof_the_order_is_gone():
+    # Sera answers a cancel for an unknown order with a 400 that says so; a
+    # 404 comes from something in front of Sera, such as a CDN page.
+    assert vr._is_order_gone(errors.SeraError(None, "<html>404 Not Found</html>", 404)) is False
+    assert vr._is_order_gone(
+        errors.SeraError(None, "Order not found for cancellation: abc", 400)) is True

@@ -872,3 +872,39 @@ def test_dust_below_the_market_minimum_is_dropped_without_a_warning(caplog):
 
     assert out == []
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class _Notes:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, bool]] = []
+
+    def send_raw(self, text, *, important=False):
+        self.sent.append((text, important))
+
+
+def test_an_order_sera_has_no_record_of_is_settled_at_zero_with_an_alert():
+    # Sera pruned the order's record while rotor was off: any fill on it is
+    # lost to rotor, so the operator is told to check the position.
+    store = vr.StateStore(":memory:")
+    store.add_unsettled([_unsettled()])
+    notes = _Notes()
+
+    vr._positions_for_quoting(
+        store, store.load_unsettled(), {"o-1": []}, server_now=5000, log=LOG,
+        unknown={"o-1"}, notifier=notes)
+
+    assert store.load_unsettled() == []
+    assert len(notes.sent) == 1 and notes.sent[0][1] is True
+    assert "check XSGD/USDC's position by hand" in notes.sent[0][0]
+
+
+def test_a_reverted_fill_with_a_transaction_is_flagged_but_not_counted(caplog):
+    store = vr.StateStore(":memory:")
+    store.add_unsettled([_unsettled()])
+    reverted = {**_fill("30", "reverted"), "tx_hash": "0xabc"}
+
+    vr._positions_for_quoting(
+        store, store.load_unsettled(), {"o-1": [reverted]}, server_now=5000, log=LOG)
+
+    assert store.load_positions() == {}
+    assert "reports a fill as reverted, yet it has transaction 0xabc" in caplog.text

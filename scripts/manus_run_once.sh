@@ -11,9 +11,9 @@
 # expire between runs. Do NOT pass --cancel-on-exit: quotes should rest between
 # fires and the next run replaces them.
 #
-# Exit code 0 = a fresh quote set was placed (or nothing needed placing);
-# non-zero = this run could not requote (e.g. cooldown / transient error) and
-# the next scheduled fire should retry.
+# Exit code 0 = a fresh quote set was placed, or the last one is still inside
+# Sera's cancel cooldown and keeps resting; non-zero = this run could not
+# requote (e.g. a transient error) and the next scheduled fire should retry.
 set -euo pipefail
 
 # Run from the repo root wherever the scheduler starts us: poetry finds the

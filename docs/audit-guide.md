@@ -95,10 +95,15 @@ Positions and return orders:
   other failure (timeout, dropped connection, 5xx, unreadable reply) it stays,
   and the placement is tracked as live so the next cycle cancels it. An order
   Sera never booked has no fills (Sera answers its fill read with a JSON 404,
-  detail "Order not found") and settles at zero with a warning.
+  detail "Order not found") and settles at zero with an important alert, since
+  the same answer for an order Sera did book (its record pruned while rotor was
+  off) would hide a fill.
 - An order is settled only after its expiry plus 60 seconds of Sera server time,
   and only when none of its fills is `pending`/`confirming` (or an unknown
   status). Only `settled` fills count; `failed`/`reverted` count as zero.
+  Rotor trusts Sera's settlement status, so a false `reverted` on Sera's side
+  would go uncounted; a `failed`/`reverted` fill that carries a `tx_hash` is
+  logged as a warning to check on-chain.
 - Settling an order updates its market's position and deletes its ledger row in
   one SQLite transaction, so each order is counted exactly once.
 - Each tick reads the fills of every ledger order and every live order once.
@@ -133,11 +138,14 @@ Live order lifecycle:
   hours, and once on the start that ends it, across restarts and fires. The
   Telegram notifier exists before any startup step, so failures alert.
 - Dry-run never signs, places, or cancels.
-- Live mode unlocks the wallet before any signing path.
+- Live mode unlocks the wallet as the first startup step, before any signing
+  path, so a bad key is a failed start (logged, alerted once per outage).
 - Rotor reattaches only open orders it placed (`_known_order_ids`: tracked
-  orders plus the settlement ledger). Any other open order on a configured
-  market stops startup (exit 1, alert) and is alerted once mid-run; rotor never
-  adopts, and so never cancels, it.
+  orders plus the settlement ledger), whatever their market, so an order on a
+  pair since removed from the config is cancelled at boot. Any other open order
+  on a configured market stops startup (exit 1, alert); mid-run, the open-order
+  reads after each cancel spot one and alert once. Rotor never adopts, and so
+  never cancels, it.
 - Startup cancellation is default-on and runs before the first quote tick.
 - Boot cancellation is one pass that never blocks on Sera's cooldown; any
   placement left live stays tracked, and the tick loop's cancel guard cancels it
@@ -149,12 +157,20 @@ Live order lifecycle:
   before fresh placements, and rotor then waits (up to about 5 s,
   `_wait_until_gone`) until Sera no longer lists them, because Sera applies a
   cancel after acknowledging it and a VL batch holds its budget until then.
-- If the newest tracked order clears the cancel-cooldown guard within 60 seconds,
-  the tick waits for it; otherwise the tick is skipped.
+- The cancel-cooldown guard is `--min-requote-seconds` plus 5 s, so a small
+  clock difference from Sera cannot land a cancel inside its cooldown. If the
+  newest tracked order clears it within 60 seconds, the tick waits for it;
+  otherwise the tick is skipped.
 - Cancel cooldowns keep local tracking for later retry, but an order Sera reports
-  as gone (404, a 400 whose message says "not found", or a not-found /
+  as gone (a 400 whose message says "not found", or a not-found /
   already-cancelled / already-filled code) is dropped so a stuck cancel cannot
-  wedge quoting until restart.
+  wedge quoting until restart. A bare 404 is not gone: Sera never sends one for
+  a cancel, so it comes from a proxy or CDN. A tracked order past its signed
+  expiry plus 60 s is dropped too, whatever its cancel answers.
+- A tick with no order to place (every pair's price unavailable) cancels the
+  resting quotes once the guard allows, rather than leaving them until expiry.
+- A tick that ran so long its orders would have under 120 s to live places
+  nothing.
 - VL batch results are reconciled: server-cancelled legs are not tracked, and a
   clipped (amended) leg tracks its accepted size so a full fill at that size
   prunes. A malformed batch response keeps a cancelable `vl_batch_id` rather than
@@ -177,9 +193,14 @@ Live order lifecycle:
   the gap before it.
 - `--cancel-on-exit` is opt-in and cancels only tracked placements, waiting out
   Sera's 5-minute cancel cooldown once (a second stop signal skips it); a stop
-  seen before Phase 7 places nothing new; leftovers are alerted and the loop
-  exits 1. An auto-update restart cancels tracked placements once before
-  re-exec regardless (the next process cancels leftovers at boot).
+  seen before Phase 7 places nothing new; leftovers are alerted and rotor
+  exits 1, `--once` included. An auto-update restart cancels tracked placements
+  once before re-exec regardless, and leftovers are only a notice (the next
+  process cancels them at boot); a stop that arrives during the update check
+  exits normally instead.
+- A `--once` fire sends no "started"/"stopped" messages. An auto-update problem
+  is alerted once per distinct message (kept in the state file's `notes`), and
+  again after an update check succeeds in between.
 
 Sera signing and API:
 

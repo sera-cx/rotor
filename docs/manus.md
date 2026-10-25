@@ -41,20 +41,21 @@ long-running loop. Each invocation:
 2. cancels the stale set (single pass — it never blocks on Sera's cancel
    cooldown in `--once` mode),
 3. places a fresh quote set around the latest price,
-4. exits (`0` placed/ok, non-zero = could not requote this run — the next fire
-   retries).
+4. exits (`0` placed, or the last fire's quotes are still inside Sera's cancel
+   cooldown and keep resting; non-zero = could not requote this run — the next
+   fire retries).
 
-Startup failures share an hourly budget across fires: at most 3 fires per clock
-hour try to start, and after the third failure the rest of that hour's fires
-exit 1 at once without contacting Sera. With `--telegram`, the hour's first and
-third failed startup alert, and so does the first start that succeeds after them.
+A fire that cannot start (Sera unreachable or not ready, a bad key) exits 1, and
+the next fire tries again. With `--telegram`, such an outage alerts when it
+begins, every 6 hours while it lasts, and once when a fire starts again; the
+outage is kept beside the state file, so fires share it.
 A fire that places nothing alerts once no fire has placed for 15 minutes (at
 most once per 15 minutes), and the next fire that places reports that quoting
 resumed.
 
 Keep `.rotor_state.sqlite` on persistent storage. Open orders are recovered from
 Sera on each fire, but the file is the only record of positions held for return
-and of fills still to be counted (and of the startup budget); losing it forgets
+and of fills still to be counted (and of any startup outage); losing it forgets
 them, and rotor goes back to quoting both sides normally.
 
 ### The scheduled command

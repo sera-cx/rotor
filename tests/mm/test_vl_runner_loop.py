@@ -498,8 +498,9 @@ def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
 def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_path):
     # Sera books tick 1's USDC bid batch, but its answer times out on the way
     # back, and a taker fills 5 of its XSGD bid. Rotor recorded the batch before
-    # sending it, so tick 2 cancels it and the fill still becomes a position
-    # that is returned at its price, as if the answer had arrived.
+    # sending it, so the fill still becomes a position that is returned at its
+    # price, as if the answer had arrived. Tick 2 comes 12 hours later, long
+    # after the batch expired, so rotor stops tracking it instead of cancelling.
     client = _FakeClient(fill_first_xsgd_bid=True)
     client.send_errors = [httpx.ReadTimeout("timed out")]
     source = _SequencedSource({
@@ -513,7 +514,7 @@ def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_pat
 
     assert result == 0
     assert ("lost_vl", "batch-1") in client.events
-    assert ("cancel_vl", "batch-1") in client.events
+    assert ("cancel_vl", "batch-1") not in client.events
     assert _xsgd_asks(client)[1:] == [
         (Decimal("5"), Decimal("1.0025")),
         # The market fell to 0.98; the ask still does not sell below the fill.
@@ -539,7 +540,7 @@ def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(
     assert result == 0
     assert ("cancel_vl", "batch-1") in client.events
     # Its two legs settle with no fills, each with a warning saying why.
-    assert caplog.text.count("Sera has no record of it; settled with no fills") == 2
+    assert caplog.text.count("so it was settled with no fills") == 2
     assert _markets_quoted_per_tick(client)[1:] == [
         {"XSGD/USDC", "EURC/USDC"}, {"XSGD/USDC", "EURC/USDC"}]
     store = vr.StateStore(tmp_path / "state.sqlite")
@@ -1829,8 +1830,9 @@ def test_the_cancel_guard_waits_out_a_short_remainder_then_requotes(monkeypatch)
 
     _run(min_requote_seconds=300.0)
 
-    # 300 - 250 = 50 s left, under the 60 s limit: wait it out, then requote.
-    assert 50.0 in stop_flag.waits
+    # 300 - 250 = 50 s left, plus a 5 s margin for any clock difference from
+    # Sera, under the 60 s limit: wait it out, then requote.
+    assert stop_flag.waits == [55.0]
     assert [markets != set() for markets in _markets_quoted_per_tick(client)] == [True, True]
 
 
@@ -1947,3 +1949,155 @@ def test_a_source_that_fails_now_and_then_is_not_alerted_but_a_lasting_failure_i
         "rate instead (it bounds return orders; quotes are at Wise's prices either way):",
         RECOVERED,
     ]
+
+
+def test_the_last_quotes_are_pulled_when_no_pair_can_quote(monkeypatch):
+    # Tick 1 quotes; then every source, Wise included, goes down. Nothing can
+    # replace tick 1's quotes, so tick 2 cancels them instead of leaving them
+    # on a rate that may have gone stale.
+    client = _FakeClient()
+    source = _wire_runner(monkeypatch, client=client)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def sources_go_down(started, poll, stop=None):
+        source.always_fail = {("SGD", "USD"), ("EUR", "USD")}
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", sources_go_down)
+
+    _run()
+
+    assert len(client.batch_places) == 1
+    assert ("cancel_vl", "batch-1") in client.events
+    assert client.active_orders == set()
+
+
+def test_a_fire_once_that_leaves_orders_live_with_cancel_on_exit_exits_1(monkeypatch, tmp_path):
+    # It placed, but Sera keeps refusing the exit cancels: the supervisor must
+    # not read that as a clean book.
+    client = _FakeClient(cancel_ok=False)
+    _wire_runner(monkeypatch, client=client)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    result = vr.run(config_path="vl.toml", once=True, cancel_on_exit=True,
+                    state_path=tmp_path / "state.sqlite")
+
+    assert client.batch_places
+    assert result == 1
+
+
+def test_fire_once_runs_send_no_start_stop_pair_and_one_alert_per_update_problem(
+    monkeypatch, tmp_path,
+):
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
+    clock = _frozen_clock(monkeypatch, T0)
+    status = {"now": "failed"}
+
+    class Updater:
+        def __init__(self, *, interval_seconds: float) -> None:
+            pass
+
+        def run_if_due(self, _log):
+            if status["now"] == "failed":
+                return GitUpdateResult(status="failed", message="git fetch failed")
+            return GitUpdateResult(status="unchanged", message="already up to date")
+
+    monkeypatch.setattr(vr, "DailyGitUpdater", Updater)
+
+    def fire() -> int:
+        result = _run(once=True, telegram=True, auto_update=True,
+                      state_path=tmp_path / "state.sqlite")
+        clock["now"] += 305.0
+        return result
+
+    assert [fire() for _ in range(3)] == [0, 0, 0]
+    status["now"] = "unchanged"
+    fire()
+    status["now"] = "failed"
+    fire()
+
+    assert not notifier.containing("VL mm started")
+    assert not notifier.containing("VL mm stopped")
+    # Once when it starts failing, once more after it worked in between.
+    assert len(notifier.containing("auto-update failed: git fetch failed")) == 2
+
+
+def test_an_auto_update_restart_leaves_cooldown_orders_to_the_next_process(monkeypatch, tmp_path):
+    client = _FakeClient(open_orders=[_OLD_ORDER], cancel_ok=False)
+    _remember(tmp_path / "state.sqlite", "old-order")
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    class UpdatedOnce:
+        def __init__(self, *, interval_seconds: float) -> None:
+            pass
+
+        def run_if_due(self, _log):
+            return GitUpdateResult(status="updated", message="pulled")
+
+    monkeypatch.setattr(vr, "DailyGitUpdater", UpdatedOnce)
+    monkeypatch.setattr(vr, "restart_current_process", lambda: None)
+
+    vr.run(config_path="vl.toml", auto_update=True, telegram=True,
+           state_path=tmp_path / "state.sqlite")
+
+    assert [m for m in notifier.messages if "cancel" in m[0]] == [
+        ("🔄 1 order(s) are still in Sera's cancel cooldown; the restarted rotor "
+         "cancels them at boot", False)]
+
+
+def test_orders_past_their_expiry_stop_blocking_when_their_cancel_is_refused(monkeypatch):
+    # From tick 2 Sera refuses every cancel. Tick 1's orders expire at +600 s;
+    # once past that (and the grace), rotor stops tracking them and quotes.
+    client = _FakeClient()
+    _wire_runner(monkeypatch, client=client)
+    _fake_clock(monkeypatch, steps=[305.0, 400.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def cancels_refused(started, poll, stop=None):
+        client.cancel_ok = False
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", cancels_refused)
+
+    _run()
+
+    # Tick 1 placed; tick 2 (cancel refused) did not; tick 3 did.
+    assert len(client.batch_places) == 2
+
+
+def test_a_restart_cancels_its_order_on_a_pair_removed_from_the_config(monkeypatch, tmp_path):
+    removed = {**_OLD_ORDER, "symbol": "AUDD/USDC"}
+    client = _FakeClient(open_orders=[removed])
+    _remember(tmp_path / "state.sqlite", "old-order", market="AUDD/USDC")
+    _wire_runner(monkeypatch, client=client)
+    _stop_after_sleeps(monkeypatch, 1)
+
+    _run(state_path=tmp_path / "state.sqlite")
+
+    assert ("cancel_order", "old-order", 42) in client.events
+
+
+def test_an_order_someone_else_places_mid_run_is_alerted_once(monkeypatch):
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
+    clock = _fake_clock(monkeypatch, steps=[305.0, 305.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def someone_trades(started, poll, stop=None):
+        if clock["now"] == T0:
+            client.open_orders = [{**_OLD_ORDER, "trade_id": "someone-else"}]
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", someone_trades)
+
+    _run(telegram=True)
+
+    alerts = notifier.containing("did not place (someone-else)")
+    assert len(alerts) == 1 and alerts[0][1] is True
+    assert ("cancel_order", "someone-else", 42) not in client.events

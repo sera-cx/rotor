@@ -98,6 +98,10 @@ SETTLE_GRACE_SECONDS = 60.0
 # When the cancel-cooldown guard clears within this many seconds, the tick waits
 # for it instead of being skipped.
 MAX_GUARD_WAIT_SECONDS = 60.0
+# The guard waits this much past --min-requote-seconds, so a small clock
+# difference from Sera (reattached orders carry Sera's timestamps) cannot land
+# a cancel inside its cooldown.
+COOLDOWN_MARGIN_SECONDS = 5.0
 # A temporary startup failure is retried this often; a --once fire exits instead.
 BOOT_RETRY_SECONDS = 60.0
 # A startup outage is alerted when it begins and again after this long.
@@ -285,6 +289,13 @@ class StateStore:
         # Superseded by quoting; their rows only timed alerts, safe to drop.
         self._db.execute("DROP TABLE IF EXISTS dark_pairs")
         self._db.execute("DROP TABLE IF EXISTS watchdog")
+        # Small notes kept across runs, such as the last auto-update problem.
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         # The wallet and Sera deployment this file belongs to (see claim()).
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS identity (
@@ -379,8 +390,8 @@ class StateStore:
                 rows,
             )
 
-    def load_active(self, markets: set[str]) -> list[LivePlacement]:
-        """Load unresolved active orders for configured markets."""
+    def load_active(self, markets: set[str] | None = None) -> list[LivePlacement]:
+        """Load unresolved active orders, for `markets` only when given."""
         rows = self._db.execute(
             """
             SELECT order_id, uuid_int, market, side, kind, spent_token,
@@ -402,7 +413,7 @@ class StateStore:
             batch_id,
             qty_base,
         ) in rows:
-            if market not in markets:
+            if markets is not None and market not in markets:
                 continue
             order = LiveOrder(
                 side=side,
@@ -549,6 +560,16 @@ class StateStore:
                 """,
                 rows,
             )
+
+    def note_changed(self, key: str, value: str) -> bool:
+        """Store `value` under `key`; return whether it differs from what was there."""
+        row = self._db.execute("SELECT value FROM notes WHERE key = ?", (key,)).fetchone()
+        if (row[0] if row else "") == value:
+            return False
+        with self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO notes (key, value) VALUES (?, ?)", (key, value))
+        return True
 
     def replace_quoting(self, episodes: dict[str, QuotingEpisode]) -> None:
         """Replace the not-quoting records."""
@@ -969,7 +990,9 @@ def run(
         f"{' (dry-run)' if dry_run else ''}"
     )
     log.warning("%s", started)
-    notifier.notify_startup(started)
+    # A --once fire every few minutes would make these a message pair per fire.
+    if not once:
+        notifier.notify_startup(started)
     if skipped:
         notifier.send_raw(
             "⚠️ Not quoting "
@@ -982,7 +1005,7 @@ def run(
     # Reattach to any orders already resting on Sera for the configured markets
     # so a restart does not orphan or duplicate live quotes. In dry-run we never
     # touch live state.
-    stored_live = [] if state is None else state.load_active(markets)
+    stored_live = [] if state is None else state.load_active()
     foreign: list[str] = []
     live: list[LivePlacement] = [] if dry_run else _load_live_placements(
         client,
@@ -1034,6 +1057,9 @@ def run(
         window=max(poll_seconds * 3, NOT_QUOTING_ALERT_SECONDS),
         carry_over=once,
     )
+    # A --once fire's exit code; cleanup that leaves orders live overrides it.
+    code = 0
+    requote_after = min_requote_seconds + COOLDOWN_MARGIN_SECONDS
     try:
         while not stop.requested:
             tick_started = time.time()
@@ -1047,12 +1073,13 @@ def run(
                     log.warning("auto-update stopping VL loop before restart")
                     notifier.send_raw(f"🔄 rotor auto-update: {update_result.message}; restarting")
                     break
-                if update_result is not None and update_result.status in ("failed", "skipped"):
-                    # --auto-update was asked for; say so when it is not working.
-                    notifier.send_raw(
-                        f"⚠️ rotor auto-update {update_result.status}: {update_result.message}",
-                        important=True,
-                    )
+                if update_result is not None:
+                    # --auto-update was asked for; say so when it stops working,
+                    # once per problem (a --once fire checks every time).
+                    failing = update_result.status in ("failed", "skipped")
+                    problem = f"{update_result.status}: {update_result.message}" if failing else ""
+                    if (state is None or state.note_changed("auto_update", problem)) and failing:
+                        notifier.send_raw(f"⚠️ rotor auto-update {problem}", important=True)
             # Re-read Sera's metadata hourly (sooner after a rejection that
             # suggests it went stale). A failed refresh keeps the last good
             # metadata and is tried again later; --once runs read it at boot.
@@ -1088,7 +1115,7 @@ def run(
             # Phase 0: if we have no tracked state, try to recover open orders
             # from Sera before quoting again (falls back to prior local state).
             if not dry_run and not live:
-                stored = state.load_active(markets) if state is not None else live
+                stored = state.load_active() if state is not None else live
                 foreign = []
                 live = _load_live_placements(
                     client,
@@ -1115,7 +1142,8 @@ def run(
                 except Exception as exc:
                     log.warning("skip tick: server time unavailable: %s", exc)
                     if once:
-                        return 1
+                        code = 1
+                        break
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
             # Phase 1: read the fills of every order rotor accounts for: its live
@@ -1138,6 +1166,9 @@ def run(
                     live = _prune_fully_filled_placements(
                         live, _filled_quantities(fills), log)
                     if state is not None:
+                        live = _prune_expired_placements(
+                            live, unsettled, server_now=tick_expiration - order_ttl_seconds,
+                            log=log)
                         state.replace_active(live)
                         positions = _positions_for_quoting(
                             state,
@@ -1147,11 +1178,13 @@ def run(
                             log=log,
                             unknown=unknown_orders,
                             stuck=stuck_settlements,
+                            notifier=notifier,
                         )
                 except Exception as exc:
                     log.warning("skip tick: fill polling failed: %s", exc)
                     if once:
-                        return 1
+                        code = 1
+                        break
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
 
@@ -1173,7 +1206,8 @@ def run(
             except Exception as exc:
                 log.warning("skip tick: %s", exc)
                 if once:
-                    return 1
+                    code = 1
+                    break
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
@@ -1189,9 +1223,20 @@ def run(
                 if not dry_run:
                     _update_quoting(quoting, tick_refs, set(), PlacementIssues(),
                                     placed=False, log=log)
+                    # Nothing replaces the resting quotes, priced on what may
+                    # now be a stale rate: pull them once Sera's cooldown allows
+                    # rather than leave them until they expire.
+                    if live and all_requote_safe(
+                        [order for placement in live for order in placement.orders],
+                        requote_after,
+                    ):
+                        live = _cancel_placements(client, live, log)
+                        if state is not None:
+                            state.replace_active(live)
                 log.warning("skip tick: no emitted order intents")
                 if once:
-                    return 1
+                    code = 1
+                    break
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
@@ -1210,7 +1255,8 @@ def run(
             if dry_run:
                 # Dry-run logs grouping only; no signatures or cancellations.
                 if once:
-                    return 0
+                    code = 0
+                    break
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
@@ -1220,15 +1266,16 @@ def run(
             # (restarts, shortened poll intervals) skips the tick instead.
             live_orders = [
                 order for placement in live for order in placement.orders]
-            if live_orders and not all_requote_safe(live_orders, min_requote_seconds):
+            if live_orders and not all_requote_safe(live_orders, requote_after):
                 wait_s = (
                     max(order.placed_at for order in live_orders)
-                    + min_requote_seconds - time.time()
+                    + requote_after - time.time()
                 )
                 if wait_s > MAX_GUARD_WAIT_SECONDS:
                     log.debug("skip tick: cancel cooldown guard clears in %.1fs", wait_s)
                     if once:
-                        return 0
+                        code = 0
+                        break
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
                 log.debug("waiting %.1fs for the cancel cooldown guard", wait_s)
@@ -1245,12 +1292,22 @@ def run(
                     state.replace_active(live)
                 if live:
                     if once:
-                        return 1
+                        code = 1
+                        break
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
                 # Sera answers a cancel before applying it; until it does, the
                 # old batch still holds its budget and could block the new one.
-                _wait_until_gone(client, cancelled, log, stop=stop)
+                # The same reads show orders someone else has on these markets.
+                foreign = []
+                _wait_until_gone(
+                    client, cancelled, log, stop=stop, markets=markets,
+                    known=_known_order_ids(state, []) | cancelled, foreign=foreign)
+                if foreign and not foreign_alerted:
+                    message = _foreign_orders_message(client, foreign)
+                    log.error("%s", message)
+                    notifier.send_raw(f"⚠️ {message}", important=True)
+                foreign_alerted = bool(foreign)
             if stop.requested and cancel_on_exit:
                 # Shutting down to leave nothing resting: placing a fresh set now
                 # would only leave orders Sera will not let us cancel yet.
@@ -1266,7 +1323,8 @@ def run(
                     elapsed, MIN_ORDER_TTL_SECONDS,
                 )
                 if once:
-                    return 1
+                    code = 1
+                    break
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
@@ -1289,7 +1347,8 @@ def run(
             if state is not None:
                 state.replace_active(live)
             if once:
-                return 0 if placed else 1
+                code = 0 if placed else 1
+                break
             sleep_remaining(tick_started, poll_seconds, stop)
     except Exception as exc:
         # Anything that ends the loop unexpectedly (a state file that cannot be
@@ -1307,15 +1366,18 @@ def run(
         # could be picked off during the restart gap.
         if (cancel_on_exit or restart_after_update) and live and not dry_run:
             # A restart cancels once: the next process cancels leftovers at boot.
+            # A stop that came during the update check means exit, not restart.
+            restarting = restart_after_update and not stop.requested
             live = _cancel_before_exit(
                 client, live, log, stop=stop, notifier=notifier,
-                wait=cancel_on_exit and not restart_after_update,
+                wait=cancel_on_exit and not restarting, restarting=restarting,
                 order_ttl_seconds=order_ttl_seconds,
             )
             if state is not None:
                 state.replace_active(live)
             left_live = bool(live)
-        notifier.notify_shutdown("VL mm stopped")
+        if not once:
+            notifier.notify_shutdown("VL mm stopped")
         if state is not None:
             state.close()
         # Release the HTTP connection pool (best-effort; fakes may lack close()).
@@ -1332,7 +1394,7 @@ def run(
             log.error("auto-update restart failed: %s", exc)
             return 1
     # --cancel-on-exit could not clear everything.
-    return 1 if left_live else 0
+    return 1 if left_live else code
 
 
 def _cancel_before_exit(
@@ -1344,13 +1406,15 @@ def _cancel_before_exit(
     notifier: TelegramNotifier,
     wait: bool,
     order_ttl_seconds: int,
+    restarting: bool = False,
 ) -> list[LivePlacement]:
     """Cancel tracked placements on shutdown; report any that stay live.
 
     Sera refuses to cancel an order younger than its cancel cooldown, so with
     `wait` rotor sleeps until the youngest remaining order is old enough and
     tries once more (a second Ctrl-C or SIGTERM skips the wait). Anything still
-    live is logged and alerted with when it expires.
+    live is logged and alerted with when it expires. When `restarting`, the
+    next process cancels the leftovers at boot, so that is only a notice.
     """
     live = _cancel_placements(client, live, log)
     youngest = max(
@@ -1369,6 +1433,14 @@ def _cancel_before_exit(
             live = _cancel_placements(client, live, log)
     if live:
         count = sum(len(placement.orders) or 1 for placement in live)
+        if restarting:
+            message = (
+                f"{count} order(s) are still in Sera's cancel cooldown; the restarted "
+                "rotor cancels them at boot"
+            )
+            log.warning("%s", message)
+            notifier.send_raw(f"🔄 {message}")
+            return live
         message = (
             f"{count} order(s) could not be cancelled before exit (Sera's cancel "
             f"cooldown); they expire by about {_fmt_utc(youngest + order_ttl_seconds)}"
@@ -2544,15 +2616,15 @@ def _cancel_one(cancel: Callable[[], bool], what: str, log: logging.Logger) -> b
 def _is_order_gone(exc: Exception) -> bool:
     """Return True when a cancel error means the order no longer exists on Sera.
 
-    A 404 (or a typed code about a missing/already-resolved order) means the
-    order expired, filled, or was already cancelled — retaining it would block
-    all future quoting. Genuinely retryable errors (5xx, network, cooldown) are
-    NOT treated as gone, so a maybe-live order is never dropped prematurely.
+    Sera's "not found" answer (or a typed code about a missing or resolved
+    order) means the order expired, filled, or was already cancelled; keeping
+    it would block all future quoting. Retryable errors (5xx, network,
+    cooldown) are not gone, and neither is a bare 404: Sera never answers a
+    cancel with one, so it comes from something in front of Sera (a CDN page
+    during a deploy), and the order may well be live.
     """
     if not isinstance(exc, errors.SeraError):
         return False
-    if exc.status_code == 404:
-        return True
     # Sera answers a cancel for an order or batch it does not know with a 400
     # that says so: "Order not found for cancellation:..." or "VL batch not
     # found: ...". An unanswered placement Sera never booked ends up here.
@@ -2585,9 +2657,10 @@ def _load_live_placements(
     fallback to empty local state would orphan them (live on Sera, untracked).
 
     With `known` (the order ids this rotor's state and ledger hold), only those
-    are reattached: an open order rotor did not place belongs to someone else
-    on this wallet (another rotor, say), and reattaching would cancel it. Its id
-    goes into `foreign` instead.
+    are reattached, whatever their market, so an order on a pair since removed
+    from the config is still cancelled. An open order rotor did not place, on a
+    configured market, belongs to someone else on this wallet (another rotor,
+    say), and reattaching would cancel it; its id goes into `foreign` instead.
     """
     rows = None
     last_exc: Exception | None = None
@@ -2612,16 +2685,15 @@ def _load_live_placements(
     batches: dict[str, list[LiveOrder]] = {}
     for row in rows:
         market = str(row.get("symbol") or row.get("market") or "").upper()
-        if market not in markets:
-            continue
         # Accept only bid/ask orders with enough ids to cancel later.
         side = str(row.get("side") or "").lower()
         order_id = row.get("trade_id") or row.get("order_id")
         uuid_int = row.get("uuid_int")
         if side not in ("bid", "ask") or not order_id or not uuid_int:
             continue
-        if known is not None and str(order_id) not in known:
-            if foreign is not None:
+        ours = market in markets if known is None else str(order_id) in known
+        if not ours:
+            if known is not None and market in markets and foreign is not None:
                 foreign.append(str(order_id))
             continue
         # Preserve server creation time when available for cooldown math.
@@ -2673,6 +2745,9 @@ def _wait_until_gone(
     stop: StopFlag,
     polls: int = CANCEL_SETTLE_POLLS,
     interval: float = CANCEL_SETTLE_INTERVAL_SECONDS,
+    known: set[str] | None = None,
+    markets: set[str] | frozenset[str] = frozenset(),
+    foreign: list[str] | None = None,
 ) -> None:
     """Wait (briefly) until cancelled orders no longer show as open on Sera.
 
@@ -2680,16 +2755,23 @@ def _wait_until_gone(
     budget frozen until then. Earn wallets hold exactly their budget, so new
     quotes placed at once can be refused for lack of funds. After `polls`
     reads rotor places anyway; a refusal then affects only that placement.
+    The same reads fill `foreign` with open orders on `markets` that are not
+    in `known`: someone else trading on this wallet.
     """
     for _ in range(polls):
         try:
-            open_ids = {
-                str(row.get("trade_id") or row.get("order_id"))
-                for row in client.get_open_orders()
-            }
+            rows = client.get_open_orders()
         except Exception as exc:
             log.debug("could not confirm cancels before placing: %s", exc)
             return
+        open_ids = {str(row.get("trade_id") or row.get("order_id")) for row in rows}
+        if known is not None and foreign is not None:
+            foreign[:] = sorted(
+                order_id
+                for row in rows
+                if (order_id := str(row.get("trade_id") or row.get("order_id"))) not in known
+                and str(row.get("symbol") or row.get("market") or "").upper() in markets
+            )
         if not open_ids & order_ids:
             return
         if stop.wait(interval):
@@ -2827,6 +2909,7 @@ def _positions_for_quoting(
     log: logging.Logger,
     unknown: set[str] = frozenset(),
     stuck: set[str] | None = None,
+    notifier: TelegramNotifier | None = None,
 ) -> dict[str, Position]:
     """Settle every final order into the stored positions, then add fills in flight.
 
@@ -2864,11 +2947,27 @@ def _positions_for_quoting(
         before, after = state.settle_order(order, settled)
         if order.order_id in unknown:
             # Expected only for a placement whose answer was lost and that
-            # Sera never booked; anything else is worth a look.
-            log.warning(
-                "%s %s order %s: Sera has no record of it; settled with no fills",
-                order.market, order.side, order.order_id,
+            # Sera never booked. Otherwise Sera dropped its record (an old order
+            # pruned while rotor was off, say), and a fill on it is uncounted.
+            message = (
+                f"Sera has no record of {order.market} {order.side} order "
+                f"{order.order_id}, so it was settled with no fills. That is "
+                "expected only if its placement got no answer; otherwise check "
+                f"{order.market}'s position by hand."
             )
+            log.warning("%s", message)
+            if notifier is not None:
+                notifier.send_raw(f"⚠️ {message}", important=True)
+        for fill in rows:
+            if _settlement_status(fill) in ("failed", "reverted") and fill.get("tx_hash"):
+                # Rotor trusts Sera's status; one with a transaction behind it
+                # may have settled after all, and is worth checking on-chain.
+                log.warning(
+                    "%s %s order %s: Sera reports a fill as %s, yet it has transaction "
+                    "%s; rotor does not count it, so check that trade on-chain",
+                    order.market, order.side, order.order_id,
+                    _settlement_status(fill), fill["tx_hash"],
+                )
         if settled > 0:
             log.info(
                 "%s %s filled %s @ %s; position %s -> %s",
@@ -2958,6 +3057,39 @@ def _prune_fully_filled_placements(
             placement.orders = leftover
             remaining.append(placement)
     return remaining
+
+
+def _prune_expired_placements(
+    live: list[LivePlacement],
+    unsettled: list[UnsettledOrder],
+    *,
+    server_now: float,
+    log: logging.Logger,
+) -> list[LivePlacement]:
+    """Stop tracking orders past their signed expiry (plus a grace period).
+
+    Sera has swept them, so there is nothing left to cancel, and a cancel Sera
+    keeps refusing (an order id it no longer accepts, say) would otherwise block
+    every tick. The expiry comes from the ledger, read before this tick settles
+    anything; an order the ledger does not hold is kept. Ledger rows are
+    untouched, so fills are still counted.
+    """
+    expiry = {order.order_id: order.expiration for order in unsettled}
+    kept: list[LivePlacement] = []
+    for placement in live:
+        orders = [
+            order for order in placement.orders
+            if server_now < expiry.get(order.order_id, server_now) + SETTLE_GRACE_SECONDS
+        ]
+        if len(orders) < len(placement.orders):
+            log.warning(
+                "no longer tracking %d expired order(s): %s",
+                len(placement.orders) - len(orders),
+                ",".join(o.order_id for o in placement.orders if o not in orders),
+            )
+        if orders:
+            kept.append(replace(placement, orders=orders))
+    return kept
 
 
 def _filled_base_qty(fill: dict) -> Decimal:

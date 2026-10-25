@@ -247,7 +247,9 @@ poetry run rotor mm vl \
 ```
 
 Dry run fetches Sera market metadata and reference prices, builds quotes, and
-prints only logs. It does not sign, place, or cancel orders.
+prints only logs. It does not sign, place, or cancel orders. It also does not
+read the wallet's vault balances, so a live run leaves out or trims orders the
+vault cannot fund that the dry run still shows.
 
 ## Startup
 
@@ -321,7 +323,8 @@ placed (those in its state file or settlement ledger). Run one rotor per wallet:
 an open order on those markets that rotor did not place means another rotor, or
 someone else, is trading the wallet, so rotor refuses to start (with an
 important alert) and never touches that order. If one appears while rotor runs,
-it alerts once and leaves it alone.
+it alerts once and leaves it alone. Its own orders come back whatever their
+market, so an order on a pair you removed from the config is cancelled too.
 It cancels those reattached placements before the first quote tick by default.
 It is one pass that never blocks on Sera's cancel cooldown: an order still on
 cooldown stays tracked, and the tick loop's cancel guard waits or skips a tick
@@ -334,8 +337,12 @@ clean-place-clean cycle, but it is not a pure cancel-only command.
 `--once` runs a single tick and exits, which suits an external scheduler (e.g. a
 Manus scheduled task) firing on a cadence. The boot cancel never blocks on
 Sera's cancel cooldown, so an invocation returns promptly. Each fire reattaches open orders from Sera, cancels the stale
-set, places a fresh quote set, and exits (`0` placed/ok; non-zero = this run could
-not requote and the next fire should retry). Schedule the interval at or above
+set, places a fresh quote set, and exits (`0` placed, or skipped because the last
+fire's quotes are still inside Sera's cancel cooldown and keep resting; non-zero =
+this run could not requote, or `--cancel-on-exit` left orders live, and the next
+fire should retry). A fire waits up to about a minute for that cooldown when it
+is nearly over. Fires send no Telegram "started"/"stopped" pair, and an
+auto-update problem alerts once, not on every fire. Schedule the interval at or above
 Sera's ~5-minute cancel cooldown, keep `--order-ttl` at or above the interval, and
 do not pass `--cancel-on-exit` (quotes should rest between fires). See
 [manus.md](manus.md) for a full Manus walkthrough.
