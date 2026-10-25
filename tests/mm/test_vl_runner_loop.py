@@ -277,14 +277,7 @@ class _FakeClient:
         self.batch_places.append({"batch_id": batch_id, "legs": rows})
         self.events.append(("place_vl", batch_id))
         return VLBatchResult(
-            vl_batch_id=batch_id,
-            order_ids=[record.order_id for record in records],
-            records=records,
-            amendments=[],
-            cancelled=[],
-            fills=[],
-            vl_group=None,
-        )
+            vl_batch_id=batch_id, records=records, amendments=[], cancelled=[])
 
     def sign_order(
         self,

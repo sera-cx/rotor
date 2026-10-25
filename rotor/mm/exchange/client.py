@@ -102,56 +102,27 @@ class VLBatchAmendment:
 
     # Order id of the leg Sera amended.
     order_id: str
-    # Amount sent by Rotor.
-    original_amount: str
     # Amount accepted by Sera after clipping.
     actual_amount: str
-    # Sera-provided explanation for the amendment.
-    reason: str
-
-
-@dataclass(frozen=True)
-class VLCancelledLeg:
-    """VL sibling dropped by the matching engine at placement."""
-
-    # Order id of the leg Sera cancelled.
-    order_id: str
-    # Sera-provided cancellation reason.
-    reason: str
-
-
-@dataclass(frozen=True)
-class VLGroup:
-    """Authoritative shared-budget snapshot returned by Sera."""
-
-    # Primary order id identifying the VL group.
-    primary_id: str
-    # Maximum shared spend budget for the group.
-    max_budget: str
-    # Budget consumed so far, as reported by Sera.
-    budget_consumed: str
-    # Token symbol/address used for spend accounting.
-    spent_token: str
 
 
 @dataclass(frozen=True)
 class VLBatchResult:
-    """Server-acknowledged VL batch placement result."""
+    """Server-acknowledged VL batch placement result.
 
-    # Batch identifier used for later cancellation.
+    Sera books a batch under the signed ids or not at all (it answers an error
+    unless its order ids match the signed ones), so the batch id and records are
+    rotor's own.
+    """
+
+    # Batch identifier used for later cancellation (the first leg's order id).
     vl_batch_id: str
-    # Order ids returned by Sera for each submitted leg.
-    order_ids: list[str]
     # Order ids plus uuid_int values retained for local tracking.
     records: list[OrderRecord]
     # Quantity clips returned by Sera.
     amendments: list[VLBatchAmendment]
-    # Legs cancelled immediately by Sera.
-    cancelled: list[VLCancelledLeg]
-    # Immediate fills returned in the placement response.
-    fills: list[dict]
-    # Optional authoritative VL budget state.
-    vl_group: VLGroup | None
+    # Order ids of legs the matching engine dropped at placement.
+    cancelled: list[str]
 
 
 @dataclass(frozen=True)
@@ -389,12 +360,8 @@ class SeraClient:
 
     def send_order(self, order: SignedOrder) -> OrderRecord:
         """Send one signed order (`POST /orders`)."""
-        body = self._request("POST", "/orders", json_body=order.wire, expect_status=(200, 201))
-        return OrderRecord(
-            # Sera may echo a final order id; otherwise keep the generated id.
-            order_id=body.get("order_id", order.order_id),
-            uuid_int=order.uuid_int,
-        )
+        self._request("POST", "/orders", json_body=order.wire, expect_status=(200, 201))
+        return OrderRecord(order_id=order.order_id, uuid_int=order.uuid_int)
 
     def place_order(
         self,
@@ -448,54 +415,17 @@ class SeraClient:
             json_body={"orders": [order.wire for order in orders]},
             expect_status=(200, 201),
         )
-        # Reconcile server-returned order ids with the locally built orders.
-        order_ids = [str(v) for v in body.get("order_ids") or []]
-        if not order_ids:
-            order_ids = [p.order_id for p in orders]
-        # The batch is already live on Sera; resolve a cancelable batch id BEFORE
-        # any mismatch handling so a malformed response can never orphan it.
-        vl_batch_id = str(body.get("vl_batch_id") or body.get("batch_id") or batch.vl_batch_id)
-        # A length mismatch breaks positional id->leg tracking, but the whole
-        # batch is still cancelable by vl_batch_id. Log loudly and track what we
-        # can correlate rather than raising and leaving live orders unmanaged.
-        if len(order_ids) != len(orders):
-            self._log.error(
-                "POST /orders/vl/batch returned %d order_ids for %d submitted legs; "
-                "tracking batch %s for cancellation",
-                len(order_ids),
-                len(orders),
-                vl_batch_id,
-            )
-        # Pair returned order ids with the uuid_int values computed for signing
-        # (positionally, over the safely-correlated prefix on a mismatch).
-        records = [
-            OrderRecord(order_id=order_id, uuid_int=order.uuid_int)
-            for order_id, order in zip(order_ids, orders, strict=False)
-        ]
-        # Parse optional shared-budget state into a typed dataclass.
-        vl_group = _parse_vl_group(body.get("vl_group"))
         return VLBatchResult(
-            vl_batch_id=vl_batch_id,
-            order_ids=order_ids,
-            records=records,
+            vl_batch_id=batch.vl_batch_id,
+            records=[OrderRecord(order_id=o.order_id, uuid_int=o.uuid_int) for o in orders],
             amendments=[
                 VLBatchAmendment(
                     order_id=str(row.get("order_id", "")),
-                    original_amount=str(row.get("original_amount") or ""),
                     actual_amount=str(row.get("actual_amount") or ""),
-                    reason=str(row.get("reason", "")),
                 )
                 for row in body.get("amendments", []) or []
             ],
-            cancelled=[
-                VLCancelledLeg(
-                    order_id=str(row.get("order_id", "")),
-                    reason=str(row.get("reason", "")),
-                )
-                for row in body.get("cancelled", []) or []
-            ],
-            fills=list(body.get("fills", []) or []),
-            vl_group=vl_group,
+            cancelled=[str(row.get("order_id", "")) for row in body.get("cancelled", []) or []],
         )
 
     def place_vl_batch(self, legs: list[VLLeg]) -> VLBatchResult:
@@ -919,16 +849,3 @@ def _clean_credential(name: str, value: str) -> str:
 def _require_secure_base_url(base_url: str) -> None:
     """Reject a non-TLS Sera base URL (the maker signs orders against it)."""
     require_https("SERA_BASE_URL", base_url)
-
-
-def _parse_vl_group(value) -> VLGroup | None:
-    """Parse optional VL group metadata from a Sera response."""
-    # Missing/malformed group data is optional and should not fail placement.
-    if not isinstance(value, dict):
-        return None
-    return VLGroup(
-        primary_id=str(value.get("primary_id", "")),
-        max_budget=str(value.get("max_budget", "")),
-        budget_consumed=str(value.get("budget_consumed", "")),
-        spent_token=str(value.get("spent_token", "")),
-    )

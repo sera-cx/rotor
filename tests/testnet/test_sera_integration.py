@@ -339,13 +339,11 @@ def test_testnet_two_wallet_vl_maker_taker_fill_flow():
         )
         assert taker_record.order_id
 
-        fills = list(maker_result.fills)
-        if not fills:
-            fills = _poll_for_fills(
-                maker,
-                [record.order_id for record in maker_result.records],
-                wait_seconds=wait_seconds,
-            )
+        fills = _poll_for_fills(
+            maker,
+            [record.order_id for record in maker_result.records],
+            wait_seconds=wait_seconds,
+        )
         if not fills:
             fills = _poll_for_fills(
                 taker,

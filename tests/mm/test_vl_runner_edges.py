@@ -18,7 +18,6 @@ from rotor.mm.exchange.client import (
     SignedVLBatch,
     VLBatchAmendment,
     VLBatchResult,
-    VLCancelledLeg,
 )
 from rotor.mm.positions import Position
 from rotor.mm.quote_engine import LiveOrder
@@ -117,15 +116,9 @@ def test_place_groups_uses_vl_batch_and_tracks_intents():
         def send_vl_batch(self, batch):
             return VLBatchResult(
                 vl_batch_id=batch.vl_batch_id,
-                order_ids=["leg-1", "leg-2"],
-                records=[
-                    OrderRecord("leg-1", 101),
-                    OrderRecord("leg-2", 102),
-                ],
+                records=[OrderRecord("leg-1", 101), OrderRecord("leg-2", 102)],
                 amendments=[],
                 cancelled=[],
-                fills=[],
-                vl_group=None,
             )
 
     intents = [_intent(), _intent(market="EURC/USDC")]
@@ -142,7 +135,6 @@ def test_place_groups_uses_vl_batch_and_tracks_intents():
     assert [order.order_id for order in placement.orders] == ["leg-1", "leg-2"]
     assert [order.side for order in placement.orders] == ["bid", "bid"]
     assert [order.market for order in placement.orders] == ["XSGD/USDC", "EURC/USDC"]
-    assert placement.intent_by_order_id == {"leg-1": intents[0], "leg-2": intents[1]}
 
 
 def test_place_groups_skips_a_rejected_order_and_places_the_rest(caplog):
@@ -545,7 +537,6 @@ def test_load_live_placements_groups_vl_batches_and_filters_markets():
     assert placements[1].vl_batch_id == "batch-1"
     assert [order.order_id for order in placements[1].orders] == ["vl-leg-1", "vl-leg-2"]
     assert [order.market for order in placements[1].orders] == ["XSGD/USDC", "XSGD/USDC"]
-    assert placements[1].intent_by_order_id is None
 
 
 def test_placement_from_vl_result_applies_amendments_and_drops_cancelled():
@@ -556,20 +547,15 @@ def test_placement_from_vl_result_applies_amendments_and_drops_cancelled():
     ]
     result = VLBatchResult(
         vl_batch_id="b1",
-        order_ids=["o0", "o1", "o2"],
         records=[OrderRecord("o0", 1), OrderRecord("o1", 2), OrderRecord("o2", 3)],
-        amendments=[VLBatchAmendment(
-            order_id="o1", original_amount="100", actual_amount="60", reason="budget_clip")],
-        cancelled=[VLCancelledLeg(order_id="o2", reason="stp")],
-        fills=[],
-        vl_group=None,
+        amendments=[VLBatchAmendment(order_id="o1", actual_amount="60")],
+        cancelled=["o2"],
     )
 
     placement = vr._placement_from_vl_result("USDC", result, intents)
 
     # The server-cancelled leg is not tracked as live.
     assert [o.order_id for o in placement.orders] == ["o0", "o1"]
-    assert "o2" not in placement.intent_by_order_id
     sizes = {o.order_id: o.qty_base for o in placement.orders}
     # Clipped leg tracks the accepted (amended) size so a full fill prunes it.
     assert sizes["o0"] == Decimal("100")

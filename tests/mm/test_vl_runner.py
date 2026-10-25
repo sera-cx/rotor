@@ -615,9 +615,8 @@ def test_opposite_fills_net_to_flat_for_quoting_before_they_are_stored():
 class _PlacingClient:
     vl_batch_min = 2
 
-    def __init__(self, *, fail_standalone: bool = False, short_ids: bool = False) -> None:
+    def __init__(self, *, fail_standalone: bool = False) -> None:
         self.fail_standalone = fail_standalone
-        self.short_ids = short_ids
         self.cancelled: list[str] = []
 
     def sign_vl_batch(self, legs):
@@ -627,17 +626,8 @@ class _PlacingClient:
 
     def send_vl_batch(self, batch):
         records = [OrderRecord(order.order_id, order.uuid_int) for order in batch.orders]
-        if self.short_ids:
-            records = records[:-1]
         return VLBatchResult(
-            vl_batch_id=batch.vl_batch_id,
-            order_ids=[record.order_id for record in records],
-            records=records,
-            amendments=[],
-            cancelled=[],
-            fills=[],
-            vl_group=None,
-        )
+            vl_batch_id=batch.vl_batch_id, records=records, amendments=[], cancelled=[])
 
     def sign_order(self, market, side, qty_base, price, expiration):
         return SignedOrder("solo-1", 7, {"market": market, "side": side})
@@ -703,18 +693,6 @@ def test_a_rejected_vl_batch_does_not_stop_the_standalone_orders():
     assert [row.order_id for row in store.load_unsettled()] == ["solo-1"]
 
 
-def test_vl_batch_with_mismatched_ids_is_tracked_and_every_leg_recorded():
-    store = vr.StateStore(":memory:")
-
-    placed = _place_groups(_PlacingClient(short_ids=True), _groups()[:1], LOG, state=store)
-
-    # Still tracked so it can be cancelled, but no leg of Sera's short reply is
-    # trusted to a side. The ledger was written from rotor's own signed legs.
-    assert [order.order_id for order in placed[0].orders] == ["leg-0"]
-    assert placed[0].intent_by_order_id == {}
-    assert [row.order_id for row in store.load_unsettled()] == ["leg-0", "leg-1"]
-
-
 @pytest.mark.parametrize("lost", [
     httpx.ReadTimeout("timed out"),
     errors.SeraError(None, "Service temporarily unavailable; please retry", 503),
@@ -744,12 +722,8 @@ def test_an_order_without_an_answer_stays_recorded_and_is_tracked_for_cancel(los
         ("solo-1", 7, "XSGD/USDC", "ask")]
 
 
-def test_standalone_placement_tracks_intent_for_settlement():
-    """A singleton (standalone) order must be settled like a VL leg.
-
-    Regression: standalone placements once omitted intent_by_order_id, so their
-    fills were invisible while VL legs' were. Both paths must record intents.
-    """
+def test_standalone_placement_is_recorded_for_settlement():
+    """A singleton (standalone) order is recorded in the ledger like a VL leg."""
     source = _intent("XSGD/USDC", "bid", "USDC", price="0.99", mid="1.00")
 
     store = vr.StateStore(":memory:")
@@ -763,7 +737,6 @@ def test_standalone_placement_tracks_intent_for_settlement():
     assert len(placements) == 1
     placement = placements[0]
     assert placement.kind == "standalone"
-    assert placement.intent_by_order_id == {"solo-1": source}
     assert [
         (row.order_id, row.market, row.side, row.price, row.expiration)
         for row in store.load_unsettled()

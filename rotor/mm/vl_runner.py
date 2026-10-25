@@ -169,10 +169,6 @@ class LivePlacement:
     placed_at: float
     # VL batch id is present only for VL placements.
     vl_batch_id: str | None = None
-    # Immediate fills returned by placement, when Sera provides them.
-    fills: list[dict] | None = None
-    # Maps order id to the intent it was placed from (its side and price).
-    intent_by_order_id: dict[str, OrderIntent] | None = None
 
 
 @dataclass(frozen=True)
@@ -1371,16 +1367,9 @@ def run(
             if issues.stale_metadata:
                 next_refresh = min(next_refresh, last_refresh + EARLY_REFRESH_SECONDS)
             # Placements Sera may have booked without answering are tracked too,
-            # so the next cycle cancels them with the rest.
+            # so the next cycle cancels them with the rest. (An order filled at
+            # placement is pruned by the next tick's fill read.)
             live = placed + issues.unanswered
-            try:
-                live = _prune_fully_filled_placements(
-                    live,
-                    _filled_quantities_from_placement_fills(placed),
-                    log,
-                )
-            except Exception as exc:
-                log.warning("placement fill tracking failed: %s", exc)
             if state is not None:
                 state.replace_active(live)
             if placed:
@@ -2410,13 +2399,12 @@ def _place_vl_batch(
             continue
         placed.append(placement)
         log.debug(
-            "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
+            "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d",
             result.vl_batch_id,
             spent_token,
             len(result.records),
             len(result.amendments),
             len(result.cancelled),
-            len(result.fills),
         )
         return []
     return legs
@@ -2477,9 +2465,6 @@ def _place_standalone(
             qty_base=intent.qty_base,
         )],
         placed_at=time.time(),
-        # Track the source intent so this order's fills can be counted at its
-        # price once they settle.
-        intent_by_order_id={record.order_id: intent},
     )
     placed.append(placement)
     log.debug(
@@ -2553,9 +2538,6 @@ def _unanswered_placement(
         ],
         placed_at=now,
         vl_batch_id=vl_batch_id,
-        intent_by_order_id={
-            order.order_id: intent for order, intent in zip(orders, intents, strict=True)
-        },
     )
 
 
@@ -2568,7 +2550,7 @@ def _placement_from_vl_result(
     # Use one timestamp for every sibling so cooldown checks are consistent.
     now = time.time()
     # Legs Sera dropped at placement never rest; do not track them as live.
-    cancelled_ids = {leg.order_id for leg in result.cancelled if leg.order_id}
+    cancelled_ids = set(result.cancelled)
     # Sera may clip a leg's size; track the accepted (amended) amount so a full
     # fill at the clipped size is recognized and pruned.
     amended = {
@@ -2576,18 +2558,10 @@ def _placement_from_vl_result(
         for a in result.amendments
         if a.order_id and a.actual_amount not in (None, "")
     }
-    # Map returned order ids back to their source intents for fill settlement.
-    # When Sera returns a different number of ids than legs, that positional
-    # match is unreliable, so no fills are attributed to the batch at all.
-    rows = list(zip(result.records, intents, strict=False))
-    attributable = len(result.records) == len(intents)
     orders: list[LiveOrder] = []
-    intent_by_order_id: dict[str, OrderIntent] = {}
-    for record, intent in rows:
+    for record, intent in zip(result.records, intents, strict=True):
         if record.order_id in cancelled_ids:
             continue
-        if attributable:
-            intent_by_order_id[record.order_id] = intent
         orders.append(
             LiveOrder(
                 side=intent.side,
@@ -2604,8 +2578,6 @@ def _placement_from_vl_result(
         orders=orders,
         placed_at=now,
         vl_batch_id=result.vl_batch_id,
-        fills=result.fills,
-        intent_by_order_id=intent_by_order_id,
     )
 
 
@@ -2807,9 +2779,8 @@ def _load_live_placements(
                 vl_batch_id=vl_batch_id,
             )
         )
-    # Reattached placements have no intent_by_order_id: they are tracked for
-    # cancellation only. Fills are settled from the unsettled_orders ledger, which
-    # recorded each order when it was placed.
+    # Reattached placements are tracked for cancellation only. Fills are settled
+    # from the unsettled_orders ledger, which recorded each order when placed.
     if out and announce:
         log.debug("reattached %d open placement(s)", len(out))
     return out
@@ -3090,24 +3061,6 @@ def _position_text(position: Position | None) -> str:
     if position is None:
         return "flat"
     return f"{fmt(position.net_base)} @ {fmt(position.price)}"
-
-
-def _filled_quantities_from_placement_fills(
-    placements: list[LivePlacement],
-) -> dict[str, Decimal]:
-    """Return fill quantities from immediate placement responses."""
-    out: dict[str, Decimal] = {}
-    for placement in placements:
-        if not placement.fills:
-            continue
-        for fill in placement.fills:
-            order_id = str(fill.get("order_id") or "")
-            if not order_id:
-                continue
-            qty_base = _filled_base_qty(fill)
-            if qty_base > 0:
-                out[order_id] = out.get(order_id, Decimal("0")) + qty_base
-    return out
 
 
 def _prune_fully_filled_placements(
