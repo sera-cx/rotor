@@ -148,8 +148,8 @@ Rules:
   reference rates; `wise` (for currencies none of them covers) uses Wise's
   mid-market rate. When Wise cannot convert from a currency (it sends to CNH,
   COP, NGN, ZAR and AED but not from them), that rate is read from the other
-  direction's reply. ARS and PEN have no Wise route at all and no central-bank
-  source in rotor, so they cannot be quoted.
+  direction's reply. For ARS and PEN Wise gives a mid but no transfer price in
+  either direction, so both of their sides quote around that mid.
 - Every pair's normal quotes are placed at Wise's after-fee prices for each
   order's own final size (after budget and balance trimming): a bid at what
   converting that much of the base token through Wise pays, an ask at what

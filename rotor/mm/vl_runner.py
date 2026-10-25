@@ -2109,6 +2109,7 @@ def _at_wise_prices(
             out.append(intent)
             continue
         fetch = wise.sell_rate if intent.side == "bid" else wise.buy_rate
+        fallback = None
         try:
             obs = fetch(runtime.iso_base, runtime.iso_quote, intent.qty_base)
             age = now - obs.ts
@@ -2123,14 +2124,14 @@ def _at_wise_prices(
             price = quantize_price(info, mid.rate * (1 + sign * bps / BPS), intent.side)
             if outage and refs is not None:
                 refs.wise_outage.setdefault(intent.market, exc)
-            log.info(
-                "%s %s at mid %s %s %s bps: Wise cannot price it (%s: %s)",
-                intent.market, intent.side, fmt(mid.rate), "-" if sign < 0 else "+",
-                fmt(bps), type(exc).__name__, exc,
-            )
+            fallback = f"mid {fmt(mid.rate)} {'-' if sign < 0 else '+'} {fmt(bps)} bps: " \
+                f"Wise cannot price it ({type(exc).__name__}: {exc})"
         if price == intent.price:
+            # Unchanged since the first pass (already logged there).
             out.append(intent)
             continue
+        if fallback is not None:
+            log.info("%s %s at %s", intent.market, intent.side, fallback)
         try:
             validate_minimums(
                 info,
