@@ -1901,9 +1901,38 @@ def _intents_for_runtime(
     # Sizes are final now; Wise's fees fall with size, so price them again
     # (a reply for an unchanged size is reused, not re-requested).
     intents = _at_wise_prices(intents, runtime, now=now, log=log)
+    intents = _without_self_cross(intents, log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
     return intents
+
+
+def _without_self_cross(intents: list[OrderIntent], log: logging.Logger) -> list[OrderIntent]:
+    """Drop a normal order that would trade against this pair's own return order.
+
+    The return order is priced from the mid and its fill price, the normal order
+    from Wise's live rate, so once the market moves away from a daily mid the two
+    can meet. Sera would refuse the later one as a self-trade, and with it any VL
+    batch it belongs to. Holding a position, the return order is the one to keep.
+    """
+    returning = next((intent for intent in intents if intent.is_return), None)
+    if returning is None:
+        return intents
+    out: list[OrderIntent] = []
+    for intent in intents:
+        crosses = not intent.is_return and (
+            intent.price >= returning.price if returning.side == "ask"
+            else intent.price <= returning.price
+        )
+        if crosses:
+            log.info(
+                "%s %s %s left out: it would cross the return %s at %s",
+                intent.market, intent.side, fmt(intent.price), returning.side,
+                fmt(returning.price),
+            )
+            continue
+        out.append(intent)
+    return out
 
 
 def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list[OrderIntent]:

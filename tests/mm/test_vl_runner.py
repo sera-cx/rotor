@@ -24,6 +24,7 @@ from rotor.mm.vl_runner import (
     OrderIntent,
     _place_groups,
     _validate_budget_caps,
+    _without_self_cross,
     group_intents,
 )
 from rotor.price_reference.models import PriceObservation
@@ -826,3 +827,25 @@ def test_fills_stuck_settling_an_hour_after_expiry_are_reported_once(caplog):
     # The fill still holds the return side while it settles.
     assert positions["XSGD/USDC"].net_base == Decimal("-40")
     assert store.load_unsettled() != []
+
+
+def test_a_normal_order_crossing_the_pairs_return_order_is_left_out():
+    # After a bid fill the return ask is priced from a daily mid, the normal bid
+    # from Wise's live rate; a move away from the mid can put the bid above it.
+    returning = replace(_intent("EURC/USDC", "ask", "EURC", price="1.08022"), is_return=True)
+    crossing_bid = _intent("EURC/USDC", "bid", "USDC", price="1.08070")
+    touching_bid = _intent("EURC/USDC", "bid", "USDC", price="1.08022")
+    lower_bid = _intent("EURC/USDC", "bid", "USDC", price="1.08000")
+
+    assert _without_self_cross([crossing_bid, returning], LOG) == [returning]
+    assert _without_self_cross([touching_bid, returning], LOG) == [returning]
+    assert _without_self_cross([lower_bid, returning], LOG) == [lower_bid, returning]
+
+    # The mirror case: a return bid after an ask fill, and the normal ask.
+    return_bid = replace(_intent("EURC/USDC", "bid", "USDC", price="1.07900"), is_return=True)
+    crossing_ask = _intent("EURC/USDC", "ask", "EURC", price="1.07850")
+    assert _without_self_cross([return_bid, crossing_ask], LOG) == [return_bid]
+
+    # Without a return order nothing is dropped, even a crossed normal pair.
+    normal = [_intent("EURC/USDC", "bid", "USDC", price="1.1"), _intent("EURC/USDC", "ask", "EURC", price="1.0")]
+    assert _without_self_cross(normal, LOG) == normal

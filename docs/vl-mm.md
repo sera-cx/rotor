@@ -28,9 +28,9 @@ time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
 - After the window it **holds at the fill price indefinitely**. Rotor never
   returns a position at a loss against its fill price. Breakeven is measured on
   price alone; any fees or gas a deployment charges are not included.
-- Unlike normal quotes, it is not priced at Wise: it walks inside Wise's
-  after-fee price, back toward the fill price, so the position can return to
-  neutral.
+- Unlike normal quotes, it is not priced at Wise: it can start outside Wise's
+  after-fee price and walks back toward the fill price, so the position can
+  return to neutral.
 - It never quotes closer to the latest mid than `return_bps`. If the market moved
   in rotor's favour, the order sits `return_bps` from mid instead of overpaying.
 - It never spends more than the normal order it replaces, so a larger position is
@@ -40,7 +40,10 @@ time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
   the side to a dust-sized return order; the next fill there
   absorbs it.
 - The other side keeps quoting normally. Fills there grow the position, and its
-  fill price and clock become size-weighted averages.
+  fill price and clock become size-weighted averages. If the market moves away
+  from a daily mid far enough that the other side's normal order would cross
+  the return order, that normal order is left out for the tick: Sera would
+  refuse the self-trade, and with it any VL batch the order belongs to.
 
 Fills are counted from a ledger, not from the resting quote set. Every order
 is recorded with its side, limit price, and signed expiry once rotor has signed
