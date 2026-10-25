@@ -40,23 +40,6 @@ def test_all_requote_safe_uses_boundary(monkeypatch):
     assert qe.all_requote_safe(orders, min_requote_seconds=50.1) is False
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "2026-01-01T00:00:00Z",
-        "2026-01-01T08:00:00+08:00",
-        1767225600,
-    ],
-)
-def test_parse_ts_accepts_common_api_timestamp_shapes(value):
-    assert qe.parse_ts(value) == pytest.approx(1767225600.0)
-
-
-def test_parse_ts_returns_none_for_bad_values():
-    assert qe.parse_ts("") is None
-    assert qe.parse_ts("not-a-date") is None
-
-
 def test_fmt_helpers_are_compact():
     assert qe.fmt(Decimal("100.000")) == "100"
 

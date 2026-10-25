@@ -45,7 +45,6 @@ from rotor.mm.quote_engine import (
     all_requote_safe,
     build_client,
     fmt,
-    parse_ts,
     sleep_remaining,
 )
 from rotor.mm.vl_config import PairConfig, VLConfig, load_vl_config
@@ -58,7 +57,7 @@ from rotor.price_reference import (
     load_token_to_iso,
     market_to_iso_pair,
 )
-from rotor.price_reference.sources import WiseNoRoute
+from rotor.price_reference.sources import WiseNoRoute, parse_ts
 from rotor.updater import (
     DEFAULT_UPDATE_INTERVAL_SECONDS,
     DailyGitUpdater,

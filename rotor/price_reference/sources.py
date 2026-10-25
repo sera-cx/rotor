@@ -167,7 +167,7 @@ class WiseRateSource:
             source=self.name,
             pair=_pair(base, quote),
             rate=rate,
-            ts=_parse_ts(body.get("rateTimestamp") or body.get("createdTime")),
+            ts=_wise_ts(body.get("rateTimestamp") or body.get("createdTime")),
         )
 
     def _observation(
@@ -178,7 +178,7 @@ class WiseRateSource:
             pair=_pair(base, quote),
             rate=rate,
             # Freshness is anchored to when Wise set the rate.
-            ts=_parse_ts(body.get("rateTimestamp") or body.get("createdTime")),
+            ts=_wise_ts(body.get("rateTimestamp") or body.get("createdTime")),
         )
 
     def _reply(self, source: str, target: str, amount_field: str, amount: Decimal) -> dict:
@@ -561,14 +561,18 @@ def _published_ts(*dates: Any) -> float:
     as fresh as its oldest input. A reply with no usable date at all is a
     failed read: stamping it "now" would make a rate of unknown age look fresh.
     """
-    stamps = [ts for ts in (_date_ts(date) for date in dates) if ts is not None]
+    stamps = [ts for ts in (parse_ts(date) for date in dates) if ts is not None]
     if not stamps:
         raise ValueError(f"no usable publication date in {dates!r}")
     return min(stamps)
 
 
-def _date_ts(value: Any) -> float | None:
-    """Parse a publication date/time into POSIX seconds, or None if unusable."""
+def parse_ts(value: Any) -> float | None:
+    """Parse an API date or timestamp into POSIX seconds, or None if unusable.
+
+    Accepts numbers (already seconds), date-only values and ISO 8601 times;
+    naive values are read as UTC so freshness checks are deterministic.
+    """
     if value is None:
         return None
     if isinstance(value, int | float):
@@ -613,39 +617,13 @@ def _positive_decimal(value: Any) -> Decimal:
     return out
 
 
-def _parse_ts(value: Any) -> float:
-    """Parse common provider timestamp shapes into POSIX seconds.
-
-    A missing timestamp is a failed read, never "now": a rate of unknown age
-    must not look fresh.
-    """
-    if value is None:
-        raise ValueError("reply has no timestamp")
-    # Numeric timestamps are already seconds.
-    if isinstance(value, int | float):
-        return float(value)
-    # String timestamps may be numeric, ISO 8601, or Wise's strict format.
-    text = str(value).strip()
-    if not text:
-        raise ValueError("reply has an empty timestamp")
-    # Python's fromisoformat expects an explicit +00:00 instead of trailing Z.
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        # Try numeric strings first.
-        return float(text)
-    except ValueError:
-        pass
-    try:
-        # Accept ISO 8601 variants first.
-        parsed = dt.datetime.fromisoformat(text)
-    except ValueError:
-        # Wise historically used this offset-aware format.
-        parsed = dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
-    # Treat naive timestamps as UTC so freshness checks are deterministic.
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.UTC)
-    return parsed.timestamp()
+def _wise_ts(value: Any) -> float:
+    """The time Wise set a rate. A reply without one is a failed read, never
+    "now": a rate of unknown age must not look fresh."""
+    ts = parse_ts(value)
+    if ts is None:
+        raise ValueError(f"Wise reply has no timestamp it can read: {value!r}")
+    return ts
 
 
 def _parse_ecb_xml(text: str) -> tuple[str, dict[str, Decimal]]:

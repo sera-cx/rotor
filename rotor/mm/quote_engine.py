@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 import signal
 import threading
@@ -73,31 +72,6 @@ def sleep_remaining(started: float, poll_seconds: float, stop: StopFlag | None =
         stop.wait(remaining)
     else:
         time.sleep(remaining)
-
-
-def parse_ts(value) -> float | None:
-    """Parse common API timestamp values into POSIX seconds."""
-    # Missing/empty timestamps let callers fall back to current time.
-    if value is None:
-        return None
-    # Numeric timestamps are already seconds.
-    if isinstance(value, int | float):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    # Convert trailing-Z UTC form to Python's accepted +00:00 form.
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        # Accept ISO 8601 values from API records.
-        parsed = dt.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    # Treat naive timestamps as UTC to keep cooldown math deterministic.
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.UTC)
-    return parsed.timestamp()
 
 
 def fmt(value: Decimal) -> str:

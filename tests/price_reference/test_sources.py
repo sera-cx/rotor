@@ -14,6 +14,7 @@ from rotor.price_reference.sources import (
     EcbRateSource,
     FedH10RateSource,
     WiseNoRoute,
+    parse_ts,
 )
 from rotor.price_reference.symbols import market_to_iso_pair
 
@@ -326,3 +327,20 @@ def test_a_daily_feed_is_read_once_per_minute_for_all_pairs_and_so_is_a_failure(
     src.quote("SGD", "USD")
     src.quote("JPY", "USD")
     assert calls["n"] == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T08:00:00+08:00",
+        1767225600,
+    ],
+)
+def test_parse_ts_accepts_common_api_timestamp_shapes(value):
+    assert parse_ts(value) == pytest.approx(1767225600.0)
+
+
+def test_parse_ts_returns_none_for_bad_values():
+    assert parse_ts("") is None
+    assert parse_ts("not-a-date") is None
