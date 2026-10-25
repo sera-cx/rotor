@@ -368,7 +368,7 @@ def test_a_brief_skip_is_not_alerted_and_a_long_one_is_alerted_once():
     ]
 
 
-def test_not_quoting_episodes_survive_restarts_and_skip_pairs_alerted_elsewhere(tmp_path):
+def test_not_quoting_episodes_survive_restarts(tmp_path):
     sent: list[str] = []
 
     class Notifier:
@@ -383,19 +383,55 @@ def test_not_quoting_episodes_survive_restarts_and_skip_pairs_alerted_elsewhere(
             _refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log, now=0.0)
     finally:
         store.close()
+    assert sent == []
+    # A --once fire 15 minutes later is a new process; the episode carried over.
     store = vr.StateStore(path)
     try:
         alerts = vr.DarkPairAlerts({"XSGD/USDC"}, state=store)
-        # A pair whose rate passed its carry limit already got the stale alert.
-        alerts.update(_refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log,
-                      alerted_elsewhere={"XSGD/USDC"}, now=900.0)
-        alerts.update(_refs(quoted=["XSGD/USDC"]), notifier=Notifier(), log=log,
-                      alerted_elsewhere={"XSGD/USDC"}, now=1200.0)
+        alerts.update(_refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log, now=900.0)
+        alerts.update(_refs(quoted=["XSGD/USDC"]), notifier=Notifier(), log=log, now=1200.0)
         assert store.load_dark_pairs() == {}
     finally:
         store.close()
 
-    assert sent == []
+    assert [text.splitlines()[0] for text in sent] == [
+        "⚠️ Not quoting these pairs; the other pairs are quoting:", "✅ Quoting again:"]
+
+
+def test_wise_being_unreachable_for_the_window_is_alerted_once(tmp_path):
+    sent: list[str] = []
+
+    class Notifier:
+        def send_raw(self, text, *, important=False):
+            sent.append(text)
+
+    def outage():
+        refs = _refs(quoted=["XSGD/USDC", "EURC/USDC"])
+        refs.wise_outage["XSGD/USDC"] = RuntimeError("ReadTimeout")
+        refs.wise_outage["EURC/USDC"] = RuntimeError("ReadTimeout")
+        return refs
+
+    log = logging.getLogger("test")
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        alerts = vr.DarkPairAlerts({"XSGD/USDC", "EURC/USDC"}, state=store)
+        alerts.update(outage(), notifier=Notifier(), log=log, now=0.0)
+        alerts.update(outage(), notifier=Notifier(), log=log, now=600.0)
+        assert sent == []
+        alerts.update(outage(), notifier=Notifier(), log=log, now=900.0)
+        alerts.update(outage(), notifier=Notifier(), log=log, now=1200.0)
+        # The episode is persisted, so --once fires share it.
+        assert vr.WISE_OUTAGE in store.load_dark_pairs()
+        alerts.update(_refs(quoted=["XSGD/USDC", "EURC/USDC"]), notifier=Notifier(), log=log,
+                      now=1500.0)
+        assert store.load_dark_pairs() == {}
+    finally:
+        store.close()
+
+    assert len(sent) == 2
+    assert sent[0].startswith("⚠️ Wise is not answering")
+    assert "for 15m (EURC/USDC, XSGD/USDC): ReadTimeout" in sent[0]
+    assert sent[1].startswith("✅ Wise is answering again")
 
 
 def test_state_store_drops_the_superseded_pending_returns_table(tmp_path):

@@ -72,7 +72,7 @@ def test_wise_source_rejects_response_without_enabled_options(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="no enabled transfer method"):
-        src.quote("SGD", "USD")
+        src.sell_rate("SGD", "USD", Decimal("1000"))
 
 
 def test_wise_source_rejects_non_positive_target(monkeypatch):
@@ -89,7 +89,7 @@ def test_wise_source_rejects_non_positive_target(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="rate must be positive"):
-        src.quote("SGD", "USD")
+        src.sell_rate("SGD", "USD", Decimal("1000"))
 
 
 def test_wise_source_propagates_http_errors(monkeypatch):

@@ -1618,6 +1618,13 @@ class _AgedSource(_SequencedSource):
         )
 
 
+class _NoWiseMid(_AgedSource):
+    """The same source, with Wise unable to give a mid (it is down)."""
+
+    def mid_rate(self, base, quote, qty_base):
+        raise RuntimeError("Wise is down")
+
+
 class _RecordingNotifier:
     """Stand-in for TelegramNotifier that records every message it is asked to send."""
 
@@ -1647,9 +1654,32 @@ def _headings(notifier: _RecordingNotifier) -> list[tuple[str, bool]]:
     return [(text.split("\n")[0], important) for text, important in notifier.messages]
 
 
-def test_run_keeps_quoting_on_a_weekend_rate_and_warns_once(monkeypatch, tmp_path):
+def test_on_a_weekend_pairs_quote_on_wises_live_mid_without_an_alert(monkeypatch, tmp_path):
     client = _FakeClient()
     source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _stop_after_sleeps(monkeypatch, 3)
+
+    result = vr.run(
+        config_path="unused.toml",
+        min_requote_seconds=0.0,
+        telegram=True,
+        state_path=tmp_path / "state.sqlite",
+    )
+
+    # Friday's daily rate is set aside while Wise answers: nothing to announce.
+    assert result == 0
+    assert len(client.batch_places) == 3
+    assert not notifier.containing("not updating")
+    assert not notifier.containing("Wise's mid-market rate instead")
+
+
+def test_run_keeps_quoting_on_a_weekend_rate_and_warns_once(monkeypatch, tmp_path):
+    client = _FakeClient()
+    # Wise has no mid either, so the carried Friday rate is the mid.
+    source = _NoWiseMid(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
     _wire_runner(monkeypatch, config=_config(), client=client, source=source)
     monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
@@ -1700,9 +1730,31 @@ def test_run_with_halt_on_stale_reference_quotes_on_wises_mid_not_weekend_rates(
     assert len(notifier.containing("use Wise's mid-market rate instead")) == 1
 
 
+class _WiseDown(_SequencedSource):
+    """A working mid source, with Wise unreachable for every request."""
+
+    def _settlement(self, base, quote, factor):
+        raise RuntimeError("ReadTimeout: Wise did not answer")
+
+
+def test_with_wise_down_normal_orders_sit_at_the_outage_spread_around_the_mid(monkeypatch):
+    client = _FakeClient()
+    source = _WiseDown({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+
+    assert vr.run(config_path="unused.toml", once=True, min_requote_seconds=0.0) == 0
+
+    # The pairs keep quoting, fallback_weekend_bps (default 200) from the mid.
+    bids = {leg["market"]: leg["price"] for leg in client.batch_places[0]["legs"]}
+    asks = {row["market"]: row["price"] for row in client.standalone_places}
+    assert bids == {"XSGD/USDC": Decimal("0.98"), "EURC/USDC": Decimal("1.96")}
+    assert asks == {"XSGD/USDC": Decimal("1.02"), "EURC/USDC": Decimal("2.04")}
+
+
 def test_fire_once_runs_announce_a_weekend_only_once(monkeypatch, tmp_path):
     client = _FakeClient()
-    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
+    source = _NoWiseMid(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
     _wire_runner(monkeypatch, config=_config(), client=client, source=source)
     monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
@@ -1720,20 +1772,31 @@ def test_fire_once_runs_announce_a_weekend_only_once(monkeypatch, tmp_path):
     assert len(notifier.containing("not updating")) == 1
 
 
-def test_tick_references_record_carried_and_skipped_pairs(monkeypatch):
-    client = _FakeClient()
-    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE, always_fail={("EUR", "USD")})
+def test_tick_references_record_carried_covered_and_skipped_pairs(monkeypatch):
     config = _config()
-    _wire_runner(monkeypatch, config=config, client=client, source=source)
-    runtimes = vr._build_runtimes(config, client, max_reference_age_s=None)
-    refs = vr.TickReferences()
 
-    intents = vr._build_tick_intents(config, runtimes, {}, expiration=1, log=LOG, refs=refs)
+    def tick(source):
+        client = _FakeClient()
+        _wire_runner(monkeypatch, config=config, client=client, source=source)
+        runtimes = vr._build_runtimes(config, client, max_reference_age_s=None)
+        refs = vr.TickReferences()
+        intents = vr._build_tick_intents(config, runtimes, {}, expiration=1, log=LOG, refs=refs)
+        return {intent.market for intent in intents}, refs
 
-    assert {intent.market for intent in intents} == {"XSGD/USDC"}
+    # Wise answers for SGD: the carried XSGD rate is set aside for Wise's mid.
+    # EUR fails everywhere (its own source and Wise), so EURC has no mid.
+    markets, refs = tick(_AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE, always_fail={("EUR", "USD")}))
+    assert markets == {"XSGD/USDC"}
+    assert refs.covered == {"XSGD/USDC"}
+    assert refs.quoted["XSGD/USDC"].source == "wise"
+    assert isinstance(refs.skipped["EURC/USDC"], ReferenceUnavailable)
+
+    # Wise has no mid: XSGD quotes on the carried rate, and EURC has no mid at all.
+    markets, refs = tick(_NoWiseMid(WEEKEND_RATES, age_s=WEEKEND_AGE, always_fail={("EUR", "USD")}))
+    assert markets == {"XSGD/USDC"}
+    assert refs.covered == set()
     assert refs.quoted["XSGD/USDC"].stale is True
     assert isinstance(refs.skipped["EURC/USDC"], ReferenceUnavailable)
-    assert not isinstance(refs.skipped["EURC/USDC"], ReferenceTooStale)
 
 
 def test_a_rate_past_its_carry_limit_is_replaced_by_wises_mid_with_one_alert(
@@ -1803,7 +1866,6 @@ def _refs(*, stale=True, age_s=WEEKEND_AGE, ts=FRIDAY) -> vr.TickReferences:
 STARTED = "🟡 Reference rates are not updating. These pairs keep quoting on the last published rate:"
 REMINDER = "🟡 Still quoting on reference rates that have not updated:"
 RECOVERED = "✅ Reference rates updated again:"
-STOPPED = "⛔ Stopped quoting on reference rates past their carry limit:"
 
 
 def test_stale_alerts_announce_remind_and_recover():
@@ -1821,25 +1883,28 @@ def test_stale_alerts_announce_remind_and_recover():
     assert _headings(notifier) == [(STARTED, True), (REMINDER, False), (RECOVERED, False)]
     started = notifier.messages[0][0]
     assert "XSGD/USDC: bnm rate dated 1970-01-21, 3d 0h old" in started
-    assert "no new rate by 1970-01-28 00:00 UTC" in started
+    assert "carried until 1970-01-28 00:00 UTC at most" in started
     assert "weekends and public holidays" in started
     assert "XSGD/USDC: bnm rate dated 1970-01-24" in notifier.messages[2][0]
 
 
-def test_stale_alerts_report_a_rate_past_its_carry_limit():
+def test_a_carried_rate_wise_covers_leaves_the_episode_alone():
+    # Wise blinks on a weekend: one tick on the carried rate opens the episode;
+    # ticks where Wise's mid covers it neither close nor reopen it.
     alerts = _stale_alerts()
     notifier = _RecordingNotifier()
-    too_old = vr.TickReferences(skipped={
-        "XSGD/USDC": ReferenceTooStale("XSGD/USDC: bnm quote is stale age=700000.0s"),
-    })
+    covered = vr.TickReferences(
+        quoted={"XSGD/USDC": ReferencePrice(pair="SGD/USD", rate=Decimal("0.74"),
+                                            ts=FRIDAY + 3 * DAY, source="wise")},
+        covered={"XSGD/USDC"},
+    )
 
     alerts.update(_refs(), notifier=notifier, log=LOG, now=0.0)
-    alerts.update(too_old, notifier=notifier, log=LOG, now=305.0)
-    alerts.update(too_old, notifier=notifier, log=LOG, now=610.0)
-    alerts.update(_refs(stale=False, age_s=60.0), notifier=notifier, log=LOG, now=915.0)
+    alerts.update(covered, notifier=notifier, log=LOG, now=305.0)
+    alerts.update(_refs(), notifier=notifier, log=LOG, now=610.0)
+    alerts.update(covered, notifier=notifier, log=LOG, now=915.0)
 
-    assert _headings(notifier) == [(STARTED, True), (STOPPED, True), (RECOVERED, False)]
-    assert "age=700000.0s" in notifier.messages[1][0]
+    assert _headings(notifier) == [(STARTED, True)]
 
 
 def test_stale_alerts_ignore_a_one_off_fetch_failure():

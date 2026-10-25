@@ -27,7 +27,8 @@ from rotor.mm.vl_runner import (
     _without_self_cross,
     group_intents,
 )
-from rotor.price_reference.models import PriceObservation
+from rotor.price_reference.models import PriceObservation, ReferencePrice
+from rotor.price_reference.sources import WiseNoRoute
 
 LOG = logging.getLogger("test")
 HOUR = 3600.0
@@ -120,15 +121,18 @@ class _Wise:
     default_max_age_s = 600.0
 
     def __init__(self, *, live="1.0000", sell_fee="0.0024", buy_fee="0.0037", age=0.0,
-                 fail=False):
+                 fail=False, no_sell_route=False):
         self.live = Decimal(live)
         self.sell_fee = Decimal(sell_fee)
         self.buy_fee = Decimal(buy_fee)
         self.age = age
         self.fail = fail
+        self.no_sell_route = no_sell_route
         self.priced: list[tuple[str, Decimal]] = []
 
     def sell_rate(self, base, quote, qty_base):
+        if self.no_sell_route:
+            raise WiseNoRoute("Wise does not convert SGD to USD")
         return self._obs("sell", qty_base, self.live * (1 - self.sell_fee))
 
     def buy_rate(self, base, quote, qty_base):
@@ -144,9 +148,10 @@ class _Wise:
 NOW = 1_800_000_000.0
 
 
-def _priced(intents, wise, info=None):
+def _priced(intents, wise, info=None, *, mid="1.0000", stale=False, now=NOW, refs=None):
     runtime = replace(_runtime(info), settlement=wise)
-    return vr._at_wise_prices(intents, runtime, now=NOW, log=LOG)
+    ref = ReferencePrice(pair="SGD/USD", rate=Decimal(mid), ts=now, source="ecb", stale=stale)
+    return vr._at_wise_prices(intents, runtime, ref, now=now, log=LOG, refs=refs)
 
 
 def _vl_config(*, return_bps: str = "2", budget: str = "1000", window: str = "48") -> VLConfig:
@@ -313,11 +318,39 @@ def test_a_return_order_keeps_its_auction_price_and_asks_wise_nothing():
     assert wise.priced == [("sell", Decimal("100"))]
 
 
-def test_without_a_fresh_wise_rate_the_pair_does_not_quote():
-    with pytest.raises(vr.ReferenceUnavailable, match="Wise settlement rate failed"):
-        _priced(_quote(), _Wise(fail=True))
-    with pytest.raises(vr.ReferenceUnavailable, match="Wise settlement rate is 601s old"):
-        _priced(_quote(), _Wise(age=601.0))
+def test_a_side_wise_does_not_offer_sits_at_the_weekday_spread_around_the_mid():
+    # Wise sends to some currencies it cannot send from: the ask keeps Wise's
+    # price, the bid sits fallback_bps (default 50) under the mid.
+    refs = vr.TickReferences()
+    bid, ask = _priced(_quote(), _Wise(no_sell_route=True), refs=refs)
+
+    assert bid.price == Decimal("0.9950")
+    assert ask.price == Decimal("1.0037")
+    # Wise answered (it offers no such route), so this is not an outage.
+    assert refs.wise_outage == {}
+
+
+def test_the_weekend_spread_covers_fx_weekends_carried_mids_and_wise_outages():
+    saturday = NOW + 24 * HOUR  # NOW is a Friday morning.
+    friday_night = NOW + 13 * HOUR  # 21:00 UTC, when the FX weekend starts.
+    for wise, kwargs in (
+        (_Wise(no_sell_route=True), {"now": saturday}),
+        (_Wise(no_sell_route=True), {"now": friday_night}),
+        (_Wise(no_sell_route=True), {"stale": True}),
+    ):
+        bid, _ask = _priced(_quote(), wise, **kwargs)
+        assert bid.price == Decimal("0.9800")  # 200 bps under the mid
+    # Sunday 21:00 UTC the market reopens and the weekday spread is back.
+    bid, _ask = _priced(_quote(), _Wise(no_sell_route=True), now=NOW + 61 * HOUR)
+    assert bid.price == Decimal("0.9950")
+
+    # Wise unreachable, or its rate older than its window: both sides go wide,
+    # and the outage is recorded for the alert.
+    for wise in (_Wise(fail=True), _Wise(age=601.0)):
+        refs = vr.TickReferences()
+        bid, ask = _priced(_quote(), wise, refs=refs)
+        assert (bid.price, ask.price) == (Decimal("0.9800"), Decimal("1.0200"))
+        assert list(refs.wise_outage) == ["XSGD/USDC"]
 
 
 def test_a_bid_below_the_market_minimum_at_wises_price_is_dropped():

@@ -44,14 +44,19 @@ Pricing:
 - Tokens are priced at their currency's reference rate (Sera's 1:1 stablecoin
   assumption); rotor reads no token market price, so a depeg is not detected.
 - The source rate is quote-per-base and is the pair's mid. `ecb`/`fed`/`bnm`
-  are published reference rates; `wise` is the midpoint of Wise's after-fee
-  sell and buy rates for the pair's `qty_base`.
+  are published reference rates; `wise` is Wise's mid-market rate (from the
+  buy-direction reply, inverted, when Wise cannot convert from the base).
 - Every normal order is priced at Wise's after-fee rate for its own final
   size (`_at_wise_prices`, run before and again after trimming): bid = Wise sell
   rate, ask = Wise buy cost, cheapest enabled method with no Wise balance on
   either end, rounded away from mid. Return orders (`is_return`) keep their
-  auction price. A failed or >10-minute-old Wise rate skips the pair; a bid
-  below the market minimum at Wise's price is dropped.
+  auction price. A side Wise cannot price (`WiseNoRoute`: no such route;
+  otherwise an outage or a >10-minute-old rate) sits at the mid -/+
+  `fallback_bps`, or `fallback_weekend_bps` on an FX weekend (Friday 21:00 to
+  Sunday 21:00 UTC, `_fx_weekend`), on a carried mid, or during an outage
+  (recorded in `TickReferences.wise_outage` and alerted after 15 minutes). A
+  bid below the market minimum at its price is dropped. `fallback_weekend_bps`
+  is never below `fallback_bps`.
 - Bids round down and asks round up.
 - Amounts round down.
 - Quotes fail closed when market minimums are not met.
@@ -59,11 +64,13 @@ Pricing:
   stale daily feed is detectable; a reply without a usable date is a failed
   read (never stamped "now"). Staleness windows are per-source (intraday for
   `wise`, daily for `ecb`/`fed`/`bnm`), overridable via config/CLI.
-- A stale daily reference is carried forward until its carry limit (default 7
-  days from the published date), because official sources do not publish on
-  weekends or holidays. The oracle marks that price `stale`, the runner alerts
-  on it, and a `wise` quote is never carried. `--halt-on-stale-reference`
-  disables carrying.
+- A stale daily reference is set aside for Wise's live mid when Wise answers
+  (`TickReferences.covered`, no alert). Only when Wise has no mid is it carried
+  forward, until its carry limit (default 7 days from the published date),
+  because official sources do not publish on weekends or holidays. The oracle
+  marks that price `stale`, the runner alerts on it, and a `wise` quote is never
+  carried. `--halt-on-stale-reference` disables carrying. Wise's own freshness
+  window is fixed; the age overrides apply to the daily sources only.
 - A pair whose own source fails (`ReferenceUnavailable`, including a rate past
   its carry limit or any stale rate under `--halt-on-stale-reference`) uses
   Wise's mid-market rate instead (`_wise_mid`, from the same reply as the sell

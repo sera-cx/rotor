@@ -36,7 +36,7 @@ from rotor.mm.exchange.client import (
     VLBatchResult,
     VLLeg,
 )
-from rotor.mm.grid import quantize_price, quantize_qty, validate_minimums
+from rotor.mm.grid import BPS, quantize_price, quantize_qty, validate_minimums
 from rotor.mm.positions import Position, apply_fill, return_price
 from rotor.mm.quote_engine import (
     LiveOrder,
@@ -52,12 +52,12 @@ from rotor.notifications import TelegramNotifier
 from rotor.price_reference import (
     ReferencePrice,
     ReferencePriceOracle,
-    ReferenceTooStale,
     ReferenceUnavailable,
     load_price_reference_source,
     load_token_to_iso,
     market_to_iso_pair,
 )
+from rotor.price_reference.sources import WiseNoRoute
 from rotor.updater import (
     DEFAULT_UPDATE_INTERVAL_SECONDS,
     DailyGitUpdater,
@@ -88,6 +88,8 @@ STALE_REMINDER_SECONDS = 6 * 60 * 60.0
 # A pair that produces no quote this long while others may still quote (its
 # price source failing, say) is alerted once; quoting again is reported.
 DARK_PAIR_ALERT_SECONDS = 15 * 60.0
+# DarkPairAlerts' episode key for Wise being unreachable (not a market name).
+WISE_OUTAGE = "*wise*"
 # An order's fills are counted this long after it expires, so a match made just
 # before expiry has time to show up in its fill list.
 SETTLE_GRACE_SECONDS = 60.0
@@ -195,16 +197,21 @@ class TickReferences:
     skipped: dict[str, Exception] = field(default_factory=dict)
     # market -> why its own source failed, so it quoted on Wise's mid instead.
     fallback: dict[str, Exception] = field(default_factory=dict)
+    # Markets whose carried daily rate was set aside for Wise's live mid.
+    covered: set[str] = field(default_factory=set)
+    # market -> why Wise could not price a normal order while unreachable, so
+    # that order sat at the mid +/- the pair's weekend/outage spread.
+    wise_outage: dict[str, Exception] = field(default_factory=dict)
 
 
 @dataclass
 class StaleAlertState:
     """One pair's open stale-reference alert episode."""
 
-    # "carrying" while the pair quotes on a carried-forward rate; "stopped" once
-    # that rate passed its carry limit and the pair stopped quoting.
+    # "carrying" while the pair quotes on a carried-forward rate; "wise" while
+    # its own source is unavailable and it uses Wise's mid instead.
     status: str
-    # Published timestamp of the carried rate; None once stopped.
+    # Published timestamp of the carried rate; None for "wise".
     published_ts: float | None
     # When the operator was last told about this episode.
     alerted_at: float
@@ -659,7 +666,9 @@ class DarkPairAlerts:
     whose price source keeps failing would otherwise show up only as a log
     line per tick. A pair skipped on every tick for DARK_PAIR_ALERT_SECONDS
     gets one alert with the reason; its next quote sends one "quoting again".
-    Episodes are kept in the state file, so --once fires share them.
+    Wise being unreachable that long, so normal orders sit at the mid +/- the
+    weekend/outage spread, is one more episode (under WISE_OUTAGE). Episodes
+    are kept in the state file, so --once fires share them.
     """
 
     def __init__(
@@ -672,8 +681,9 @@ class DarkPairAlerts:
         self._state = state
         self.window = window
         loaded = {} if state is None else state.load_dark_pairs()
-        # market -> (first skipped at, alerted yet)
-        self._episodes = {m: e for m, e in loaded.items() if m in markets}
+        # market (or WISE_OUTAGE) -> (first seen at, alerted yet)
+        self._episodes = {
+            m: e for m, e in loaded.items() if m in markets or m == WISE_OUTAGE}
 
     def update(
         self,
@@ -681,35 +691,46 @@ class DarkPairAlerts:
         *,
         notifier: TelegramNotifier | None,
         log: logging.Logger,
-        alerted_elsewhere: set[str] = frozenset(),
         now: float | None = None,
     ) -> None:
-        """Advance each pair's episode from this tick and alert on changes.
-
-        `alerted_elsewhere` are markets another alert already covers (a rate
-        past its carry limit); they are tracked but not alerted twice.
-        """
+        """Advance each pair's episode from this tick and alert on changes."""
         now = time.time() if now is None else now
         dark: list[str] = []
         back: list[str] = []
+        outage: list[str] = []
+        recovered: list[str] = []
         before = dict(self._episodes)
         for market, error in sorted(refs.skipped.items(), key=lambda item: item[0]):
             since, alerted = self._episodes.get(market, (now, False))
             if not alerted and now - since >= self.window:
                 alerted = True
-                if market not in alerted_elsewhere:
-                    dark.append(
-                        f"{market} for {_fmt_duration(now - since)}: {_first_line(error)}")
+                dark.append(f"{market} for {_fmt_duration(now - since)}: {_first_line(error)}")
             self._episodes[market] = (since, alerted)
         for market in sorted(refs.quoted):
             episode = self._episodes.pop(market, None)
-            if episode is not None and episode[1] and market not in alerted_elsewhere:
+            if episode is not None and episode[1]:
                 back.append(f"{market} after {_fmt_duration(now - episode[0])}")
+        if refs.wise_outage:
+            since, alerted = self._episodes.get(WISE_OUTAGE, (now, False))
+            if not alerted and now - since >= self.window:
+                alerted = True
+                first = next(iter(refs.wise_outage.values()))
+                outage.append(
+                    f"for {_fmt_duration(now - since)} ({', '.join(sorted(refs.wise_outage))}): "
+                    f"{_first_line(first)}")
+            self._episodes[WISE_OUTAGE] = (since, alerted)
+        else:
+            episode = self._episodes.pop(WISE_OUTAGE, None)
+            if episode is not None and episode[1]:
+                recovered.append(f"after {_fmt_duration(now - episode[0])}")
         if self._episodes != before and self._state is not None:
             self._state.replace_dark_pairs(self._episodes)
         for lines, icon, heading in (
             (dark, "⚠️", "Not quoting these pairs; the other pairs are quoting:"),
             (back, "✅", "Quoting again:"),
+            (outage, "⚠️", "Wise is not answering, so normal orders sit at the mid "
+                           "+/- each pair's fallback_weekend_bps:"),
+            (recovered, "✅", "Wise is answering again; normal orders are back at its prices:"),
         ):
             if not lines:
                 continue
@@ -723,13 +744,15 @@ class StaleReferenceAlerts:
     """Tell the operator when pairs quote on reference rates that stopped updating.
 
     Official daily FX sources (BNM, ECB, the Fed) publish nothing on
-    weekends or public holidays, so the oracle carries their last rate forward
-    instead of halting the pair. Each such episode is announced once on the
-    important channel, repeated quietly every `reminder_seconds`, and closed with
-    a notice when fresh rates return, or with an important alert if the carried
-    rate passes its carry limit and the pair stops quoting. Episodes live in the
-    state store so fire-once runs do not re-announce the same weekend every run.
-    Without a notifier the same messages still reach the log.
+    weekends or public holidays, so the oracle carries their last rate forward.
+    While Wise answers, its live mid is used instead and nothing is announced;
+    a carried rate is quoted on only when Wise has no mid either. Each such
+    episode is announced once on the important channel, repeated quietly every
+    `reminder_seconds`, and closed with a notice when fresh rates return. A pair
+    whose source is unavailable altogether, and so uses Wise's mid, is announced
+    once too. Episodes live in the state store so fire-once runs do not
+    re-announce the same weekend every run. Without a notifier the same
+    messages still reach the log.
     """
 
     def __init__(
@@ -739,7 +762,7 @@ class StaleReferenceAlerts:
         state: StateStore | None = None,
         reminder_seconds: float = STALE_REMINDER_SECONDS,
     ) -> None:
-        # Each pair's carry limit, so a warning can say when quoting would stop.
+        # Each pair's carry limit, so a warning can say how long it may last.
         self._carry_limit = {
             runtime.config.market: runtime.oracle.max_carry_age_s for runtime in runtimes
         }
@@ -766,7 +789,6 @@ class StaleReferenceAlerts:
         started: list[str] = []
         reminded: list[str] = []
         recovered: list[str] = []
-        stopped: list[str] = []
         changed = False
         switched: list[str] = []
         for market, reason in sorted(refs.fallback.items(), key=lambda item: item[0]):
@@ -776,7 +798,9 @@ class StaleReferenceAlerts:
                 switched.append(f"{market}: {_first_line(reason)}")
                 changed = True
         for market, ref in sorted(refs.quoted.items(), key=lambda item: item[0]):
-            if market in refs.fallback:
+            # A carried rate set aside for Wise's mid neither opens nor closes
+            # an episode, so a Wise blip on a weekend does not flap the alert.
+            if market in refs.fallback or market in refs.covered:
                 continue
             episode = self._episodes.get(market)
             if not ref.stale:
@@ -795,18 +819,6 @@ class StaleReferenceAlerts:
                 episode.published_ts = ref.ts
                 episode.alerted_at = now
                 reminded.append(line)
-                changed = True
-        for market, error in sorted(refs.skipped.items(), key=lambda item: item[0]):
-            episode = self._episodes.get(market)
-            # Only a rate past its carry limit ends a carrying episode; a one-off
-            # fetch failure in the middle of a weekend is not worth an alert.
-            if (
-                episode is not None
-                and episode.status == "carrying"
-                and isinstance(error, ReferenceTooStale)
-            ):
-                self._episodes[market] = StaleAlertState("stopped", None, now)
-                stopped.append(f"{market}: {error}")
                 changed = True
         if changed and self._state is not None:
             self._state.replace_reference_alerts(self._episodes)
@@ -837,13 +849,6 @@ class StaleReferenceAlerts:
                 True,
             ),
             (recovered, "✅", "Reference rates updated again:", None, False),
-            (
-                stopped,
-                "⛔",
-                "Stopped quoting on reference rates past their carry limit:",
-                "Quoting resumes when the source publishes a new rate.",
-                True,
-            ),
         ):
             if not lines:
                 continue
@@ -853,17 +858,13 @@ class StaleReferenceAlerts:
             if notifier is not None:
                 notifier.send_raw(f"{icon} {body}", important=important)
 
-    def stopped(self) -> set[str]:
-        """Markets already alerted as stopped on a rate past its carry limit."""
-        return {m for m, e in self._episodes.items() if e.status == "stopped"}
-
     def _carry_line(self, market: str, ref: ReferencePrice) -> str:
         """Describe one pair quoting on a carried-forward rate."""
         limit = self._carry_limit.get(market)
         until = (
             ""
             if limit is None
-            else f"; quoting stops if there is no new rate by {_fmt_utc(ref.ts + limit)}"
+            else f"; carried until {_fmt_utc(ref.ts + limit)} at most"
         )
         return (
             f"{market}: {ref.source} rate {_rate_date(ref.ts)}, "
@@ -1260,21 +1261,13 @@ def run(
 
             # Warn (throttled) while pairs quote on carried-forward daily rates.
             # An alert failure must never cost a tick, so it is only logged.
-            # Pairs the stale alerts report as stopped (before or after this
-            # update) get their stop and recovery messages from there only.
-            stopped_pairs = stale_alerts.stopped()
             try:
                 stale_alerts.update(tick_refs, notifier=notifier, log=log)
             except Exception as exc:
                 log.warning("stale-reference alert failed: %s", exc)
             if not dry_run:
                 try:
-                    dark_pairs.update(
-                        tick_refs,
-                        notifier=notifier,
-                        log=log,
-                        alerted_elsewhere=stopped_pairs | stale_alerts.stopped(),
-                    )
+                    dark_pairs.update(tick_refs, notifier=notifier, log=log)
                 except Exception as exc:
                     log.warning("not-quoting alert failed: %s", exc)
 
@@ -1868,18 +1861,27 @@ def _intents_for_runtime(
     funds: dict[str, Decimal] | None,
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
-    # Fetch a fresh mid for this pair (Wise, as a mid source, prices the size).
+    # The mid: the pair's own source while fresh, then Wise's live mid, and a
+    # carried daily rate (weekend, holiday) only while Wise has no mid either.
     try:
         ref = runtime.oracle.get(
             runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
         )
     except ReferenceUnavailable as exc:
-        # Quotes come from Wise anyway; the mid only bounds return orders, so a
-        # source that stopped (past its carry limit, or down) is replaced by
-        # Wise's live mid rather than taking the pair down.
+        # A source that is down, or past its carry limit, is replaced by Wise's
+        # live mid rather than taking the pair down.
         ref = _wise_mid(runtime, exc, now=now)
         if refs is not None:
             refs.fallback[runtime.config.market] = exc
+    else:
+        if ref.stale:
+            try:
+                ref = _wise_mid(runtime, ReferenceUnavailable("carried rate"), now=now)
+            except ReferenceUnavailable:
+                pass
+            else:
+                if refs is not None:
+                    refs.covered.add(runtime.config.market)
     # Debug-only per-pair trace for operators and audits.
     log.debug(
         "%s mid=%s src=%s qty=%s%s",
@@ -1890,16 +1892,16 @@ def _intents_for_runtime(
         f" stale_age={ref.age_s:.0f}s" if ref.stale else "",
     )
     # One bid and one ask of the configured size, priced at Wise's after-fee
-    # rates for that size.
+    # rates for that size (or around the mid where Wise cannot price a side).
     intents = _normal_intents(runtime, ref.rate, expiration)
-    intents = _at_wise_prices(intents, runtime, now=now, log=log)
+    intents = _at_wise_prices(intents, runtime, ref, now=now, log=log, refs=refs)
     if position is not None:
         intents = _with_return_order(
             intents, runtime, position, config, now=now, log=log)
     intents = _within_limits(intents, runtime.info, budgets, funds, log)
     # Sizes are final now; Wise's fees fall with size, so price them again
     # (a reply for an unchanged size is reused, not re-requested).
-    intents = _at_wise_prices(intents, runtime, now=now, log=log)
+    intents = _at_wise_prices(intents, runtime, ref, now=now, log=log, refs=refs)
     intents = _without_self_cross(intents, log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
@@ -2066,12 +2068,21 @@ def _wise_mid(runtime: PairRuntime, reason: Exception, *, now: float) -> Referen
     return ReferencePrice(pair=pair, rate=obs.rate, ts=obs.ts, source=obs.source, age_s=age)
 
 
+def _fx_weekend(now: float) -> bool:
+    """Whether `now` falls in the FX weekend: Friday 21:00 to Sunday 21:00 UTC."""
+    t = time.gmtime(now)
+    hour_of_week = t.tm_wday * 24 + t.tm_hour  # Monday 00:00 is hour 0.
+    return 4 * 24 + 21 <= hour_of_week < 6 * 24 + 21
+
+
 def _at_wise_prices(
     intents: list[OrderIntent],
     runtime: PairRuntime,
+    mid: ReferencePrice,
     *,
     now: float,
     log: logging.Logger,
+    refs: TickReferences | None = None,
 ) -> list[OrderIntent]:
     """Price each normal order at what converting its own size through Wise costs.
 
@@ -2082,11 +2093,16 @@ def _at_wise_prices(
     fall with size, so this runs again once sizes are final (after budget and
     balance trimming). Return orders keep their auction price: they walk back
     to the fill price, which Wise's rate would stop them reaching. A bid that
-    falls below the market's minimum notional is dropped. A Wise failure, or a
-    rate older than Wise's freshness window, skips the pair.
+    falls below the market's minimum notional is dropped.
+
+    Where Wise cannot price a side (it offers no such route, it is
+    unreachable, or its rate is older than its freshness window), that order
+    sits at the mid +/- the pair's `fallback_bps`, or `fallback_weekend_bps`
+    on an FX weekend, on a carried mid, or while Wise is unreachable.
     """
     wise = runtime.settlement
     info = runtime.info
+    pair = runtime.config
     out: list[OrderIntent] = []
     for intent in intents:
         if intent.is_return:
@@ -2095,18 +2111,23 @@ def _at_wise_prices(
         fetch = wise.sell_rate if intent.side == "bid" else wise.buy_rate
         try:
             obs = fetch(runtime.iso_base, runtime.iso_quote, intent.qty_base)
+            age = now - obs.ts
+            if age > wise.default_max_age_s:
+                raise ReferenceUnavailable(f"Wise's rate is {age:.0f}s old")
+            price = quantize_price(info, obs.rate, intent.side)
         except Exception as exc:
-            raise ReferenceUnavailable(
-                f"{runtime.iso_base}/{runtime.iso_quote}: Wise settlement rate failed "
-                f"({type(exc).__name__}: {exc})"
-            ) from exc
-        age = now - obs.ts
-        if age > wise.default_max_age_s:
-            raise ReferenceUnavailable(
-                f"{runtime.iso_base}/{runtime.iso_quote}: Wise settlement rate is "
-                f"{age:.0f}s old"
+            outage = not isinstance(exc, WiseNoRoute)
+            wide = outage or mid.stale or _fx_weekend(now)
+            bps = pair.fallback_weekend_bps if wide else pair.fallback_bps
+            sign = -1 if intent.side == "bid" else 1
+            price = quantize_price(info, mid.rate * (1 + sign * bps / BPS), intent.side)
+            if outage and refs is not None:
+                refs.wise_outage.setdefault(intent.market, exc)
+            log.info(
+                "%s %s at mid %s %s %s bps: Wise cannot price it (%s: %s)",
+                intent.market, intent.side, fmt(mid.rate), "-" if sign < 0 else "+",
+                fmt(bps), type(exc).__name__, exc,
             )
-        price = quantize_price(info, obs.rate, intent.side)
         if price == intent.price:
             out.append(intent)
             continue
@@ -2119,12 +2140,12 @@ def _at_wise_prices(
             )
         except ValueError as exc:
             log.warning(
-                "%s %s dropped: at Wise's price it is too small (%s)",
+                "%s %s dropped: at its price it is too small (%s)",
                 intent.market, intent.side, exc,
             )
             continue
         log.debug(
-            "%s %s at Wise's price %s for %s (mid-based %s)",
+            "%s %s priced at %s for %s (was %s)",
             intent.market, intent.side, fmt(price), fmt(intent.qty_base), fmt(intent.price),
         )
         out.append(replace(intent, price=price))

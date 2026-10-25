@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from rotor.config import get_config, get_config_json, require_https
 from rotor.price_reference.sources import (
     BnmRateSource,
@@ -16,11 +18,12 @@ def load_price_reference_source(name: str) -> RateSource:
     """Return the FX source a pair's `price_source` names.
 
     Each source applies its own default staleness window (intraday for Wise,
-    daily for the official references). An operator can override any source's
-    window with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`) or the global
-    `PRICE_REFERENCE_MAX_AGE_S`. How long a stale daily rate is still quoted on
-    comes from `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`;
-    Wise is intraday and never carries a stale quote, so neither applies to it.
+    daily for the official references). An operator can override a daily
+    source's window with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`) or
+    the global `PRICE_REFERENCE_MAX_AGE_S`. How long a stale daily rate is still
+    quoted on comes from `<SOURCE>_MAX_CARRY_AGE_S` or
+    `PRICE_REFERENCE_MAX_CARRY_AGE_S`. Wise prices every normal order, so its
+    intraday window is fixed: none of these overrides applies to it.
     """
     source_name = str(name).lower()
     if source_name == "wise":
@@ -29,7 +32,6 @@ def load_price_reference_source(name: str) -> RateSource:
         return WiseRateSource(
             base_url=_url("WISE_BASE_URL", "https://api.wise.com"),
             token_env="WISE_API_TOKEN",
-            max_age_s=_max_age_override("WISE"),
         )
     if source_name == "ecb":
         # ECB is configured by a single XML feed URL.
@@ -86,8 +88,8 @@ def _seconds_override(*keys: str) -> float | None:
             value = float(str(raw).strip())
         except ValueError as exc:
             raise ValueError(f"{key} must be a number of seconds, got {raw!r}") from exc
-        if value <= 0:
-            raise ValueError(f"{key} must be > 0, got {value}")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be a positive number of seconds, got {raw!r}")
         return value
     return None
 

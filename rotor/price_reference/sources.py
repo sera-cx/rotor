@@ -64,6 +64,15 @@ class RateSource(Protocol):
         """
 
 
+class WiseNoRoute(ValueError):
+    """Wise answered, but does not offer this conversion (or no usable method).
+
+    Wise sends to some currencies it cannot send from (CNH, NGN, ZAR, ...), and
+    offers no route at all for others (ARS, PEN). Unlike an outage, this does
+    not change from one tick to the next.
+    """
+
+
 class WiseRateSource:
     """Wise quotes API (`POST /v3/quotes`): what converting through Wise costs.
 
@@ -75,8 +84,7 @@ class WiseRateSource:
     - `sell_rate`: quote currency received per base unit when converting an
       amount of base into quote.
     - `buy_rate`: quote currency paid per base unit to buy an amount of base.
-    - `quote`: as a mid source, for currencies no central-bank source covers,
-      halfway between the two for the worked amount.
+    - `mid_rate`, and `quote` as a mid source: Wise's own mid-market rate.
 
     Wise prices anonymous quote requests; `WISE_API_TOKEN` only raises its rate
     limits.
@@ -123,17 +131,9 @@ class WiseRateSource:
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
     ) -> PriceObservation:
-        """Mid for `amount` of base: halfway between Wise's sell and buy rates."""
-        qty = _positive_decimal(amount if amount is not None else self.DEFAULT_AMOUNT)
-        sell = self.sell_rate(base, quote, qty)
-        buy = self.buy_rate(base, quote, qty)
-        return PriceObservation(
-            source=self.name,
-            pair=_pair(base, quote),
-            rate=(sell.rate + buy.rate) / 2,
-            ts=min(sell.ts, buy.ts),
-            raw={"sell_rate": str(sell.rate), "buy_rate": str(buy.rate), "amount": str(qty)},
-        )
+        """Wise's mid-market rate, as a pair's mid source."""
+        return self.mid_rate(
+            base, quote, amount if amount is not None else self.DEFAULT_AMOUNT)
 
     def sell_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
         """Quote received per base unit converting `qty_base` of base into quote."""
@@ -152,12 +152,21 @@ class WiseRateSource:
         return self._observation(base, quote, rate, body, option)
 
     def mid_rate(self, base: str, quote: str, qty_base: Decimal) -> PriceObservation:
-        """Wise's own mid-market rate, from the same reply `sell_rate` reads."""
-        body = self._reply(base, quote, "sourceAmount", qty_base)
+        """Wise's own mid-market rate, from the same reply `sell_rate` reads.
+
+        When Wise cannot send from base, the reply `buy_rate` reads carries the
+        same mid-market rate the other way round.
+        """
+        try:
+            body = self._reply(base, quote, "sourceAmount", qty_base)
+            rate = _positive_decimal(body.get("rate"))
+        except WiseNoRoute:
+            body = self._reply(quote, base, "targetAmount", qty_base)
+            rate = 1 / _positive_decimal(body.get("rate"))
         return PriceObservation(
             source=self.name,
             pair=_pair(base, quote),
-            rate=_positive_decimal(body.get("rate")),
+            rate=rate,
             ts=_parse_ts(body.get("rateTimestamp") or body.get("createdTime")),
         )
 
@@ -208,9 +217,13 @@ class WiseRateSource:
             # Let httpx expose non-2xx responses as provider failures.
             response.raise_for_status()
             body = response.json()
-        except Exception:
+        except Exception as exc:
             if cached is not None:
                 return cached[1]
+            # Wise answers 422 for a route it does not offer.
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 422:
+                raise WiseNoRoute(
+                    f"Wise does not convert {source.upper()} to {target.upper()}") from exc
             raise
         # Forget replies too old to quote on, so the cache stays small.
         self._replies = {
@@ -537,7 +550,7 @@ def _cheapest_wise_option(body: Any) -> dict:
         and "BALANCE" not in (str(opt.get("payIn", "")).upper(), str(opt.get("payOut", "")).upper())
     ]
     if not usable:
-        raise ValueError("Wise quote returned no enabled transfer method")
+        raise WiseNoRoute("Wise quote returned no enabled transfer method")
     return max(usable, key=_option_rate)
 
 

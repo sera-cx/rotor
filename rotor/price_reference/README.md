@@ -23,9 +23,12 @@ Available sources:
   that does not involve a Wise balance, are `sell_rate` (quote received per
   base converting base into quote) and `buy_rate` (quote paid per base buying
   base). The runner places every pair's normal orders at them. As a mid source
-  (`quote`), it returns the midpoint of the two. A reply is reused for 60
-  seconds, and on a failed request the last reply comes back for the caller's
-  freshness check.
+  (`quote`, or `mid_rate`), it returns Wise's mid-market rate, read from the
+  buy-direction reply (inverted) when Wise cannot convert from the base. A
+  route Wise does not offer (HTTP 422, or no usable transfer method) raises
+  `WiseNoRoute`, which the runner tells apart from an outage. A reply is reused
+  for 60 seconds, and on a failed request the last reply comes back for the
+  caller's freshness check.
 - `ecb`: ECB daily euro reference rates, crossed through EUR. Keyless. Pure mid.
 - `fed`: Federal Reserve H.10 rates via the official FRED API
   (`api.stlouisfed.org/fred/series/observations`), crossed through USD. Needs a

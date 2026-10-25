@@ -18,6 +18,19 @@ from rotor.price_reference import parse_market_symbol
 
 # Closed set of external reference providers accepted per pair.
 PRICE_SOURCE_CHOICES = {"wise", "ecb", "fed", "bnm"}
+# Spreads around the mid for a side Wise cannot price: on weekdays with a live
+# or fresh mid, and on FX weekends, carried rates and Wise outages.
+DEFAULT_FALLBACK_BPS = Decimal("50")
+DEFAULT_FALLBACK_WEEKEND_BPS = Decimal("200")
+# Keys each table may hold; anything else is a typo or a global setting written
+# after a table header (TOML scoping), which would otherwise be ignored.
+GLOBAL_KEYS = {
+    "fixed_bps", "return_bps", "return_window_hours", "fallback_bps",
+    "fallback_weekend_bps", "budget", "pair",
+}
+PAIR_KEYS = {
+    "market", "price_source", "qty_base", "fixed_bps", "fallback_bps", "fallback_weekend_bps",
+}
 
 
 @dataclass(frozen=True)
@@ -40,8 +53,13 @@ class PairConfig:
     price_source: str
     # Base-token order size before quantization.
     qty_base: Decimal
-    # Fixed spread bps, possibly inherited from global config.
+    # Where a return order starts (2 x fixed_bps from the fill), possibly
+    # inherited from global config.
     fixed_bps: Decimal
+    # Spread around the mid for a side Wise cannot price, on weekdays.
+    fallback_bps: Decimal = DEFAULT_FALLBACK_BPS
+    # The same on FX weekends, on a carried rate, or while Wise is unreachable.
+    fallback_weekend_bps: Decimal = DEFAULT_FALLBACK_WEEKEND_BPS
 
 
 @dataclass(frozen=True)
@@ -79,8 +97,14 @@ def load_vl_config(path: str | Path) -> VLConfig:
 
 def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfig:
     """Validate a parsed VL config dict."""
+    unknown = sorted(set(raw) - GLOBAL_KEYS)
+    if unknown:
+        raise ValueError(f"{source}: unknown setting(s) {', '.join(unknown)}")
     # Global strategy defaults apply to each pair unless the pair overrides.
     fixed_bps = _bps(raw, "fixed_bps", Decimal("8"), source=source)
+    fallback_bps = _bps(raw, "fallback_bps", DEFAULT_FALLBACK_BPS, source=source)
+    fallback_weekend_bps = _bps(
+        raw, "fallback_weekend_bps", DEFAULT_FALLBACK_WEEKEND_BPS, source=source)
     return_bps = _bps(raw, "return_bps", Decimal("2"), source=source)
     return_window_hours = _decimal(raw, "return_window_hours", Decimal("48"))
     if return_window_hours <= 0:
@@ -93,6 +117,8 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
         raw.get("pair"),
         source=source,
         default_fixed_bps=fixed_bps,
+        default_fallback_bps=fallback_bps,
+        default_fallback_weekend_bps=fallback_weekend_bps,
     )
     # Reject inverse duplicates because they would compete for the same market
     # exposure from opposite directions.
@@ -153,6 +179,8 @@ def _parse_pairs(
     *,
     source: str,
     default_fixed_bps: Decimal,
+    default_fallback_bps: Decimal = DEFAULT_FALLBACK_BPS,
+    default_fallback_weekend_bps: Decimal = DEFAULT_FALLBACK_WEEKEND_BPS,
 ) -> list[PairConfig]:
     """Parse and validate one or more `[[pair]]` TOML tables."""
     rows = _list_table(value)
@@ -166,6 +194,12 @@ def _parse_pairs(
             raise ValueError(f"{source}: [[pair]] #{i + 1} missing market")
         # Reuse the shared symbol parser for delimiter/side validation.
         parse_market_symbol(market)
+        extra = sorted(set(row) - PAIR_KEYS)
+        if extra:
+            raise ValueError(
+                f"{source}: [[pair]] {market} has unknown key(s) {', '.join(extra)}; "
+                "global settings must come before the first [[budget]] or [[pair]]"
+            )
         # Per-pair source controls where this market's benchmark comes from.
         price_source = str(row.get("price_source", "wise")).strip().lower()
         if price_source == "mas":
@@ -181,12 +215,22 @@ def _parse_pairs(
         if qty_base <= 0:
             raise ValueError(f"{source}: {market} qty_base must be > 0")
         # Pair-level strategy values override globals; otherwise defaults apply.
+        where = f"{source}: {market}"
+        fallback_bps = _bps(row, "fallback_bps", default_fallback_bps, source=where)
+        fallback_weekend_bps = _bps(
+            row, "fallback_weekend_bps", default_fallback_weekend_bps, source=where)
+        if fallback_weekend_bps < fallback_bps:
+            raise ValueError(
+                f"{where}: fallback_weekend_bps ({fallback_weekend_bps}) must be at least "
+                f"fallback_bps ({fallback_bps})")
         out.append(
             PairConfig(
                 market=market,
                 price_source=price_source,
                 qty_base=qty_base,
-                fixed_bps=_bps(row, "fixed_bps", default_fixed_bps, source=f"{source}: {market}"),
+                fixed_bps=_bps(row, "fixed_bps", default_fixed_bps, source=where),
+                fallback_bps=fallback_bps,
+                fallback_weekend_bps=fallback_weekend_bps,
             )
         )
     return out

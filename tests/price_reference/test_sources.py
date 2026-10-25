@@ -12,6 +12,7 @@ from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
     FedH10RateSource,
+    WiseNoRoute,
     WiseRateSource,
 )
 from rotor.price_reference.symbols import market_to_iso_pair
@@ -98,17 +99,44 @@ def test_wise_buy_rate_is_what_buying_the_amount_costs_by_the_cheapest_transfer(
     assert obs.rate == Decimal("0.783")
 
 
-def test_wise_mid_is_halfway_between_its_sell_and_buy_rates_for_the_amount():
+def test_wise_as_a_mid_source_quotes_its_mid_market_rate():
     def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        if "sourceAmount" in body:
-            return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
-        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 783, 1000)]))
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
 
     obs = _wise(handler).quote("SGD", "USD", amount=Decimal("1000"))
 
-    assert obs.rate == Decimal("0.780")
+    assert obs.rate == Decimal("0.78")
     assert obs.source == "wise"
+
+
+def test_wise_mid_comes_from_the_buy_reply_when_wise_cannot_send_from_base():
+    # Wise sends to CNH but not from it: selling CNH is a 422, buying it works,
+    # and that reply's rate is USD->CNH, so the CNH/USD mid is its inverse.
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["sourceCurrency"] == "CNH":
+            return httpx.Response(422, json={"errors": [{"code": "error.route.not.supported"}]})
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 141, 1000)], rate=7.1))
+
+    wise = _wise(handler)
+
+    assert wise.mid_rate("CNH", "USD", Decimal("1000")).rate == 1 / Decimal("7.1")
+    with pytest.raises(WiseNoRoute):
+        wise.sell_rate("CNH", "USD", Decimal("1000"))
+    assert wise.buy_rate("CNH", "USD", Decimal("1000")).rate == Decimal("0.141")
+
+
+def test_wise_reports_a_route_it_does_not_offer_apart_from_an_outage():
+    def no_route(_request):
+        return httpx.Response(422, json={"errors": [{"code": "error.route.not.supported"}]})
+
+    def down(_request):
+        return httpx.Response(503, json={})
+
+    with pytest.raises(WiseNoRoute):
+        _wise(no_route).sell_rate("PEN", "USD", Decimal("1000"))
+    with pytest.raises(httpx.HTTPStatusError):
+        _wise(down).sell_rate("SGD", "USD", Decimal("1000"))
 
 
 def test_wise_mid_comes_from_the_same_reply_as_the_sell_rate():

@@ -145,8 +145,11 @@ Rules:
   `WISE_API_TOKEN` is optional: Wise prices anonymous quotes too, and a token
   only raises its rate limits.
 - A pair's source sets its mid. `ecb`, `fed`, and `bnm` publish daily
-  reference rates; `wise` (for currencies none of them covers) uses the
-  midpoint of Wise's after-fee sell and buy rates for the pair's `qty_base`.
+  reference rates; `wise` (for currencies none of them covers) uses Wise's
+  mid-market rate. When Wise cannot convert from a currency (it sends to CNH,
+  COP, NGN, ZAR and AED but not from them), that rate is read from the other
+  direction's reply. ARS and PEN have no Wise route at all and no central-bank
+  source in rotor, so they cannot be quoted.
 - Every pair's normal quotes are placed at Wise's after-fee prices for each
   order's own final size (after budget and balance trimming): a bid at what
   converting that much of the base token through Wise pays, an ask at what
@@ -154,14 +157,23 @@ Rules:
   does not involve a Wise balance. A taker on Sera gets what converting through
   Wise would give. Wise's fees fall with size: about 25-80 bps each way on majors
   at a few thousand dollars. Wise's rates are live, so quotes follow the live
-  market whatever the daily mid says. A Wise rate older than 10 minutes, or no
-  answer at all (a reply up to that old is reused), skips the pair.
+  market whatever the daily mid says.
+- Where Wise cannot price one side (it offers no such route, it does not
+  answer, or its rate is older than 10 minutes; a reply up to that old is
+  reused), that side sits around the mid instead: `fallback_bps` (default 50)
+  below it for a bid or above it for an ask on weekdays, and the wider
+  `fallback_weekend_bps` (default 200) during the FX weekend (Friday 21:00 to
+  Sunday 21:00 UTC), on a carried mid, or while Wise is unreachable. Both can be
+  set globally or per pair, and `fallback_weekend_bps` must be at least
+  `fallback_bps`. The other side keeps Wise's price if Wise can give it.
 - The mid sets how close a return order may come (`return_bps`) and how far its
   auction starts; normal quotes do not use it.
 - `fixed_bps` (global or per pair) sets where a return order starts after a
   fill: `2 x fixed_bps` from the fill price. It does not move normal quotes.
-- `return_bps` is the closest a return order quotes to mid. Both spreads must
+- `return_bps` is the closest a return order quotes to mid. Every spread must
   be more than 0 and less than 10000.
+- Unknown keys are refused, at the top level and in `[[pair]]`: a typo, or a
+  global setting written after a table header, would otherwise be ignored.
 - Every `[[budget]]` token must be traded by a configured market; a typo there
   is rejected instead of silently leaving that token uncapped.
 - `--order-ttl` must be at least 120 seconds: Sera sweeps orders due to expire
@@ -178,17 +190,21 @@ cross-rate details.
 Each source observation is stamped with the provider's published timestamp and
 checked against a per-source freshness window: 10 minutes for `wise` (intraday)
 and 48 hours for the daily references (`ecb`, `fed`, `bnm`). Override a
-single source with `<SOURCE>_MAX_AGE_S`, all of them with
-`PRICE_REFERENCE_MAX_AGE_S`, or everything at runtime with `--max-reference-age`.
+single daily source with `<SOURCE>_MAX_AGE_S`, all of them with
+`PRICE_REFERENCE_MAX_AGE_S`, or at runtime with `--max-reference-age`. Wise's
+window is fixed: it prices every normal order, so no override loosens it.
 
-Daily references publish nothing on weekends or public holidays, so a stale daily
-rate is carried forward: the pair keeps quoting on the last published rate until
-that rate is 7 days old (`<SOURCE>_MAX_CARRY_AGE_S` or
-`PRICE_REFERENCE_MAX_CARRY_AGE_S` to change; neither applies to `wise`). With `--telegram`, Rotor warns once
-on the important channel when pairs start quoting on carried rates, repeats the
-warning on the normal channel every 6 hours, and reports when fresh rates
-return. These alert episodes are kept in the state database, so `--once` runs
-do not repeat them. A stale `wise` quote is never carried.
+Daily references publish nothing on weekends or public holidays. When a daily
+rate goes stale, the pair uses Wise's live mid instead, with no alert: that is
+the normal weekend. Only if Wise has no mid either is the last published rate
+carried forward, until it is 7 days old (`<SOURCE>_MAX_CARRY_AGE_S` or
+`PRICE_REFERENCE_MAX_CARRY_AGE_S` to change; neither applies to `wise`). With
+`--telegram`, Rotor warns once on the important channel when pairs start
+quoting on carried rates, repeats the warning on the normal channel every 6
+hours, and reports when fresh rates return. A tick where Wise's mid covers a
+carried rate leaves that episode open, so a Wise blip on a weekend does not
+repeat the warning. These alert episodes are kept in the state database, so
+`--once` runs do not repeat them. A stale `wise` quote is never carried.
 
 A pair whose own source fails outright (down, or a rate past its carry limit)
 keeps quoting with its mid replaced by Wise's live mid-market rate, read from the same
@@ -197,15 +213,15 @@ at Wise's prices either way; the mid only bounds return orders. Pass
 `--halt-on-stale-reference` to switch to Wise's mid as soon as a rate is stale
 instead of carrying it.
 
-Pairs are isolated within a tick: if Wise cannot price a pair (so neither its
-quotes nor a fallback mid exist), or its quote fails market minimums, only that
-pair is skipped —
+Pairs are isolated within a tick: if a pair has no mid at all (its source and
+Wise both fail), or its quote fails market minimums, only that pair is skipped —
 the other configured pairs still quote. A tick is fully skipped only when no pair
 produces a quote. With `--telegram`, a pair that has produced no quote for 15
 minutes in a row is alerted once with the reason (for example its price source
-failing), and again once when it quotes again; a pair already reported as past
-its carry limit is not alerted twice. These episodes are kept in the state
-file, so `--once` fires share them. Placement is isolated the same way: an order or VL batch that
+failing), and again once when it quotes again. Wise being unreachable for 15
+minutes, so normal orders sit at the mid ± `fallback_weekend_bps`, is alerted
+once the same way, with a notice when it answers again. These episodes are kept
+in the state file, so `--once` fires share them. Placement is isolated the same way: an order or VL batch that
 Sera rejects (for example an ask whose base token the wallet does not hold) is
 logged and skipped, and the tick's other orders still go out.
 

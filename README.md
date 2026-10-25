@@ -47,6 +47,8 @@ override `.env`, and `.env` overrides `rotor/secret.py`.
 # follows a table header inside that table.
 fixed_bps = "50"
 return_bps = "2"
+fallback_bps = "50"
+fallback_weekend_bps = "200"
 
 [[budget]]
 token = "USDC"
@@ -68,15 +70,18 @@ Supported FX sources are `wise`, `ecb`, `fed`, and `bnm`. `wise`, `ecb`, and
 `bnm` work without a key (`WISE_API_TOKEN` is optional and only
 raises Wise's rate limits); `fed` (the official FRED API) needs a free
 `FRED_API_KEY`. A pair's source sets its mid: the central-bank sources publish
-daily reference rates, and `wise` (for currencies none of them covers) uses the
-midpoint of Wise's after-fee sell and buy rates for the pair's size.
+daily reference rates, and `wise` (for currencies none of them covers) uses
+Wise's mid-market rate.
 
 Every pair's normal quotes, whatever its source, are placed at Wise's after-fee
 prices for each order's own size: a bid at what converting that much of the base
 token through Wise pays, an ask at what buying it through Wise costs, by the
 cheapest enabled transfer method that does not involve a Wise balance. Wise's
-rates are live, so quotes follow the live market. The mid and `fixed_bps` shape
-the return orders that bring a position back after a fill.
+rates are live, so quotes follow the live market. Where Wise cannot price a
+side (a currency it cannot convert from, or Wise being down), that side sits
+`fallback_bps` from the mid, or `fallback_weekend_bps` on FX weekends, on a
+carried rate, or during an outage. The mid and `fixed_bps` shape the return
+orders that bring a position back after a fill.
 
 ## Run
 
