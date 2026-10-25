@@ -44,23 +44,14 @@ def _quantize_step(
     return (value / quantum).to_integral_value(rounding=rounding) * quantum
 
 
-def validate_minimums(
-    info: MarketInfo, qty: Decimal, bid_px: Decimal | None, ask_px: Decimal | None
-) -> None:
-    """Reject orders below Sera's market minimums (or empty, or crossed)."""
+def validate_minimums(info: MarketInfo, side: str, qty: Decimal, price: Decimal) -> None:
+    """Reject an order below Sera's market minimum for its side (or empty)."""
     # A zero/negative amount after quantization cannot produce a valid order.
     if qty <= 0:
         raise ValueError("quantity rounds to zero")
-    if bid_px is None and ask_px is None:
-        raise ValueError("no quoteable side")
     # Bid minimums are quote-token notional minimums: base size times bid price.
-    if bid_px is not None and info.min_bid_quote_amount and qty * bid_px < info.min_bid_quote_amount:
-        raise ValueError(
-            f"bid notional {qty * bid_px} below Sera min {info.min_bid_quote_amount}"
-        )
+    if side == "bid" and qty * price < info.min_bid_quote_amount:
+        raise ValueError(f"bid notional {qty * price} below Sera min {info.min_bid_quote_amount}")
     # Ask minimums are base-token amount minimums.
-    if ask_px is not None and info.min_ask_amount and qty < info.min_ask_amount:
+    if side == "ask" and qty < info.min_ask_amount:
         raise ValueError(f"ask qty {qty} below Sera min {info.min_ask_amount}")
-    # A crossed quote is invalid and would invert maker economics.
-    if bid_px is not None and ask_px is not None and bid_px >= ask_px:
-        raise ValueError(f"bid {bid_px} must be below ask {ask_px}")

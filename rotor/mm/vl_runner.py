@@ -1937,8 +1937,8 @@ def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list
     """
     info = runtime.info
     qty = quantize_qty(info, runtime.config.qty_base)
-    validate_minimums(info, qty, mid, None)
-    validate_minimums(info, qty, None, mid)
+    validate_minimums(info, "bid", qty, mid)
+    validate_minimums(info, "ask", qty, mid)
     return [
         # A bid spends quote tokens and buys base.
         OrderIntent(
@@ -2026,12 +2026,7 @@ def _within_limits(
         # A bid spends quote tokens (qty x price); an ask spends base tokens (qty).
         qty = quantize_qty(info, limit if intent.side == "ask" else limit / intent.price)
         try:
-            validate_minimums(
-                info,
-                qty,
-                intent.price if intent.side == "bid" else None,
-                intent.price if intent.side == "ask" else None,
-            )
+            validate_minimums(info, intent.side, qty, intent.price)
         except ValueError as exc:
             log.warning(
                 "%s %s dropped: trimmed to its %s %s it is too small (%s)",
@@ -2127,12 +2122,7 @@ def _at_wise_prices(
         if fallback is not None:
             log.info("%s %s at %s", intent.market, intent.side, fallback)
         try:
-            validate_minimums(
-                info,
-                intent.qty_base,
-                price if intent.side == "bid" else None,
-                price if intent.side == "ask" else None,
-            )
+            validate_minimums(info, intent.side, intent.qty_base, price)
         except ValueError as exc:
             log.warning(
                 "%s %s dropped: at its price it is too small (%s)",
@@ -2192,12 +2182,7 @@ def _with_return_order(
     limit = normal.qty_base if side == "ask" else normal.qty_base * normal.price / price
     qty = quantize_qty(info, min(abs(position.net_base), limit))
     try:
-        validate_minimums(
-            info,
-            qty,
-            price if side == "bid" else None,
-            price if side == "ask" else None,
-        )
+        validate_minimums(info, side, qty, price)
     except ValueError as exc:
         log.debug(
             "%s position %s too small to return alone (%s); quoting normally",

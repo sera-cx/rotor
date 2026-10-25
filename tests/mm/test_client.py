@@ -122,7 +122,7 @@ def test_api_credentials_are_trimmed_and_sent_clean(key, secret):
 
     def handler(request: httpx.Request) -> httpx.Response:
         headers.append(request.headers["Authorization"])
-        return httpx.Response(200, json={"orders": []})
+        return httpx.Response(200, json={"trades": [], "total": 0})
 
     client = SeraClient(owner_address=OWNER, signer=_stub_signer, api_key=key,
                         api_secret=secret, base_url="https://api.sera.cx/api/v1")
@@ -274,7 +274,7 @@ def test_cancel_vl_batch_429_rate_limit_propagates():
 
 def test_get_open_orders_uses_owner_query_and_bearer_auth():
     routes = _build_mock_routes({
-        "GET /orders": {"orders": [{"trade_id": "id-1"}]},
+        "GET /orders": {"trades": [{"trade_id": "id-1"}], "total": 1},
     })
     captured: list[dict] = []
     client = _make_client(routes, captured)
@@ -453,16 +453,6 @@ def test_reads_without_seras_list_are_errors_not_empty(reply):
         client.get_order_fills("o-1")
     with pytest.raises(RuntimeError, match="returned no orders list"):
         client.get_open_orders()
-
-
-def test_get_open_orders_accepts_trades_response_shape():
-    routes = _build_mock_routes({
-        "GET /orders": {"trades": [{"trade_id": "trade-1"}]},
-    })
-    client = _make_client(routes)
-    client.bootstrap()
-
-    assert client.get_open_orders() == [{"trade_id": "trade-1"}]
 
 
 def _good_order(**overrides):

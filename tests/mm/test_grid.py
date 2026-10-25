@@ -52,17 +52,16 @@ def test_precision_is_the_fallback_when_steps_are_absent():
     assert quantize_qty(info, Decimal("12.345")) == Decimal("12.3")
 
 
-@pytest.mark.parametrize(("qty", "bid", "ask", "match"), [
-    (Decimal("0"), Decimal("1"), None, "quantity rounds to zero"),
-    (Decimal("1"), Decimal("0.74"), None, "bid notional"),
-    (Decimal("0.99"), None, Decimal("1"), "ask qty"),
-    (Decimal("100"), Decimal("1.01"), Decimal("1.00"), "must be below ask"),
-    (Decimal("100"), None, None, "no quoteable side"),
+@pytest.mark.parametrize(("side", "qty", "price", "match"), [
+    ("bid", Decimal("0"), Decimal("1"), "quantity rounds to zero"),
+    ("bid", Decimal("1"), Decimal("0.74"), "bid notional"),
+    ("ask", Decimal("0.99"), Decimal("1"), "ask qty"),
 ])
-def test_orders_below_seras_minimums_or_crossed_are_refused(qty, bid, ask, match):
+def test_orders_below_seras_minimums_are_refused(side, qty, price, match):
     with pytest.raises(ValueError, match=match):
-        validate_minimums(_market(), qty, bid, ask)
+        validate_minimums(_market(), side, qty, price)
 
 
 def test_an_order_at_the_minimums_is_accepted():
-    validate_minimums(_market(), Decimal("12"), Decimal("0.7334"), Decimal("0.7400"))
+    validate_minimums(_market(), "bid", Decimal("12"), Decimal("0.7334"))
+    validate_minimums(_market(), "ask", Decimal("12"), Decimal("0.7400"))

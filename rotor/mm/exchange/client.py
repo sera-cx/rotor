@@ -531,18 +531,14 @@ class SeraClient:
                     "offset": page * page_limit,
                 },
             )
-            # Older/newer API responses may use trades or orders. A reply with
-            # neither list (an HTML page, an empty body) is not an empty book.
-            rows = next(
-                (body[key] for key in ("orders", "trades") if isinstance(body.get(key), list)),
-                None,
-            )
-            if rows is None:
+            # Sera answers {trades: [...], total: N}, total counting every match.
+            # A reply without them (an HTML page, an empty body) is not an
+            # empty book.
+            rows, total = body.get("trades"), body.get("total")
+            if not isinstance(rows, list) or not isinstance(total, int):
                 raise RuntimeError("GET /orders returned no orders list")
             out.extend(rows)
-            total = body.get("total")
-            done = len(out) >= total if isinstance(total, int) else len(rows) < page_limit
-            if done or not rows:
+            if len(out) >= total or not rows:
                 return out
         raise RuntimeError(f"GET /orders has more than {max_pages * page_limit} open orders")
 
@@ -651,16 +647,9 @@ class SeraClient:
             wait = _retry_wait(response, attempt)
             self._log.debug("retrying %s %s in %.1fs after %s", method, path, wait, error)
             self._sleep(wait)
-        # Empty success responses normalize to an empty dict for callers.
-        if response.status_code == 204 or not response.content:
-            return {}
-        try:
-            # Most successful Sera endpoints return JSON bodies.
-            return response.json()
-        except Exception:
-            # Treat a non-JSON success body as an empty object to keep callers
-            # defensive.
-            return {}
+        # An empty success (a 204 cancel) is an empty dict; every other Sera
+        # success is JSON.
+        return response.json() if response.content else {}
 
 
 def _order_wire(
