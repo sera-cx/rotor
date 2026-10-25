@@ -792,14 +792,21 @@ def test_a_cancel_cooldown_is_not_retried():
 
 
 def test_a_server_error_is_retried_only_where_repeating_is_harmless():
-    client, sent, _ = _scripted_client([SERVER_ERROR, (200, {"items": []}, {}), SERVER_ERROR])
+    client, sent, _ = _scripted_client(
+        [SERVER_ERROR, (200, {"items": []}, {}), SERVER_ERROR, SERVER_ERROR,
+         SERVER_ERROR, (200, {}, {})])
 
     assert client._request("GET", "/fills/a") == {"items": []}
-    # A VL batch may already have been placed when the error came back.
-    with pytest.raises(errors_mod.SeraError) as raised:
-        client._request("POST", "/orders/vl/batch", json_body={})
-    assert raised.value.status_code == 503
-    assert sent == ["GET /fills/a", "GET /fills/a", "POST /orders/vl/batch"]
+    # A placement may already have been booked when the error came back, and
+    # Sera refuses a repeated order_id, so neither kind is sent again.
+    for path in ("/orders/vl/batch", "/orders"):
+        with pytest.raises(errors_mod.SeraError) as raised:
+            client._request("POST", path, json_body={})
+        assert raised.value.status_code == 503
+    # Repeating a cancel is harmless.
+    assert client._request("POST", "/orders/cancel", json_body={}) == {}
+    assert sent == ["GET /fills/a", "GET /fills/a", "POST /orders/vl/batch", "POST /orders",
+                    "POST /orders/cancel", "POST /orders/cancel"]
 
 
 def test_retries_give_up_after_two():

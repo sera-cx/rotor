@@ -29,10 +29,12 @@ RATE_LIMITS = {"read": 10.0, "trade": 5.0, "cancel": 2.0}
 MAX_RETRIES = 2
 # The longest Retry-After wait honoured before a retry, in seconds.
 MAX_RETRY_WAIT_S = 5.0
-# POSTs that are safe to repeat after a server error: Sera dedupes an order on
-# its client-chosen order_id, and a repeated cancel changes nothing.
-# A VL batch is not here: Sera does not document deduping a whole batch.
-_REPEATABLE_POSTS = {"/orders", "/orders/cancel", "/orders/vl/cancel"}
+# POSTs that are safe to repeat after a server error: a repeated cancel changes
+# nothing. Placements are not here: a 503 can come after Sera booked the order,
+# and Sera refuses a repeated order_id with a 400, which would read as "never
+# booked". Unrepeated, the runner treats the 503 as unanswered and keeps
+# tracking the order. Sera does not document deduping a VL batch either.
+_REPEATABLE_POSTS = {"/orders/cancel", "/orders/vl/cancel"}
 
 
 @dataclass(frozen=True)
