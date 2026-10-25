@@ -1252,7 +1252,8 @@ def run(
                     expiration=tick_expiration,
                     log=log,
                     refs=tick_refs,
-                    skip=unreadable | inactive,
+                    skip=inactive,
+                    unreadable=unreadable,
                     funds=funds,
                 )
             except Exception as exc:
@@ -1268,14 +1269,12 @@ def run(
                 stale_alerts.update(tick_refs, notifier=notifier, log=log)
             except Exception as exc:
                 log.warning("stale-reference alert failed: %s", exc)
-            if not dry_run:
-                try:
-                    dark_pairs.update(tick_refs, notifier=notifier, log=log)
-                except Exception as exc:
-                    log.warning("not-quoting alert failed: %s", exc)
 
             if not intents:
                 # No emitted sides means nothing can be safely placed this tick.
+                if not dry_run:
+                    _update_dark_pairs(dark_pairs, tick_refs, set(), PlacementIssues(),
+                                       notifier=notifier, log=log)
                 log.warning("skip tick: no emitted order intents")
                 if once:
                     return 1
@@ -1368,6 +1367,9 @@ def run(
             inactive |= issues.inactive
             inactive_alerted |= issues.inactive
             inactive_alerted -= {o.market for p in placed for o in p.orders}
+            if not dry_run:
+                sent = {o.market for p in placed + issues.unanswered for o in p.orders}
+                _update_dark_pairs(dark_pairs, tick_refs, sent, issues, notifier=notifier, log=log)
             if issues.stale_metadata:
                 next_refresh = min(next_refresh, last_refresh + EARLY_REFRESH_SECONDS)
             # Placements Sera may have booked without answering are tracked too,
@@ -1823,9 +1825,13 @@ def _build_tick_intents(
     refs: TickReferences | None = None,
     now: float | None = None,
     skip: set[str] | frozenset[str] = frozenset(),
+    unreadable: set[str] | frozenset[str] = frozenset(),
     funds: dict[str, Decimal] | None = None,
 ) -> list[OrderIntent]:
     """Build all order intents for one loop tick, leaving out `skip` markets.
+
+    Markets in `unreadable` (fills that could not be read) are left out too,
+    and recorded in `refs.skipped` so the not-quoting alert covers them.
 
     Each pair is isolated: a pair Wise cannot price (its own reference failing
     falls back to Wise's mid), or a quote that fails market minimums, skips
@@ -1838,6 +1844,10 @@ def _build_tick_intents(
     out: list[OrderIntent] = []
     for runtime in runtimes:
         if runtime.config.market in skip:
+            continue
+        if runtime.config.market in unreadable:
+            if refs is not None:
+                refs.skipped[runtime.config.market] = RuntimeError("its fills could not be read")
             continue
         try:
             out.extend(
@@ -2249,12 +2259,48 @@ class PlacementIssues:
     # unreadable reply). Sera may have booked them, so they are tracked for
     # cancellation, and their orders stay in the ledger.
     unanswered: list[LivePlacement] = field(default_factory=list)
+    # market -> the refusal of an order or batch that held one of its orders.
+    refused: dict[str, Exception] = field(default_factory=dict)
 
     def note(self, exc: Exception) -> None:
         if isinstance(exc, errors.SeraError) and (
             exc.status_code == 422 or exc.error_code == "AMOUNT_BELOW_MIN"
         ):
             self.stale_metadata = True
+
+
+def _update_dark_pairs(
+    dark_pairs: DarkPairAlerts,
+    refs: TickReferences,
+    sent: set[str],
+    issues: PlacementIssues,
+    *,
+    notifier: TelegramNotifier | None,
+    log: logging.Logger,
+) -> None:
+    """Advance the not-quoting alerts from what this tick actually placed."""
+    _not_quoting(refs, sent, issues)
+    # An alert failure must never cost a tick, so it is only logged.
+    try:
+        dark_pairs.update(refs, notifier=notifier, log=log)
+    except Exception as exc:
+        log.warning("not-quoting alert failed: %s", exc)
+
+
+def _not_quoting(refs: TickReferences, sent: set[str], issues: PlacementIssues) -> None:
+    """Move pairs that placed nothing this tick from `quoted` to `skipped`.
+
+    A pair counts as quoting only if one of its orders went out (or may have:
+    unanswered). One whose orders Sera refuses every tick, or that had no order
+    to place, is not quoting even while the other pairs are. Markets Sera
+    called inactive have their own alert and are left as they are.
+    """
+    for market in list(refs.quoted):
+        if market in sent or market in issues.inactive:
+            continue
+        refs.skipped[market] = issues.refused.get(market) or RuntimeError(
+            "no order to place (no funds for it, or under the market minimum)")
+        del refs.quoted[market]
 
 
 def _inactive_market(exc: Exception, intents: list[OrderIntent]) -> str | None:
@@ -2348,6 +2394,8 @@ def _place_vl_batch(
             issues.note(exc)
             inactive = _inactive_market(exc, legs)
             if inactive is None:
+                for leg in legs:
+                    issues.refused.setdefault(leg.market, exc)
                 log.error(
                     "could not place VL batch spent=%s legs=%d: %s",
                     spent_token, len(legs), exc,
@@ -2409,6 +2457,8 @@ def _place_standalone(
         inactive = _inactive_market(exc, [intent])
         if inactive is not None:
             issues.inactive.add(inactive)
+        else:
+            issues.refused.setdefault(intent.market, exc)
         log.error(
             "could not place %s %s spent=%s: %s",
             intent.market,

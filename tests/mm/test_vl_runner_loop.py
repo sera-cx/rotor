@@ -195,6 +195,8 @@ class _FakeClient:
         self.server_offset = 0.0
         # Markets Sera rejects orders for as not active (still listed).
         self.inactive_markets: set[str] = set()
+        # Markets whose orders (and any VL batch holding one) Sera refuses.
+        self.refuse_markets: set[str] = set()
         self.inactive_rejections: list[str] = []
         # Raised by bootstrap() in order, one per call, until the list is empty.
         self.bootstrap_errors: list[Exception] = []
@@ -233,6 +235,8 @@ class _FakeClient:
 
     def send_vl_batch(self, batch: SignedVLBatch) -> VLBatchResult:
         legs = [order.wire["leg"] for order in batch.orders]
+        if any(leg.market in self.refuse_markets for leg in legs):
+            raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
         for leg in legs:
             if leg.market in self.inactive_markets:
                 self.inactive_rejections.append(leg.market)
@@ -305,6 +309,8 @@ class _FakeClient:
         if market in self.inactive_markets:
             self.inactive_rejections.append(market)
             raise SeraError("PAIR_INACTIVE", "Invalid request", 400)
+        if market in self.refuse_markets:
+            raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
         if self.reject_asks and side == "ask":
             self.events.append(("rejected", market, side))
             raise SeraError("INSUFFICIENT_EQUITY", "available equity below the order", 400)
@@ -1229,6 +1235,50 @@ def test_run_keeps_quoting_through_failed_metadata_refreshes_and_alerts_once(mon
     assert all(markets == {"XSGD/USDC", "EURC/USDC"} for markets in _markets_quoted_per_tick(client))
     assert len(notifier.containing("could not refresh Sera market metadata")) == 1
     assert len(notifier.containing("metadata refreshed again")) == 1
+
+
+def test_a_pair_sera_refuses_every_tick_is_alerted_while_others_quote(monkeypatch):
+    # Sera refuses every EURC order, which also sinks the shared USDC bid batch;
+    # the XSGD ask still goes out, so the stall watchdog stays quiet.
+    client = _FakeClient()
+    client.refuse_markets = {"EURC/USDC"}
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _fake_clock(monkeypatch, steps=[305.0, 305.0, 305.0, 1.0])
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True, state_path=":memory:")
+
+    dark = notifier.containing("Not quoting these pairs")
+    assert len(dark) == 1
+    assert "EURC/USDC for 15m: INSUFFICIENT_EQUITY: available equity below the order" in dark[0][0]
+    assert "XSGD/USDC" not in dark[0][0]
+    assert not notifier.containing("stalled")
+
+
+def test_once_fires_alert_a_pair_whose_fills_stay_unreadable(monkeypatch, tmp_path):
+    # Each --once fire is a new process, so the per-run read-failure count never
+    # escalates; the persisted not-quoting episode does.
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    client.unreadable_market = "EURC/USDC"
+    client.unreadable_ticks = set(range(100))
+    clock = {"now": T0}
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+
+    for _ in range(5):
+        vr.run(config_path="vl.toml", once=True, min_requote_seconds=0.0, telegram=True,
+               state_path=tmp_path / "state.sqlite")
+        clock["now"] += 305.0
+
+    dark = notifier.containing("Not quoting these pairs")
+    assert len(dark) == 1
+    assert "EURC/USDC" in dark[0][0] and "its fills could not be read" in dark[0][0]
 
 
 def test_a_refresh_that_finds_no_configured_market_keeps_the_last_metadata(monkeypatch):

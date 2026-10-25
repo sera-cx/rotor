@@ -216,9 +216,11 @@ instead of carrying it.
 Pairs are isolated within a tick: if a pair has no mid at all (its source and
 Wise both fail), or its quote fails market minimums, only that pair is skipped —
 the other configured pairs still quote. A tick is fully skipped only when no pair
-produces a quote. With `--telegram`, a pair that has produced no quote for 15
-minutes in a row is alerted once with the reason (for example its price source
-failing), and again once when it quotes again. Wise being unreachable for 15
+produces a quote. With `--telegram`, a pair that has placed no order for 15
+minutes in a row is alerted once with the reason (its price source failing, its
+fills unreadable, Sera refusing its orders or the VL batch they share, or no
+funds for any of its orders), and again once when it quotes again. A pair
+counts as quoting only if one of its orders went out. Wise being unreachable for 15
 minutes, so normal orders sit at the mid ± `fallback_weekend_bps`, is alerted
 once the same way, with a notice when it answers again. These episodes are kept
 in the state file, so `--once` fires share them. Placement is isolated the same way: an order or VL batch that
