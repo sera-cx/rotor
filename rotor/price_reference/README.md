@@ -5,8 +5,8 @@ This package turns one named FX source into the mid used by each pair in
 
 Files:
 
-- `__init__.py`: public exports for source adapters, data models, config
-  loaders, and symbol mapping helpers.
+- `__init__.py`: re-exports the oracle, its errors, the config loaders, and the
+  symbol helpers the runner uses.
 - `aggregator.py`: freshness-checking `ReferencePriceOracle` wrapper.
 - `config.py`: config-driven factory for `wise`, `ecb`, `fed`, and `bnm`
   sources plus optional token-to-ISO overrides.

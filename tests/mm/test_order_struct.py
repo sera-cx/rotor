@@ -130,11 +130,10 @@ def test_raw_amount_rejects_every_oversized_scale(exponent: int) -> None:
     The scaled value needs more significant digits than the 50-digit context
     can quantize. The server hits the same wall, so the request would fail
     server-side regardless; rotor refuses locally instead of signing and
-    sending it. The uint256 ceiling (~1.16e77, 78 digits) sits above the
-    50-digit context, so a value large enough to overflow uint256 can never be
-    quantized in the first place. The explicit `exceeds uint256` guard is
-    therefore unreachable in both Rotor and the server; it is kept only as
-    defence in depth should the precision ever be raised.
+    sending it. That precision is the upper bound: the uint256 ceiling
+    (~1.16e77, 78 digits) sits above it, so no amount that would overflow
+    uint256 can be quantized at all (test_uses_server_decimal_precision pins
+    the precision at 50).
     """
     with pytest.raises(ValueError, match="too large to represent"):
         eip712.raw_amount(Decimal(10) ** exponent, 18)

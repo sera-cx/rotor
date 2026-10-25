@@ -112,9 +112,6 @@ def compose_uuid(
 # amount, which changes the signature. This constant is load-bearing.
 SERVER_DECIMAL_PREC: int = 50
 
-# Solidity uint256 ceiling; the server rejects raw amounts above it.
-UINT256_MAX: int = (1 << 256) - 1
-
 # `recipient` is always the zero address for maker orders.
 ZERO_ADDRESS: str = "0x0000000000000000000000000000000000000000"
 
@@ -133,10 +130,10 @@ def raw_amount(amount: Decimal, decimals: int) -> int:
             )
         except decimal.InvalidOperation as exc:
             # A value needing more digits than the context allows cannot be
-            # quantized. The server hits the same wall (its own uint256 guard
-            # sits after this call and is unreachable for such values), so it
-            # would fail the request anyway — fail here with a clear message
-            # instead of signing or sending anything.
+            # quantized. That precision is the only upper bound needed: 10**50
+            # is far below the uint256 ceiling (~1.16e77). The server hits the
+            # same wall, so it would fail the request anyway — fail here with a
+            # clear message instead of signing or sending anything.
             raise ValueError(
                 f"amount too large to represent at {SERVER_DECIMAL_PREC} "
                 f"significant digits: {amount}e{decimals}"
@@ -144,8 +141,6 @@ def raw_amount(amount: Decimal, decimals: int) -> int:
     result = int(truncated)
     if result < 0:
         raise ValueError(f"amount must be non-negative, got {result}")
-    if result > UINT256_MAX:
-        raise ValueError(f"amount exceeds uint256: {result}")
     return result
 
 

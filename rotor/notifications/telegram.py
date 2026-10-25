@@ -31,59 +31,31 @@ TELEGRAM_API = "https://api.telegram.org"
 class TelegramNotifier:
     """Three-channel notifier; public methods never raise on Telegram failures."""
 
-    def __init__(
-        self,
-        token: str | None = None,
-        normal_chat_id: str | None = None,
-        important_chat_id: str | None = None,
-        debug_chat_id: str | None = None,
-        log: logging.Logger | None = None,
-        dry_run: bool = False,
-        http: httpx.Client | None = None,
-    ):
-        """Wire up channel routing.
-
-        Args:
-            token: Bot token. Defaults to ``TELEGRAM_TOKEN`` config. Empty
-                forces dry-run.
-            normal_chat_id: Chat id for the silent lifecycle channel.
-            important_chat_id: Chat id for the loud error channel.
-            debug_chat_id: Chat id for heartbeats.
-            log: Optional logger; defaults to the module logger.
-            dry_run: If True (or if no token or chat id resolves), log instead
-                of send.
-            http: Optional HTTP client, for tests.
-        """
-        # Explicit constructor args override config, which helps tests and
-        # one-off scripts avoid environment mutations.
-        self._token = (token if token is not None else get_config(
-            "TELEGRAM_TOKEN", "")).strip()
-        self._normal_chat_id = (
-            normal_chat_id if normal_chat_id is not None
-            else get_config("TELEGRAM_NORMAL_CHAT_ID", "")
-        )
-        self._important_chat_id = (
-            important_chat_id if important_chat_id is not None
-            else get_config("TELEGRAM_IMPORTANT_CHAT_ID", "")
-        )
-        self._debug_chat_id = (
-            debug_chat_id if debug_chat_id is not None
-            else get_config("TELEGRAM_DEBUG_CHAT_ID", "")
-        )
+    def __init__(self, *, log: logging.Logger | None = None, dry_run: bool = False):
+        """Read the TELEGRAM_* settings. `dry_run` (a run without --telegram)
+        only logs at DEBUG, and does not warn about missing settings."""
+        self._token = get_config("TELEGRAM_TOKEN", "").strip()
+        self._chats = {
+            "normal": get_config("TELEGRAM_NORMAL_CHAT_ID", ""),
+            "important": get_config("TELEGRAM_IMPORTANT_CHAT_ID", ""),
+            "debug": get_config("TELEGRAM_DEBUG_CHAT_ID", ""),
+        }
         self._log = log or logging.getLogger(__name__)
         self._dry_run = dry_run
-        self._http = http or httpx.Client(timeout=10.0)
+        self._http = httpx.Client(timeout=10.0)
 
         # Last time ANY message was sent — drives heartbeat rate-limiting.
         self._last_message_at: float = time.time()
 
+        if dry_run:
+            return
         if not self._token:
             self._log.warning(
                 "TelegramNotifier: TELEGRAM_TOKEN is empty — messages will be "
                 "dry-logged only."
             )
             self._dry_run = True
-        elif not (self._normal_chat_id or self._important_chat_id):
+        elif not (self._chats["normal"] or self._chats["important"]):
             # A token alone sends nothing; say so instead of dropping alerts.
             self._log.warning(
                 "TelegramNotifier: no TELEGRAM_NORMAL_CHAT_ID or "
@@ -107,25 +79,19 @@ class TelegramNotifier:
             important=True,
         )
 
-    def heartbeat(self) -> bool:
+    def heartbeat(self) -> None:
         """Emit a "still alive" message if silent for `HEARTBEAT_SECONDS`.
 
         Call on every loop tick; self-rate-limits.
-
-        Returns:
-            True if a heartbeat was emitted this call, False otherwise.
         """
         if time.time() - self._last_message_at < HEARTBEAT_SECONDS:
-            return False
+            return
         self._send("💓 rotor market maker alive.", channel="debug")
         self._last_message_at = time.time()
-        return True
 
-    def send_raw(self, text: str, *, important: bool = False, debug: bool = False) -> None:
-        """Send to normal, to normal and important, or (`debug`) to debug only."""
-        if debug:
-            self._send(text, channel="debug")
-        elif important and not self._important_chat_id:
+    def send_raw(self, text: str, *, important: bool = False) -> None:
+        """Send to the normal channel, and with `important` to the important one."""
+        if important and not self._chats["important"]:
             # With no separate important chat both channels are the same chat:
             # one message, with the important channel's notification.
             self._send(text, channel="important")
@@ -138,28 +104,12 @@ class TelegramNotifier:
         # Any attempted send/log counts as activity for heartbeat suppression.
         self._last_message_at = time.time()
 
-    def _send(self, text: str, *, channel: str) -> bool:
-        """Send `text` to the channel's chat.
-
-        Returns:
-            True if a real Telegram send happened, False on dry-run or a
-            swallowed exception (Telegram failures must not crash the loop).
-
-        Raises:
-            ValueError: If `channel` is not one of the allowed values.
-        """
-        if channel == "normal":
-            chat_id = self._normal_chat_id
-        elif channel == "important":
-            chat_id = self._important_chat_id or self._normal_chat_id
-        elif channel == "debug":
-            chat_id = self._debug_chat_id or self._normal_chat_id
-        else:
-            raise ValueError(f"unknown channel {channel!r}")
-
+    def _send(self, text: str, *, channel: str) -> None:
+        """Send `text` to the channel's chat; failures are logged, never raised."""
+        chat_id = self._chats[channel] or self._chats["normal"]
         if self._dry_run or not chat_id:
             self._log.debug("[telegram dry-run %s] %s", channel, text)
-            return False
+            return
 
         if len(text) > MAX_MESSAGE_CHARS:
             cut = "\n…[cut]"
@@ -167,7 +117,6 @@ class TelegramNotifier:
         try:
             # Only the important channel pushes a notification.
             self._post(text, chat_id, silent=channel != "important")
-            return True
         except Exception as e:
             # Telegram failures must NOT take down the MM loop.
             # httpx errors quote the request URL, which holds the token; never
@@ -177,7 +126,6 @@ class TelegramNotifier:
                 channel,
                 str(e).replace(self._token, "<TELEGRAM_TOKEN>"),
             )
-            return False
 
     def _post(self, text: str, chat_id: str, *, silent: bool) -> None:
         """Send one plain-text message with the Bot API's sendMessage."""

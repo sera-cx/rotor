@@ -49,7 +49,7 @@ def test_vl_flags_pass_to_the_runner(monkeypatch, flags, changed):
 
 
 def test_live_vl_requires_wallet_unlock(monkeypatch, capsys):
-    wallet_key.lock()
+    monkeypatch.setattr(wallet_key, "_account", None)
     monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
 

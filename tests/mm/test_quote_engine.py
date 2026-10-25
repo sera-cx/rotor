@@ -11,7 +11,7 @@ from rotor.security import key as wallet_key
 
 
 def test_build_client_dry_run_uses_zero_address_when_wallet_locked(monkeypatch):
-    wallet_key.lock()
+    monkeypatch.setattr(wallet_key, "_account", None)
     monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
 
     client = qe.build_client(dry_run=True, log=__import__("logging").getLogger("test"))
@@ -22,7 +22,7 @@ def test_build_client_dry_run_uses_zero_address_when_wallet_locked(monkeypatch):
 
 
 def test_build_client_dry_run_needs_no_wallet_and_cannot_sign(monkeypatch):
-    wallet_key.lock()
+    monkeypatch.setattr(wallet_key, "_account", None)
     monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
 
     client = qe.build_client(dry_run=True, log=__import__("logging").getLogger("test"))

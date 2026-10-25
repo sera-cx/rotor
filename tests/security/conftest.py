@@ -10,15 +10,13 @@ from rotor.security import key as wallet_key
 
 @pytest.fixture(autouse=True)
 def _locked_wallet(monkeypatch: pytest.MonkeyPatch):
-    """Lock the module key buffer and clear SERA_PRIVATE_KEY around each test
-    so state doesn't leak between tests. Tests that want a key set it via
-    their own monkeypatch after this fixture runs.
+    """Start each test with no key held and no SERA_PRIVATE_KEY, and drop any
+    key a test unlocks when it ends, so state doesn't leak between tests.
+    Tests that want a key set it via their own monkeypatch after this runs.
     """
     monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
-    wallet_key.lock()
-    yield
-    wallet_key.lock()
+    monkeypatch.setattr(wallet_key, "_account", None)
 
 
 @pytest.fixture

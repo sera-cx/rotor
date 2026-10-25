@@ -1,4 +1,4 @@
-"""Tests for wallet unlock, lock, address derivation, and typed-data signing."""
+"""Tests for wallet unlock, address derivation, and typed-data signing."""
 
 from __future__ import annotations
 
@@ -10,18 +10,16 @@ from rotor.security import key as wallet_key
 
 
 class TestUnlock:
-    def test_unlock_loads_env_key_then_lock(
+    def test_unlock_loads_env_key_and_no_key_means_no_address(
         self, known_keypair: tuple[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         pk, addr = known_keypair
         monkeypatch.setenv("SERA_PRIVATE_KEY", pk)
 
         wallet_key.unlock()
-        assert wallet_key.is_unlocked()
         assert wallet_key.wallet_address() == addr
 
-        wallet_key.lock()
-        assert not wallet_key.is_unlocked()
+        monkeypatch.setattr(wallet_key, "_account", None)
         with pytest.raises(wallet_key.WalletLocked):
             wallet_key.wallet_address()
 

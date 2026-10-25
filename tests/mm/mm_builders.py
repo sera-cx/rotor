@@ -37,7 +37,6 @@ def intent(
     *,
     price: str = "1.00",
     qty: str = "100",
-    mid: str = "1.01",
 ) -> OrderIntent:
     return OrderIntent(
         market=market,
@@ -46,7 +45,6 @@ def intent(
         price=Decimal(price),
         expiration=999,
         spent_token=spent,
-        benchmark_rate=Decimal(mid),
     )
 
 

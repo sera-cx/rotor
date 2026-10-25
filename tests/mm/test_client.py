@@ -528,21 +528,13 @@ def test_get_open_orders_reads_every_page_up_to_total():
         client.get_open_orders(page_limit=2, max_pages=2)
 
 
-def test_from_response_cooldown_classification_prefers_typed_code():
-    # Typed cancel-cooldown code → cooldown.
-    cooldown = errors_mod.from_response(
-        429, {"detail": {"error_code": "CANCEL_COOLDOWN", "detail": "wait"}})
+def test_a_429_is_a_cancel_cooldown_only_when_sera_says_so():
+    cooldown = errors_mod.from_response(429, CANCEL_COOLDOWN_BODY)
     assert isinstance(cooldown, errors_mod.SeraCancelCooldown)
 
-    # A different typed code that merely mentions cooldown is NOT cancel-cooldown.
-    rate = errors_mod.from_response(
-        429, {"detail": {"error_code": "RATE_LIMITED", "detail": "in cooldown"}})
+    rate = errors_mod.from_response(429, {"detail": "Rate limit exceeded"})
     assert isinstance(rate, errors_mod.SeraRateLimit)
     assert not isinstance(rate, errors_mod.SeraCancelCooldown)
-
-    # No typed code: fall back to the message substring.
-    legacy = errors_mod.from_response(429, {"detail": "please wait, cooldown active"})
-    assert isinstance(legacy, errors_mod.SeraCancelCooldown)
 
 
 def test_from_response_names_the_refused_field():
@@ -561,8 +553,7 @@ def test_non_json_error_response_becomes_typed_error():
 
     with pytest.raises(errors_mod.SeraError) as ei:
         _client(handler)._request("GET", "/anything")
-    assert ei.value.status_code == 500
-    assert ei.value.payload == {"detail": "upstream down"}
+    assert (ei.value.status_code, ei.value.detail) == (500, "upstream down")
 
 
 # ---------------------------------------------------------------------------

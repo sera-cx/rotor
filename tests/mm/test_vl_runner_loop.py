@@ -365,7 +365,9 @@ def _wire_runner(
         "USDC": "USD",
     })
     if notifier is not None:
-        monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+        # Without --telegram run() builds a dry-run notifier; it records nothing.
+        monkeypatch.setattr(vr, "TelegramNotifier", lambda *, dry_run=False, **_kwargs: (
+            _RecordingNotifier() if dry_run else notifier))
     return source
 
 
@@ -1417,7 +1419,7 @@ class _RecordingNotifier:
     def __init__(self) -> None:
         self.messages: list[tuple[str, bool]] = []
 
-    def send_raw(self, text: str, *, important: bool = False, debug: bool = False) -> None:
+    def send_raw(self, text: str, *, important: bool = False) -> None:
         self.messages.append((text, important))
 
     def notify_startup(self, text: str) -> None:
@@ -1429,8 +1431,8 @@ class _RecordingNotifier:
     def notify_error(self, context: str, error: object) -> None:
         self.messages.append((f"error: {context}: {error}", True))
 
-    def heartbeat(self) -> bool:
-        return False
+    def heartbeat(self) -> None:
+        return None
 
     def containing(self, needle: str) -> list[tuple[str, bool]]:
         return [message for message in self.messages if needle in message[0]]
@@ -1665,9 +1667,25 @@ def test_stale_alerts_ignore_a_one_off_fetch_failure():
 
 def test_stale_alerts_still_log_without_telegram(caplog):
     with caplog.at_level(logging.WARNING, logger=LOG.name):
-        _stale_alerts().update(_refs(), notifier=None, log=LOG, now=0.0)
+        _stale_alerts().update(_refs(), notifier=vr.TelegramNotifier(dry_run=True), log=LOG,
+                               now=0.0)
 
     assert "Reference rates are not updating" in caplog.text
+
+
+def test_without_telegram_nothing_is_posted_even_with_a_token(monkeypatch, caplog):
+    client = _FakeClient()
+    _wire_runner(monkeypatch, client=client)
+    monkeypatch.setenv("TELEGRAM_TOKEN", "123:SECRET")
+    monkeypatch.setenv("TELEGRAM_NORMAL_CHAT_ID", "chat")
+    posts = []
+    monkeypatch.setattr(vr.TelegramNotifier, "_post", lambda _self, *args, **_kw: posts.append(args))
+
+    assert _run(once=True) == 0
+
+    assert client.batch_places
+    assert posts == []
+    assert "TelegramNotifier" not in caplog.text
 
 
 def test_run_refuses_an_order_ttl_sera_would_sweep_at_once(monkeypatch, caplog):

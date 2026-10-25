@@ -23,7 +23,6 @@ SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 # private-key material through every signing call. The account is derived
 # once at unlock, not on every signature.
 _account: LocalAccount | None = None
-_address: str | None = None
 
 
 class WalletNotInitialized(RuntimeError):
@@ -40,7 +39,7 @@ class InvalidPrivateKey(ValueError):
 
 def unlock() -> None:
     """Load the maker signing key from ``SERA_PRIVATE_KEY``."""
-    global _account, _address
+    global _account
 
     # Unlock is idempotent so repeated CLI/runtime checks do not reload or
     # re-derive the same key.
@@ -58,22 +57,14 @@ def unlock() -> None:
             ".env, or optional rotor/secret.py for the maker wallet."
         )
     _account = _load_account(env_key)
-    _address = _account.address
-
-
-def is_unlocked() -> bool:
-    """Return whether a private key is currently held in process memory."""
-    # Auditors should note this reports in-memory state only; it does not check
-    # whether configuration exists.
-    return _account is not None
 
 
 def wallet_address() -> str:
     """Return the unlocked wallet address or raise if the key is locked."""
     # Callers must unlock first so code cannot accidentally assume a signer.
-    if _address is None:
+    if _account is None:
         raise WalletLocked("wallet not unlocked; call `unlock()` first")
-    return _address
+    return _account.address
 
 
 def sign_typed_data(domain: dict, types: dict, message: dict) -> str:
@@ -90,16 +81,6 @@ def sign_typed_data(domain: dict, types: dict, message: dict) -> str:
     signature = signed.signature.hex()
     # Normalize to the common 0x-prefixed hex string expected by APIs.
     return signature if signature.startswith("0x") else "0x" + signature
-
-
-def lock() -> None:
-    """Forget the private key held by this process."""
-    global _account, _address
-
-    # Clearing both values prevents later code from signing or reporting an
-    # address after an explicit lock.
-    _account = None
-    _address = None
 
 
 def _load_account(private_key: str) -> LocalAccount:

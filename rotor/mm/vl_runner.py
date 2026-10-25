@@ -49,7 +49,7 @@ from rotor.mm.quote_engine import (
     sleep_remaining,
 )
 from rotor.mm.vl_config import PairConfig, VLConfig, load_vl_config
-from rotor.notifications import TelegramNotifier
+from rotor.notifications.telegram import TelegramNotifier
 from rotor.price_reference import (
     ReferencePrice,
     ReferencePriceOracle,
@@ -147,8 +147,6 @@ class OrderIntent:
     expiration: int
     # Token spent by this side; used for VL grouping and budget checks.
     spent_token: str
-    # Benchmark mid used to create this intent.
-    benchmark_rate: Decimal
     # A return order (priced by the return auction) rather than a normal quote.
     is_return: bool = False
 
@@ -746,8 +744,8 @@ class StaleReferenceAlerts:
     `reminder_seconds`, and closed with a notice when fresh rates return. A pair
     whose source is unavailable altogether, and so uses Wise's mid, is announced
     once too. Episodes live in the state store so fire-once runs do not
-    re-announce the same weekend every run. Without a notifier the same
-    messages still reach the log.
+    re-announce the same weekend every run. Every message also reaches the
+    log, with or without --telegram.
     """
 
     def __init__(
@@ -775,7 +773,7 @@ class StaleReferenceAlerts:
         self,
         refs: TickReferences,
         *,
-        notifier: TelegramNotifier | None,
+        notifier: TelegramNotifier,
         log: logging.Logger,
         now: float | None = None,
     ) -> None:
@@ -850,8 +848,7 @@ class StaleReferenceAlerts:
             body = "\n".join([heading, *lines, *([footer] if footer else [])])
             # One compact log line per state change, never one per tick.
             log.warning("%s", body.replace("\n", " | "))
-            if notifier is not None:
-                notifier.send_raw(f"{icon} {body}", important=important)
+            notifier.send_raw(f"{icon} {body}", important=important)
 
     def _carry_line(self, market: str, ref: ReferencePrice) -> str:
         """Describe one pair quoting on a carried-forward rate."""
@@ -933,7 +930,7 @@ def run(
         )
         return 1
     # Created first so a failed startup can alert and its waits can be stopped.
-    notifier = TelegramNotifier(log=log) if telegram else None
+    notifier = TelegramNotifier(log=log, dry_run=not telegram)
     stop = StopFlag()
     stop.install()
     budget = BootBudget(
@@ -977,7 +974,7 @@ def run(
             )
             # Alert on the hour's first failure and when the hour's attempts run
             # out, not on every attempt.
-            if notifier is not None and (failures == 1 or failures >= BOOT_ATTEMPTS_PER_HOUR):
+            if failures == 1 or failures >= BOOT_ATTEMPTS_PER_HOUR:
                 notifier.notify_error(
                     f"rotor could not start (attempt {failures} of "
                     f"{BOOT_ATTEMPTS_PER_HOUR} this hour"
@@ -1004,12 +1001,11 @@ def run(
     except Exception as exc:
         budget.record_failure()
         log.error("state store failed: %s", exc)
-        if notifier is not None:
-            notifier.notify_error("rotor could not use its state file", exc)
+        notifier.notify_error("rotor could not use its state file", exc)
         if state is not None:
             state.close()
         return 1
-    if budget.failures_this_hour() and notifier is not None:
+    if budget.failures_this_hour():
         notifier.send_raw(
             f"✅ rotor started after {budget.failures_this_hour()} failed attempt(s)",
             important=True,
@@ -1024,15 +1020,14 @@ def run(
         f"{' (dry-run)' if dry_run else ''}"
     )
     log.warning("%s", started)
-    if notifier is not None:
-        notifier.notify_startup(started)
-        if skipped:
-            notifier.send_raw(
-                "⚠️ Not quoting "
-                + "; ".join(f"{market} ({why})" for market, why in skipped.items())
-                + ". The other pairs are quoting.",
-                important=True,
-            )
+    notifier.notify_startup(started)
+    if skipped:
+        notifier.send_raw(
+            "⚠️ Not quoting "
+            + "; ".join(f"{market} ({why})" for market, why in skipped.items())
+            + ". The other pairs are quoting.",
+            important=True,
+        )
     # Throttled warnings while pairs quote on carried-forward daily rates.
     stale_alerts = StaleReferenceAlerts(runtimes, state=state)
     # One alert when a single pair stops quoting for a while, one when it is back.
@@ -1056,8 +1051,7 @@ def run(
         # trader over budgets and self-matching, so refuse to start.
         message = _foreign_orders_message(client, foreign)
         log.error("%s", message)
-        if notifier is not None:
-            notifier.send_raw(f"⛔ rotor did not start: {message}", important=True)
+        notifier.send_raw(f"⛔ rotor did not start: {message}", important=True)
         if state is not None:
             state.close()
         return 1
@@ -1102,8 +1096,7 @@ def run(
     try:
         while not stop.requested:
             tick_started = time.time()
-            if notifier is not None:
-                notifier.heartbeat()
+            notifier.heartbeat()
             if not dry_run and not once:
                 watchdog.check()
             if updater is not None:
@@ -1111,14 +1104,9 @@ def run(
                 if update_result is not None and update_result.updated:
                     restart_after_update = True
                     log.warning("auto-update stopping VL loop before restart")
-                    if notifier is not None:
-                        notifier.send_raw(f"🔄 rotor auto-update: {update_result.message}; restarting")
+                    notifier.send_raw(f"🔄 rotor auto-update: {update_result.message}; restarting")
                     break
-                if (
-                    update_result is not None
-                    and update_result.status in ("failed", "skipped")
-                    and notifier is not None
-                ):
+                if update_result is not None and update_result.status in ("failed", "skipped"):
                     # --auto-update was asked for; say so when it is not working.
                     notifier.send_raw(
                         f"⚠️ rotor auto-update {update_result.status}: {update_result.message}",
@@ -1145,19 +1133,17 @@ def run(
                     if refresh_failing:
                         refresh_failing = False
                         log.warning("Sera metadata refresh recovered")
-                        if notifier is not None:
-                            notifier.send_raw("✅ Sera market metadata refreshed again.")
+                        notifier.send_raw("✅ Sera market metadata refreshed again.")
                 except Exception as exc:
                     log.warning("could not refresh Sera metadata; keeping the last: %s", exc)
                     next_refresh = time.time() + EARLY_REFRESH_SECONDS
                     if not refresh_failing:
                         refresh_failing = True
-                        if notifier is not None:
-                            notifier.notify_error(
-                                "could not refresh Sera market metadata; quoting on the "
-                                "last good metadata and retrying every 10 minutes",
-                                exc,
-                            )
+                        notifier.notify_error(
+                            "could not refresh Sera market metadata; quoting on the "
+                            "last good metadata and retrying every 10 minutes",
+                            exc,
+                        )
             # Phase 0: if we have no tracked state, try to recover open orders
             # from Sera before quoting again (falls back to prior local state).
             if not dry_run and not live:
@@ -1178,8 +1164,7 @@ def run(
                 if foreign and not foreign_alerted:
                     message = _foreign_orders_message(client, foreign)
                     log.error("%s", message)
-                    if notifier is not None:
-                        notifier.send_raw(f"⚠️ {message}", important=True)
+                    notifier.send_raw(f"⚠️ {message}", important=True)
                 foreign_alerted = bool(foreign)
             if dry_run:
                 tick_expiration = int(time.time()) + order_ttl_seconds
@@ -1347,12 +1332,11 @@ def run(
             placed = _place_groups(client, groups, log, state=state, issues=issues)
             for market in sorted(issues.inactive - inactive_alerted):
                 log.error("%s is not active on Sera; not quoting it until the next refresh", market)
-                if notifier is not None:
-                    notifier.send_raw(
-                        f"⚠️ Sera says {market} is not active. Not quoting it until "
-                        "the next market refresh; the other pairs are quoting.",
-                        important=True,
-                    )
+                notifier.send_raw(
+                    f"⚠️ Sera says {market} is not active. Not quoting it until "
+                    "the next market refresh; the other pairs are quoting.",
+                    important=True,
+                )
             inactive |= issues.inactive
             inactive_alerted |= issues.inactive
             inactive_alerted -= {o.market for p in placed for o in p.orders}
@@ -1378,8 +1362,7 @@ def run(
         # Anything that ends the loop unexpectedly (a state file that cannot be
         # written, say) stops rotor: say so loudly, not only "VL mm stopped".
         log.exception("rotor stopped on an unexpected error")
-        if notifier is not None:
-            notifier.notify_error("rotor stopped on an unexpected error", exc)
+        notifier.notify_error("rotor stopped on an unexpected error", exc)
         raise
     finally:
         # A --once fire that placed nothing checks for a stall shared across fires.
@@ -1399,8 +1382,7 @@ def run(
             if state is not None:
                 state.replace_active(live)
             left_live = bool(live)
-        if notifier is not None:
-            notifier.notify_shutdown("VL mm stopped")
+        notifier.notify_shutdown("VL mm stopped")
         if state is not None:
             state.close()
         # Release the HTTP connection pool (best-effort; fakes may lack close()).
@@ -1426,7 +1408,7 @@ def _cancel_before_exit(
     log: logging.Logger,
     *,
     stop: StopFlag,
-    notifier: TelegramNotifier | None,
+    notifier: TelegramNotifier,
     wait: bool,
     order_ttl_seconds: int,
 ) -> list[LivePlacement]:
@@ -1459,8 +1441,7 @@ def _cancel_before_exit(
             f"cooldown); they expire by about {_fmt_utc(youngest + order_ttl_seconds)}"
         )
         log.warning("%s", message)
-        if notifier is not None:
-            notifier.send_raw(f"⚠️ {message}", important=True)
+        notifier.send_raw(f"⚠️ {message}", important=True)
     return live
 
 
@@ -1472,7 +1453,7 @@ def _refresh_runtimes(
     max_reference_age_s: float | None,
     carry_stale: bool,
     log: logging.Logger,
-    notifier: TelegramNotifier | None,
+    notifier: TelegramNotifier,
 ) -> list[PairRuntime]:
     """Re-read Sera's metadata and rebuild the pairs from it.
 
@@ -1500,7 +1481,7 @@ def _refresh_runtimes(
             setattr(client, name, value)
         raise
     dropped = {rt.config.market for rt in runtimes} & set(skipped)
-    if dropped and notifier is not None:
+    if dropped:
         notifier.send_raw(
             "⚠️ No longer quoting "
             + "; ".join(f"{market} ({skipped[market]})" for market in sorted(dropped))
@@ -1880,7 +1861,7 @@ def _intents_for_runtime(
     intents = _at_wise_prices(intents, runtime, ref, now=now, log=log, refs=refs)
     if position is not None:
         intents = _with_return_order(
-            intents, runtime, position, config, now=now, log=log)
+            intents, runtime, position, config, mid=ref.rate, now=now, log=log)
     intents = _within_limits(intents, runtime.info, budgets, funds, log)
     # Sizes are final now; Wise's fees fall with size, so price them again
     # (a reply for an unchanged size is reused, not re-requested).
@@ -1936,7 +1917,6 @@ def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list
             price=mid,
             expiration=expiration,
             spent_token=info.quote_symbol.upper(),
-            benchmark_rate=mid,
         ),
         OrderIntent(
             market=runtime.config.market,
@@ -1945,7 +1925,6 @@ def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list
             price=mid,
             expiration=expiration,
             spent_token=info.base_symbol.upper(),
-            benchmark_rate=mid,
         ),
     ]
 
@@ -2130,6 +2109,7 @@ def _with_return_order(
     position: Position,
     config: VLConfig,
     *,
+    mid: Decimal,
     now: float,
     log: logging.Logger,
 ) -> list[OrderIntent]:
@@ -2155,7 +2135,7 @@ def _with_return_order(
     info = runtime.info
     target = return_price(
         position,
-        normal.benchmark_rate,
+        mid,
         fixed_bps=runtime.config.fixed_bps,
         return_bps=config.return_bps,
         now=now,
@@ -2860,7 +2840,7 @@ def _report_read_failures(
     previous: dict[str, int],
     *,
     log: logging.Logger,
-    notifier: TelegramNotifier | None,
+    notifier: TelegramNotifier,
 ) -> dict[str, int]:
     """Log this tick's unreadable orders and return their consecutive counts.
 
@@ -2885,8 +2865,7 @@ def _report_read_failures(
                 "%s fills unreadable for %d ticks in a row; it is not quoting",
                 market, READ_FAILURE_ALERT_TICKS,
             )
-            if notifier is not None:
-                notifier.notify_error(f"{market} not quoting", error)
+            notifier.notify_error(f"{market} not quoting", error)
     return counts
 
 

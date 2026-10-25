@@ -1,72 +1,26 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-*.egg
 *.egg-info/
 dist/
 build/
-.eggs/
-develop-eggs/
-.installed.cfg
-MANIFEST
-pip-log.txt
-pip-delete-this-directory.txt
 
 # Virtual environments
 .venv/
 venv/
-env/
-ENV/
-.python-version
 
-# Poetry
-poetry.lock.bak
-
-# Testing / coverage
+# Test and lint caches
 .pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-
-# Linters / type checkers
 .ruff_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyright/
-.pytype/
 
-# IDEs / editors
+# Editors / OS. Editor backups and swap files of rotor/secret.py or the config
+# can hold the key.
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.project
-.pydevproject
-.settings/
-*.sublime-workspace
-*.sublime-project
-
-# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-desktop.ini
 
 # rotor-specific: anything that can hold a key or secret
 rotor/secret.py
@@ -81,18 +35,9 @@ wallet.enc*
 
 # Generated / runtime data
 *.log
-debug.log
-error.log
 .rotor_state*
 # The operator's config lives in the checkout (see README); never commit it.
 rotor/vl.config.toml
-
-/.benchmarks/*
-!/.benchmarks/README.md
-/cache/*
-!/cache/README.md
-/logs/*
-!/logs/README.md
 
 # Scratch / experimental
 scratch/

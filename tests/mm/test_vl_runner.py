@@ -114,17 +114,19 @@ def _priced(intents, wise, info=None, *, mid="1.0000", stale=False, now=NOW, ref
 def _quote(fixed_bps="25", mid="1.0000", qty="100"):
     m, f = Decimal(mid), Decimal(fixed_bps) / 10000
     return [
-        intent("XSGD/USDC", "bid", "USDC", price=str(m * (1 - f)), qty=qty, mid=mid),
-        intent("XSGD/USDC", "ask", "XSGD", price=str(m * (1 + f)), qty=qty, mid=mid),
+        intent("XSGD/USDC", "bid", "USDC", price=str(m * (1 - f)), qty=qty),
+        intent("XSGD/USDC", "ask", "XSGD", price=str(m * (1 + f)), qty=qty),
     ]
 
 
-def _with_return(position, intents, *, now, info=None, return_bps="2", window="48"):
+def _with_return(position, intents, *, now, mid="1.0000", info=None, return_bps="2",
+                 window="48"):
     return vr._with_return_order(
         intents,
         _runtime(info),
         position,
         vl_config(return_bps=return_bps, window=window),
+        mid=Decimal(mid),
         now=now,
         log=LOG,
     )
@@ -146,8 +148,7 @@ def test_short_position_swaps_the_bid_for_a_return_bid_and_keeps_the_ask():
     assert (bid.side, bid.qty_base, bid.price) == ("bid", Decimal("40"), Decimal("0.9974"))
     assert ask == intents[1]
     # Everything except size and price is the normal bid's.
-    assert (bid.spent_token, bid.expiration, bid.benchmark_rate) == (
-        intents[0].spent_token, intents[0].expiration, intents[0].benchmark_rate)
+    assert (bid.spent_token, bid.expiration) == (intents[0].spent_token, intents[0].expiration)
 
 
 def test_the_return_window_setting_sets_how_fast_the_auction_walks():
@@ -155,11 +156,12 @@ def test_the_return_window_setting_sets_how_fast_the_auction_walks():
     # 1.0100 keeps the return_bps limit out of the way.)
     position = Position(Decimal("-40"), Decimal("1.0050"), 0.0)
 
-    bid, _ask = _with_return(position, _quote("50", "1.0100"), now=12 * HOUR, window="24")
+    bid, _ask = _with_return(
+        position, _quote("50", "1.0100"), mid="1.0100", now=12 * HOUR, window="24")
     assert bid.price == Decimal("0.9999")
 
     # The default 48 h window is only a quarter through.
-    bid, _ask = _with_return(position, _quote("50", "1.0100"), now=12 * HOUR)
+    bid, _ask = _with_return(position, _quote("50", "1.0100"), mid="1.0100", now=12 * HOUR)
     assert bid.price == Decimal("0.9974")
 
 
@@ -168,7 +170,7 @@ def test_return_order_holds_at_the_fill_price_while_the_market_stays_away():
     position = Position(Decimal("40"), Decimal("0.9950"), 0.0)
     intents = _quote("50", "0.9700")
 
-    _bid, ask = _with_return(position, intents, now=72 * HOUR)
+    _bid, ask = _with_return(position, intents, mid="0.9700", now=72 * HOUR)
 
     assert (ask.qty_base, ask.price) == (Decimal("40"), Decimal("0.9950"))
 
@@ -176,7 +178,7 @@ def test_return_order_holds_at_the_fill_price_while_the_market_stays_away():
 def test_return_order_sits_return_bps_from_mid_when_the_market_came_back():
     position = Position(Decimal("-40"), Decimal("1.0050"), 0.0)
 
-    bid, _ask = _with_return(position, _quote("50", "1.0000"), now=48 * HOUR)
+    bid, _ask = _with_return(position, _quote("50", "1.0000"), mid="1.0000", now=48 * HOUR)
 
     assert bid.price == Decimal("0.9998")
 
@@ -662,7 +664,7 @@ def test_an_order_without_an_answer_stays_recorded_and_is_tracked_for_cancel(los
 
 def test_standalone_placement_is_recorded_for_settlement():
     """A singleton (standalone) order is recorded in the ledger like a VL leg."""
-    source = intent("XSGD/USDC", "bid", "USDC", price="0.99", mid="1.00")
+    source = intent("XSGD/USDC", "bid", "USDC", price="0.99")
 
     store = vr.StateStore(":memory:")
     placements = _place_groups(
