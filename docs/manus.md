@@ -25,12 +25,6 @@ required set for a live deployment is:
 Add `FRED_API_KEY` only if a pair uses `price_source = fed`, and `TELEGRAM_*`
 only with `--telegram`.
 
-**If Manus injects under a namespace prefix.** If your stored secrets arrive in
-the sandbox as `<PREFIX>SERA_API_KEY` rather than bare `SERA_API_KEY`, set one
-variable — `ROTOR_ENV_PREFIX=<PREFIX>` — and rotor resolves every name through
-that prefix automatically. Leave it unset when names are injected bare (the
-common case).
-
 **Verify in the sandbox** once secrets are set:
 
 ```bash

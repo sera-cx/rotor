@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 _DOTENV_LOADED = False
 # Values read from `.env` files. Kept apart from os.environ so a real
-# environment variable (bare or prefixed) always beats any `.env` line.
+# environment variable always beats any `.env` line, even a blank one.
 _DOTENV: dict[str, str] = {}
 
 _log = logging.getLogger(__name__)
@@ -54,21 +54,10 @@ def get_config_json(name: str, default: Any = None) -> Any:
 
 
 def _env_value(name: str) -> tuple[bool, str | None]:
-    """Resolve an env var, honoring an optional platform namespace prefix.
-
-    Some hosts inject stored secrets under a namespace prefix. Set
-    ``ROTOR_ENV_PREFIX`` so a value rotor reads as ``SERA_API_KEY`` still
-    resolves when the platform injected it as ``<PREFIX>SERA_API_KEY`` — no
-    per-name renaming or guessing. Order: the real environment (bare name,
-    then prefixed), then `.env` (bare, then prefixed), so a real variable is
-    never hidden by a `.env` line, even a blank one.
-    """
-    prefix = os.environ.get("ROTOR_ENV_PREFIX") or _DOTENV.get("ROTOR_ENV_PREFIX", "")
-    names = [name, f"{prefix}{name}"] if prefix else [name]
+    """Resolve a setting: the real environment first, then `.env`."""
     for source in (os.environ, _DOTENV):
-        for key in names:
-            if key in source:
-                return True, source[key]
+        if name in source:
+            return True, source[name]
     return False, None
 
 

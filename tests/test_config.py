@@ -61,33 +61,6 @@ def test_get_config_json_raises_on_invalid_environment_json(monkeypatch):
         get_config_json("BROKEN_JSON")
 
 
-def test_get_config_resolves_namespace_prefix(monkeypatch):
-    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
-    monkeypatch.delenv("SERA_API_KEY", raising=False)
-    monkeypatch.setenv("ROTOR_ENV_PREFIX", "MANUS_")
-    monkeypatch.setenv("MANUS_SERA_API_KEY", "from-manus")
-
-    assert get_config("SERA_API_KEY") == "from-manus"
-
-
-def test_get_config_prefers_bare_name_over_prefixed(monkeypatch):
-    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
-    monkeypatch.setenv("ROTOR_ENV_PREFIX", "MANUS_")
-    monkeypatch.setenv("SERA_API_KEY", "bare")
-    monkeypatch.setenv("MANUS_SERA_API_KEY", "prefixed")
-
-    assert get_config("SERA_API_KEY") == "bare"
-
-
-def test_get_config_json_resolves_namespace_prefix(monkeypatch):
-    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
-    monkeypatch.delenv("PRICE_REFERENCE_TOKEN_TO_ISO", raising=False)
-    monkeypatch.setenv("ROTOR_ENV_PREFIX", "MANUS_")
-    monkeypatch.setenv("MANUS_PRICE_REFERENCE_TOKEN_TO_ISO", '{"xphp": "PHP"}')
-
-    assert get_config_json("PRICE_REFERENCE_TOKEN_TO_ISO") == {"xphp": "PHP"}
-
-
 def test_dotenv_does_not_truncate_unquoted_value_with_hash(monkeypatch, tmp_path):
     # A secret containing " #" must not be silently truncated at an inline comment.
     monkeypatch.chdir(tmp_path)
@@ -101,18 +74,17 @@ def test_dotenv_does_not_truncate_unquoted_value_with_hash(monkeypatch, tmp_path
     assert get_config("ROTOR_SECRET_WITH_HASH") == "ab cd #ef"
 
 
-def test_a_real_prefixed_variable_beats_a_dotenv_line_even_a_blank_one(monkeypatch, tmp_path):
-    # .env.example ships blank SERA_* lines and suggests ROTOR_ENV_PREFIX there.
+def test_a_real_variable_beats_a_dotenv_line_even_a_blank_one(monkeypatch, tmp_path):
+    # .env.example ships blank SERA_* lines.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("SERA_API_KEY", raising=False)
-    monkeypatch.delenv("ROTOR_ENV_PREFIX", raising=False)
-    monkeypatch.setenv("MANUS_SERA_API_KEY", "from-manus")
+    monkeypatch.setenv("SERA_API_KEY", "from-env")
     monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
-    (tmp_path / ".env").write_text("ROTOR_ENV_PREFIX=MANUS_\nSERA_API_KEY=\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SERA_API_KEY=\nROTOR_ONLY_IN_DOTENV=x\n", encoding="utf-8")
 
-    assert get_config("SERA_API_KEY") == "from-manus"
-    # .env no longer leaks into the process environment.
-    assert "SERA_API_KEY" not in __import__("os").environ
+    assert get_config("SERA_API_KEY") == "from-env"
+    assert get_config("ROTOR_ONLY_IN_DOTENV") == "x"
+    # .env never leaks into the process environment.
+    assert "ROTOR_ONLY_IN_DOTENV" not in __import__("os").environ
 
 
 @pytest.mark.parametrize(("line", "value"), [
