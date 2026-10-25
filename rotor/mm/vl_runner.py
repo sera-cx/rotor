@@ -64,7 +64,6 @@ from rotor.updater import (
     restart_current_process,
 )
 
-BOOT_CANCEL_RETRY_SECONDS = 300.0
 # Sera refuses to cancel an order younger than this (HTTP 429 cancel cooldown).
 SERA_CANCEL_COOLDOWN_SECONDS = 300.0
 # Sera sweeps, every 30 s, orders due to expire within 60 s, so a shorter TTL
@@ -1055,14 +1054,10 @@ def run(
             state.close()
         return 1
     if live and not dry_run:
-        if once:
-            # Fire-once (e.g. a Manus scheduler tick): do a single boot-cancel
-            # pass and never block on Sera's multi-minute cancel cooldown. Any
-            # orders still on cooldown stay tracked and the next scheduled run
-            # requotes them, so a single invocation always returns promptly.
-            live = _cancel_placements(client, live, log)
-        else:
-            live = _cancel_boot_placements(client, live, log, stop=stop)
+        # One cancel pass, never blocking on Sera's 5-minute cancel cooldown.
+        # Orders still on cooldown stay tracked, and the tick loop's cancel
+        # guard waits or skips until they can be cancelled before it places.
+        live = _cancel_placements(client, live, log)
     if state is not None:
         state.replace_active(live)
 
@@ -2586,32 +2581,6 @@ def _is_order_gone(exc: Exception) -> bool:
         marker in code
         for marker in ("NOT_FOUND", "ALREADY_CANCEL", "ALREADY_FILLED", "ORDER_GONE", "UNKNOWN_ORDER")
     )
-
-
-def _cancel_boot_placements(
-    client: SeraClient,
-    placements: list[LivePlacement],
-    log: logging.Logger,
-    *,
-    wait_seconds: float = BOOT_CANCEL_RETRY_SECONDS,
-    stop: StopFlag | None = None,
-) -> list[LivePlacement]:
-    """Cancel startup placements, waiting once for Sera's cooldown if needed."""
-    remaining = _cancel_placements(client, placements, log)
-    if not remaining:
-        return []
-    log.warning(
-        "boot cancel has %d placement(s) still live; waiting %.0fs before retry",
-        len(remaining),
-        wait_seconds,
-    )
-    # Wait interruptibly so SIGINT/SIGTERM during boot does not block for minutes.
-    if stop is not None:
-        if stop.wait(wait_seconds):
-            return remaining
-    else:
-        time.sleep(wait_seconds)
-    return _cancel_placements(client, remaining, log)
 
 
 def _load_live_placements(

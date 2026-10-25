@@ -131,8 +131,9 @@ Live order lifecycle:
   market stops startup (exit 1, alert) and is alerted once mid-run; rotor never
   adopts, and so never cancels, it.
 - Startup cancellation is default-on and runs before the first quote tick.
-- If boot cancellation leaves placements live, Rotor waits 5 minutes and retries
-  once while keeping any remaining placements tracked.
+- Boot cancellation is one pass that never blocks on Sera's cooldown; any
+  placement left live stays tracked, and the tick loop's cancel guard cancels it
+  before anything new is placed.
 - `.rotor_state.sqlite` stores unresolved active orders, unsettled orders, open
   positions, and open stale-reference alerts; resolved rows are pruned instead of
   retained as history. Positions persist until returned.

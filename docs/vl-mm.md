@@ -314,17 +314,17 @@ someone else, is trading the wallet, so rotor refuses to start (with an
 important alert) and never touches that order. If one appears while rotor runs,
 it alerts once and leaves it alone.
 It cancels those reattached placements before the first quote tick by default.
-If cancellation is blocked by Sera's cooldown, Rotor waits 5 minutes and retries
-once before continuing with any remaining live placements still tracked. A
+It is one pass that never blocks on Sera's cancel cooldown: an order still on
+cooldown stays tracked, and the tick loop's cancel guard waits or skips a tick
+until it can be cancelled, before anything new is placed. A
 one-tick run with `--once --cancel-on-exit` can perform a supervised
 clean-place-clean cycle, but it is not a pure cancel-only command.
 
 ## Scheduled (fire-once) runs
 
 `--once` runs a single tick and exits, which suits an external scheduler (e.g. a
-Manus scheduled task) firing on a cadence. In `--once` mode the boot cancel does
-a single pass and never blocks on Sera's cancel cooldown, so an invocation always
-returns promptly. Each fire reattaches open orders from Sera, cancels the stale
+Manus scheduled task) firing on a cadence. The boot cancel never blocks on
+Sera's cancel cooldown, so an invocation returns promptly. Each fire reattaches open orders from Sera, cancels the stale
 set, places a fresh quote set, and exits (`0` placed/ok; non-zero = this run could
 not requote and the next fire should retry). Schedule the interval at or above
 Sera's ~5-minute cancel cooldown, keep `--order-ttl` at or above the interval, and

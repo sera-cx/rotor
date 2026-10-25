@@ -162,33 +162,6 @@ def test_cancel_placements_keeps_only_what_may_still_be_live(kind, reply, kept):
     assert calls == ["cancel_vl_batch" if kind == "vl" else "cancel_order"]
 
 
-def test_cancel_boot_placements_waits_once_then_retries(monkeypatch):
-    placement = vr.LivePlacement(
-        kind="standalone",
-        spent_token="USDC",
-        orders=[LiveOrder("bid", "order-1", 1, 0.0)],
-        placed_at=0.0,
-    )
-    sleeps: list[float] = []
-
-    class Client:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def cancel_order(self, order_id, uuid_int):
-            self.calls += 1
-            return self.calls > 1
-
-    client = Client()
-    monkeypatch.setattr(vr.time, "sleep", lambda seconds: sleeps.append(seconds))
-
-    remaining = vr._cancel_boot_placements(client, [placement], logging.getLogger("test"))
-
-    assert remaining == []
-    assert sleeps == [vr.BOOT_CANCEL_RETRY_SECONDS]
-    assert client.calls == 2
-
-
 def test_state_store_dedupes_and_prunes_unresolved_state(tmp_path):
     store = vr.StateStore(tmp_path / "state.sqlite")
     placement = vr.LivePlacement(

@@ -8,6 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from mm_builders import market, vl_config
 
 from rotor.mm import vl_runner as vr
@@ -1821,4 +1822,34 @@ def test_fire_once_never_waits_out_the_boot_cancel_cooldown(monkeypatch, tmp_pat
 
     assert result == 1
     assert ("cancel_order", "old-order", 42) in client.events
-    assert vr.BOOT_CANCEL_RETRY_SECONDS not in stop.waits
+    assert all(wait < vr.SERA_CANCEL_COOLDOWN_SECONDS for wait in stop.waits)
+
+
+@pytest.mark.parametrize("on_cooldown", [False, True])
+def test_a_boot_leftover_is_cancelled_before_anything_new_is_placed(
+    monkeypatch, tmp_path, on_cooldown,
+):
+    # Rotor's own order from before a restart. An old one is cancelled at boot
+    # and tick 1 quotes. One still on Sera's cancel cooldown stays tracked,
+    # tick 1 places nothing, and tick 2 cancels it before placing.
+    client = _FakeClient(open_orders=[_OLD_ORDER], cancel_ok=not on_cooldown)
+    _remember(tmp_path / "state.sqlite", "old-order")
+    _wire_runner(monkeypatch, client=client)
+    _fake_clock(monkeypatch, steps=[305.0, 1.0])
+    real_sleep = vr.sleep_remaining
+
+    def cooldown_over(started, poll, stop=None):
+        client.cancel_ok = True
+        real_sleep(started, poll, stop)
+
+    monkeypatch.setattr(vr, "sleep_remaining", cooldown_over)
+
+    _run(state_path=tmp_path / "state.sqlite")
+
+    events = [event[:2] for event in client.events]
+    cancelled = max(i for i, event in enumerate(events) if event == ("cancel_order", "old-order"))
+    first_place = next(i for i, event in enumerate(events) if event[0].startswith("place"))
+    assert cancelled < first_place
+    # On cooldown, tick 1 places nothing, so only tick 2's batch goes out.
+    assert len(client.batch_places) == (1 if on_cooldown else 2)
+
