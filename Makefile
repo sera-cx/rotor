@@ -2,7 +2,7 @@
 #
 # These targets intentionally wrap the Poetry commands used in the README so
 # local checks stay consistent across contributors and automation.
-.PHONY: install test testnet testnet-e2e testnet-scenarios live-order-ack live-prices once lint lint-fix clean
+.PHONY: install test testnet testnet-scenarios live-order-ack live-prices once lint lint-fix clean
 
 install:
 	poetry install
@@ -16,9 +16,6 @@ testnet:
 
 # These place real testnet orders, so they also need the operator's explicit
 # acknowledgement; without it pytest would skip them and still exit 0.
-testnet-e2e: live-order-ack
-	ROTOR_RUN_TESTNET=1 ROTOR_RUN_TESTNET_E2E=1 poetry run python -m pytest -q tests/testnet
-
 testnet-scenarios: live-order-ack
 	ROTOR_RUN_TESTNET=1 ROTOR_RUN_TESTNET_SCENARIOS=1 poetry run python -m pytest -q tests/testnet/test_vl_runner_scenarios.py
 

@@ -30,51 +30,7 @@ ROTOR_TESTNET_OWNER_ADDRESS=0x... \
 poetry run pytest -q tests/testnet
 ```
 
-Optional two-wallet maker/taker E2E:
-
-```bash
-ROTOR_RUN_TESTNET=1 \
-ROTOR_RUN_TESTNET_E2E=1 \
-ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
-ROTOR_TESTNET_MARKET=MYRT/USDC \
-ROTOR_TESTNET_SECOND_MARKET=CADC/USDC \
-ROTOR_TESTNET_QTY_BASE=20 \
-ROTOR_TESTNET_PRICE=0.245 \
-ROTOR_TESTNET_SECOND_PRICE=0.714 \
-ROTOR_TESTNET_MAKER_PRIVATE_KEY=0x... \
-ROTOR_TESTNET_MAKER_API_KEY=... \
-ROTOR_TESTNET_MAKER_API_SECRET=... \
-ROTOR_TESTNET_TAKER_PRIVATE_KEY=0x... \
-ROTOR_TESTNET_TAKER_API_KEY=... \
-ROTOR_TESTNET_TAKER_API_SECRET=... \
-poetry run pytest -q tests/testnet
-```
-
-The E2E test places the maker quote through `place_vl_batch()` with two VL legs,
-then places an opposite taker order from the second wallet and polls fills from
-both sides. `ROTOR_TESTNET_SECOND_PRICE`, `ROTOR_TESTNET_TAKER_PRICE`,
-`ROTOR_TESTNET_TAKER_QTY_BASE`, `ROTOR_TESTNET_ORDER_TTL`, and
-`ROTOR_TESTNET_FILL_WAIT_SECONDS` are optional overrides.
-
-Pick markets nobody else trades on testnet, so the taker fills the maker and
-not someone else's resting order. Sepolia's `XSGD/USDC` has an outside book near
-the real SGD rate: at a test price of 1 the maker's bid crosses it at once, and
-the taker trades with it instead of the maker. `MYRT/USDC` and `CADC/USDC` had
-no outside orders as of 2026-10-23; a `POST /swap/quote` answering
-`no_liquidity` both ways is a quick check.
-
-Price the test orders near each market's real rate too. Something on testnet
-takes mispriced quotes within seconds: in a 2026-10-23 run, an outside wallet
-sold MYRT into a maker bid at 0.998 (MYR is worth about 0.245 USD) and its
-leftover order then filled the taker. The examples use MYR/USD 0.245 and
-CAD/USD 0.714, with a 1% stand-in Wise fee and a 1.5% `fixed_bps` so neither the
-normal quotes nor the return orders land inside a reasonable reference price.
-
-Real placement can leave live testnet orders behind if cancel cooldowns, funding
-problems, or API failures intervene. The E2E test is therefore skipped unless
-both `ROTOR_RUN_TESTNET_E2E=1` and `ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1` are set.
-
-Optional live runner scenarios:
+Optional live runner scenarios (they place real testnet orders):
 
 ```bash
 ROTOR_RUN_TESTNET=1 \
@@ -95,6 +51,24 @@ ROTOR_TESTNET_TAKER_API_KEY=... \
 ROTOR_TESTNET_TAKER_API_SECRET=... \
 poetry run pytest -q tests/testnet/test_vl_runner_scenarios.py
 ```
+
+Real placement can leave live testnet orders behind if cancel cooldowns, funding
+problems, or API failures intervene, so the scenarios are skipped unless both
+`ROTOR_RUN_TESTNET_SCENARIOS=1` and `ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1` are set.
+
+Pick markets nobody else trades on testnet, so the taker fills the maker and
+not someone else's resting order. Sepolia's `XSGD/USDC` has an outside book near
+the real SGD rate: at a test price of 1 the maker's bid crosses it at once, and
+the taker trades with it instead of the maker. `MYRT/USDC` and `CADC/USDC` had
+no outside orders as of 2026-10-23; a `POST /swap/quote` answering
+`no_liquidity` both ways is a quick check.
+
+Price the test orders near each market's real rate too. Something on testnet
+takes mispriced quotes within seconds: in a 2026-10-23 run, an outside wallet
+sold MYRT into a maker bid at 0.998 (MYR is worth about 0.245 USD) and its
+leftover order then filled the taker. The examples use MYR/USD 0.245 and
+CAD/USD 0.714, with a 1% stand-in Wise fee and a 1.5% `fixed_bps` so neither the
+normal quotes nor the return orders land inside a reasonable reference price.
 
 The live scenario harness runs the actual VL runner with a deterministic
 test-only mid source (`ROTOR_TESTNET_MID` for the first market,

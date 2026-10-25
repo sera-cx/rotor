@@ -309,11 +309,10 @@ Opt-in Sera testnet checks:
 ROTOR_RUN_TESTNET=1 poetry run python -m pytest -q tests/testnet
 ```
 
-The default testnet checks are non-mutating. The two-wallet maker/taker E2E
-places real testnet orders only when both `ROTOR_RUN_TESTNET_E2E=1` and
-`ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1` are set. The heavier live runner scenarios
-are separately gated by `ROTOR_RUN_TESTNET_SCENARIOS=1` and use maker/taker
-wallets to fill the actual loop between ticks.
+The default testnet checks are non-mutating. The live runner scenarios place
+real testnet orders only when both `ROTOR_RUN_TESTNET_SCENARIOS=1` and
+`ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1` are set, and use maker/taker wallets to
+fill the actual loop between ticks.
 
 Highest-signal files:
 
@@ -333,8 +332,7 @@ Highest-signal files:
 - `tests/notifications/test_telegram.py`: Telegram degradation and routing.
 - `tests/test_updater.py`: autonomous Git update safety.
 - `tests/testnet/test_sera_integration.py`: real Sera testnet public read,
-  signing parity with testnet's preview, authenticated read boundaries, and explicitly gated two-wallet
-  maker/taker fill flow using VL placement.
+  signing parity with testnet's preview, and authenticated read boundaries.
 - `tests/testnet/test_vl_runner_scenarios.py`: explicitly gated live runner
   fill/return requote scenarios using maker and taker wallets.
 

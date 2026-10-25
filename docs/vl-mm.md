@@ -392,23 +392,10 @@ A deployment still on a version from before this check (GitHub `public` at
 517d80f or earlier) sees its own untracked config as local changes and never
 pulls: update it once by hand with `git pull --ff-only`.
 
-## Real Testnet E2E
+## Real Testnet Scenarios
 
-The default testnet suite is non-mutating unless the two-wallet E2E gates are
-set. That E2E places the maker quote through Sera VL, places an opposite taker
-order from a second wallet, polls fills, and then attempts best-effort cleanup:
-
-```bash
-ROTOR_RUN_TESTNET=1 \
-ROTOR_RUN_TESTNET_E2E=1 \
-ROTOR_TESTNET_ACK_LIVE_ORDER_RISK=1 \
-poetry run python -m pytest -q tests/testnet
-```
-
-See `tests/testnet/README.md` for the required maker/taker wallet and market
-environment variables.
-
-For full live runner behavior, enable the separate scenario harness:
+The default testnet suite is non-mutating. For full live runner behavior,
+enable the scenario harness, which places real testnet orders:
 
 ```bash
 ROTOR_RUN_TESTNET=1 \
