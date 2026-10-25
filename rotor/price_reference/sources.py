@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Any, Protocol
+from typing import Any
 from xml.etree import ElementTree
 
 import httpx
@@ -42,26 +42,44 @@ DAILY_REUSE_S = 60.0
 DEFAULT_TIMEOUT_S = 30.0
 
 
-class RateSource(Protocol):
-    """Minimal protocol implemented by price reference adapters."""
+class RateSource:
+    """Shared setup for the price reference adapters.
 
-    # Human-readable adapter name used in ReferenceUnavailable messages.
-    name: str
-    # Default freshness window (seconds) the oracle applies for this provider.
-    default_max_age_s: float
-    # How long a stale observation may still be quoted on, or None to never carry
-    # one forward. Optional: the oracle treats a missing value as None.
-    default_max_carry_age_s: float | None
+    `default_max_age_s` is the freshness window the oracle applies, and
+    `default_max_carry_age_s` how long a stale rate may still be quoted on
+    (None: never carried forward).
+    """
+
+    # Adapter name used in observations and ReferenceUnavailable messages.
+    name = ""
+    DEFAULT_URL = ""
+    DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
+    DEFAULT_MAX_CARRY_AGE_S: float | None = DAILY_MAX_CARRY_AGE_S
+
+    def __init__(
+        self,
+        *,
+        url: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        max_age_s: float | None = None,
+        max_carry_age_s: float | None = None,
+        http: httpx.Client | None = None,
+    ) -> None:
+        # Drop a trailing slash so endpoint joins are deterministic.
+        self.url = (url or self.DEFAULT_URL).rstrip("/")
+        self.default_max_age_s = (
+            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s))
+        self.default_max_carry_age_s = (
+            self.DEFAULT_MAX_CARRY_AGE_S if max_carry_age_s is None else float(max_carry_age_s))
+        # Tests inject a fake client; otherwise a bounded one.
+        self._http = http or httpx.Client(timeout=timeout)
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
     ) -> PriceObservation:
-        """Return quote-per-base rate for an ISO pair.
-
-        `amount` is the base-currency size being worked. Most sources are pure
-        reference feeds and ignore it; the Wise adapter prices its after-fee
-        rates for that amount.
-        """
+        """Return the quote-per-base rate for an ISO pair. Only Wise uses
+        `amount` (the base-currency size being worked)."""
+        raise NotImplementedError
 
 
 class WiseNoRoute(ValueError):
@@ -73,7 +91,7 @@ class WiseNoRoute(ValueError):
     """
 
 
-class WiseRateSource:
+class WiseRateSource(RateSource):
     """Wise quotes API (`POST /v3/quotes`): what converting through Wise costs.
 
     Rotor uses Wise for after-fee rates: what someone actually gets converting a
@@ -103,28 +121,16 @@ class WiseRateSource:
     # currency pair, direction, and amount.
     REUSE_S = 60.0
 
-    def __init__(
-        self,
-        *,
-        base_url: str = "https://api.wise.com",
-        token_env: str = "WISE_API_TOKEN",
-        timeout: float = DEFAULT_TIMEOUT_S,
-        max_age_s: float | None = None,
-        http: httpx.Client | None = None,
-    ) -> None:
-        """Configure the Wise quotes client and credential lookup."""
-        # Drop a trailing slash so endpoint joins are deterministic.
-        self.base_url = base_url.rstrip("/")
+    DEFAULT_URL = "https://api.wise.com"
+
+    def __init__(self, *, token_env: str = "WISE_API_TOKEN", **kwargs) -> None:
+        super().__init__(**kwargs)
+        # A stale Wise quote means the feed is broken, not closed: never carry
+        # it, whatever carry limit is configured.
+        self.default_max_carry_age_s = None
         # Store the config key name instead of the token value so secrets are
         # read only when a quote is requested.
         self.token_env = token_env
-        # Per-source freshness window; defaults to the class intraday window.
-        self.default_max_age_s = (
-            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
-        )
-        self.default_max_carry_age_s = self.DEFAULT_MAX_CARRY_AGE_S
-        # Allow tests to inject a fake client; otherwise create a bounded client.
-        self._http = http or httpx.Client(timeout=timeout)
         # (source, target, amount field, amount) -> (fetched at, reply)
         self._replies: dict[tuple[str, str, str, str], tuple[float, dict]] = {}
 
@@ -201,7 +207,7 @@ class WiseRateSource:
             headers["Authorization"] = f"Bearer {token}"
         try:
             response = self._http.post(
-                f"{self.base_url}/v3/quotes",
+                f"{self.url}/v3/quotes",
                 headers=headers,
                 json={
                     "sourceCurrency": source.upper(),
@@ -228,7 +234,7 @@ class WiseRateSource:
         return body
 
 
-class EcbRateSource:
+class EcbRateSource(RateSource):
     """ECB daily euro reference rates.
 
     ECB publishes rates as "1 EUR = X currency". We cross through EUR to
@@ -241,28 +247,11 @@ class EcbRateSource:
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
     DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
-    def __init__(
-        self,
-        *,
-        url: str = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
-        timeout: float = DEFAULT_TIMEOUT_S,
-        max_age_s: float | None = None,
-        max_carry_age_s: float | None = None,
-        http: httpx.Client | None = None,
-    ) -> None:
-        """Configure the ECB XML feed client."""
-        # ECB is a full feed URL, not a base URL.
-        self.url = url
-        self.default_max_age_s = (
-            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
-        )
-        self.default_max_carry_age_s = (
-            self.DEFAULT_MAX_CARRY_AGE_S
-            if max_carry_age_s is None
-            else float(max_carry_age_s)
-        )
-        # Allow tests to inject a fake client; otherwise create a bounded client.
-        self._http = http or httpx.Client(timeout=timeout)
+    # A full feed URL, not a base URL.
+    DEFAULT_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
         self._feed = _Reuse(DAILY_REUSE_S)
 
     def quote(
@@ -289,7 +278,7 @@ class EcbRateSource:
         return _parse_ecb_xml(response.text)
 
 
-class FedH10RateSource:
+class FedH10RateSource(RateSource):
     """Federal Reserve H.10 FX rates via the official FRED API.
 
     Uses the FRED ``series/observations`` JSON API at ``api.stlouisfed.org``,
@@ -325,29 +314,19 @@ class FedH10RateSource:
         "ZAR": "DEXSFUS",
     }
 
+    DEFAULT_URL = "https://api.stlouisfed.org/fred/series/observations"
+
     def __init__(
         self,
         *,
-        base_url: str = "https://api.stlouisfed.org/fred/series/observations",
         api_key: str = "",
         series_by_currency: dict[str, str] | None = None,
-        timeout: float = DEFAULT_TIMEOUT_S,
-        max_age_s: float | None = None,
-        max_carry_age_s: float | None = None,
-        http: httpx.Client | None = None,
+        **kwargs,
     ) -> None:
-        self.base_url = base_url
+        super().__init__(**kwargs)
         # The free FRED API key; read lazily so the source constructs without it
         # and only fails (clearly) when a quote is actually requested.
         self.api_key = api_key
-        self.default_max_age_s = (
-            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
-        )
-        self.default_max_carry_age_s = (
-            self.DEFAULT_MAX_CARRY_AGE_S
-            if max_carry_age_s is None
-            else float(max_carry_age_s)
-        )
         configured = self.DEFAULT_SERIES if series_by_currency is None else series_by_currency
         self.series_by_currency = {
             key.upper(): value
@@ -358,7 +337,6 @@ class FedH10RateSource:
             currency: _fred_quotes_usd_per_unit(series)
             for currency, series in self.series_by_currency.items()
         }
-        self._http = http or httpx.Client(timeout=timeout)
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
@@ -391,7 +369,7 @@ class FedH10RateSource:
         # usable (non-".") value — the very latest day may be unpublished.
         try:
             response = self._http.get(
-                self.base_url,
+                self.url,
                 params={
                     "series_id": series,
                     "api_key": self.api_key,
@@ -427,7 +405,7 @@ def _fred_quotes_usd_per_unit(series: str) -> bool:
     )
 
 
-class BnmRateSource:
+class BnmRateSource(RateSource):
     """Bank Negara Malaysia OpenAPI FX rates crossed through MYR."""
 
     name = "bnm"
@@ -435,25 +413,10 @@ class BnmRateSource:
     DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
     DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
 
-    def __init__(
-        self,
-        *,
-        base_url: str = "https://api.bnm.gov.my/public/exchange-rate",
-        timeout: float = DEFAULT_TIMEOUT_S,
-        max_age_s: float | None = None,
-        max_carry_age_s: float | None = None,
-        http: httpx.Client | None = None,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.default_max_age_s = (
-            self.DEFAULT_MAX_AGE_S if max_age_s is None else float(max_age_s)
-        )
-        self.default_max_carry_age_s = (
-            self.DEFAULT_MAX_CARRY_AGE_S
-            if max_carry_age_s is None
-            else float(max_carry_age_s)
-        )
-        self._http = http or httpx.Client(timeout=timeout)
+    DEFAULT_URL = "https://api.bnm.gov.my/public/exchange-rate"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
         self._session = _Reuse(DAILY_REUSE_S)
 
     def quote(
@@ -478,7 +441,7 @@ class BnmRateSource:
 
     def _latest_session(self) -> dict[str, dict]:
         response = self._http.get(
-            self.base_url,
+            self.url,
             headers={"Accept": "application/vnd.BNM.API.v1+json"},
         )
         response.raise_for_status()

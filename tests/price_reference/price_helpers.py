@@ -9,7 +9,7 @@ from rotor.price_reference.sources import EcbRateSource, WiseRateSource
 
 def wise_source(handler) -> WiseRateSource:
     return WiseRateSource(
-        base_url="https://api.wise.test",
+        url="https://api.wise.test",
         http=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 

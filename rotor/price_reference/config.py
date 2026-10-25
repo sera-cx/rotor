@@ -13,6 +13,14 @@ from rotor.price_reference.sources import (
     WiseRateSource,
 )
 
+# price_source -> its adapter and the setting that may override its URL.
+_SOURCES: dict[str, tuple[type[RateSource], str]] = {
+    "wise": (WiseRateSource, "WISE_BASE_URL"),
+    "ecb": (EcbRateSource, "ECB_RATES_URL"),
+    "fed": (FedH10RateSource, "FRED_API_BASE_URL"),
+    "bnm": (BnmRateSource, "BNM_EXCHANGE_RATE_BASE_URL"),
+}
+
 
 def load_price_reference_source(name: str) -> RateSource:
     """Return the FX source a pair's `price_source` names.
@@ -26,36 +34,24 @@ def load_price_reference_source(name: str) -> RateSource:
     intraday window is fixed: none of these overrides applies to it.
     """
     source_name = str(name).lower()
-    if source_name == "wise":
-        return WiseRateSource(
-            base_url=_url("WISE_BASE_URL", "https://api.wise.com"),
-            token_env="WISE_API_TOKEN",
-        )
-    if source_name == "ecb":
-        return EcbRateSource(
-            url=_url("ECB_RATES_URL", "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"),
-            max_age_s=_max_age_override("ECB"),
-            max_carry_age_s=_max_carry_age_override("ECB"),
-        )
-    if source_name == "fed":
-        return FedH10RateSource(
-            base_url=_url("FRED_API_BASE_URL", "https://api.stlouisfed.org/fred/series/observations"),
-            api_key=str(get_config("FRED_API_KEY", "") or ""),
-            series_by_currency=(
-                get_config_json("FED_H10_SERIES_JSON", None)
-                or FedH10RateSource.DEFAULT_SERIES
-            ),
-            max_age_s=_max_age_override("FED"),
-            max_carry_age_s=_max_carry_age_override("FED"),
-        )
-    if source_name == "bnm":
-        return BnmRateSource(
-            base_url=_url("BNM_EXCHANGE_RATE_BASE_URL", "https://api.bnm.gov.my/public/exchange-rate"),
-            max_age_s=_max_age_override("BNM"),
-            max_carry_age_s=_max_carry_age_override("BNM"),
-        )
-    # Keep accepted source names closed so misspellings fail loudly.
-    raise ValueError(f"price source {name!r} must be one of: wise, ecb, fed, bnm")
+    if source_name not in _SOURCES:
+        # Keep accepted source names closed so misspellings fail loudly.
+        raise ValueError(f"price source {name!r} must be one of: wise, ecb, fed, bnm")
+    cls, url_setting = _SOURCES[source_name]
+    url = _url(url_setting, cls.DEFAULT_URL)
+    if cls is WiseRateSource:
+        return WiseRateSource(url=url)
+    prefix = source_name.upper()
+    kwargs = {
+        "url": url,
+        "max_age_s": _max_age_override(prefix),
+        "max_carry_age_s": _max_carry_age_override(prefix),
+    }
+    if cls is FedH10RateSource:
+        kwargs["api_key"] = str(get_config("FRED_API_KEY", "") or "")
+        # An empty or missing map means the built-in series.
+        kwargs["series_by_currency"] = get_config_json("FED_H10_SERIES_JSON", None) or None
+    return cls(**kwargs)
 
 
 def _max_age_override(prefix: str) -> float | None:

@@ -46,6 +46,20 @@ def test_load_token_to_iso_uppercases_json_overrides(monkeypatch):
     assert load_token_to_iso() == {"XPHP": "PHP"}
 
 
+def test_an_empty_fed_series_setting_means_the_built_in_series(monkeypatch):
+    from rotor import config as config_module
+    from rotor.price_reference.sources import FedH10RateSource
+
+    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
+    monkeypatch.setattr(config_module, "_DOTENV", {})
+    monkeypatch.setenv("FED_H10_SERIES_JSON", "{}")
+
+    src = load_price_reference_source("fed")
+
+    assert src.series_by_currency == {
+        currency.upper(): series for currency, series in FedH10RateSource.DEFAULT_SERIES.items()}
+
+
 def test_load_price_reference_source_rejects_unknown_source():
     with pytest.raises(ValueError, match="wise, ecb, fed, bnm"):
         load_price_reference_source("manual")
