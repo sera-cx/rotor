@@ -36,9 +36,7 @@ export FRED_API_KEY="..."     # for price_source = fed (free FRED API key)
 `http://` is rejected outside `localhost`.
 
 For file-based local config, copy `.env.example` to the gitignored root `.env`
-and fill in real values. `rotor/secret.example.py` remains available only as a
-Python fallback template for `rotor/secret.py`. Real environment variables
-override `.env`, and `.env` overrides `rotor/secret.py`.
+and fill in real values. Real environment variables override `.env`.
 
 ## VL Config
 

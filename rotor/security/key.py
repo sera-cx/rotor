@@ -1,7 +1,7 @@
 """Signing-key loading and EIP-712 signing for Sera orders.
 
-The maker key is read from the ``SERA_PRIVATE_KEY`` config value (environment,
-root ``.env``, or optional ``rotor/secret.py``). This suits autonomous/headless
+The maker key is read from the ``SERA_PRIVATE_KEY`` config value (environment
+or root ``.env``). This suits autonomous/headless
 operation on a server; protect that value like any other secret.
 """
 
@@ -53,8 +53,8 @@ def unlock() -> None:
     env_key = str(get_config("SERA_PRIVATE_KEY", "") or "").strip()
     if not env_key:
         raise WalletNotInitialized(
-            "no SERA_PRIVATE_KEY configured. Set it in the environment, root "
-            ".env, or optional rotor/secret.py for the maker wallet."
+            "no SERA_PRIVATE_KEY configured. Set it in the environment or the "
+            "root .env for the maker wallet."
         )
     _account = _load_account(env_key)
 

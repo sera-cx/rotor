@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def cmd_mm_vl(args) -> int:
@@ -126,10 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+LEGACY_SECRET_FILE = Path(__file__).resolve().parents[1] / "secret.py"
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI args and run the selected command handler."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    # rotor/secret.py was a config fallback and is no longer read. Stop rather
+    # than run without the settings an operator kept there.
+    if LEGACY_SECRET_FILE.exists():
+        print(
+            f"{LEGACY_SECRET_FILE} is no longer read: move its settings to the "
+            "environment or the root .env (see .env.example), then delete it.",
+            file=sys.stderr,
+        )
+        return 2
     # Subparsers attach `func`; required=True guarantees it exists.
     return args.func(args)
 

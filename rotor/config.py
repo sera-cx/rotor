@@ -1,13 +1,11 @@
 """Small configuration helpers.
 
 Runtime config is environment-first for open-source friendliness. Rotor also
-loads lightweight `.env` files, then falls back to optional untracked
-`rotor/secret.py` values.
+loads lightweight `.env` files.
 """
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
@@ -24,22 +22,10 @@ _log = logging.getLogger(__name__)
 
 
 def get_config(name: str, default: Any = None) -> Any:
-    """Return config value from env/.env, optional `rotor.secret`, or default."""
+    """Return a config value from the environment or `.env`, else `default`."""
     _load_dotenv_once()
-    # Environment variables win because they are easiest to inject in
-    # deployment and avoid persisting secrets in the source tree.
     found, value = _env_value(name)
-    if found:
-        return value
-    # Loading `rotor.secret` is intentionally lazy so normal imports do not
-    # fail when the optional local-only file is absent.
-    secret = _optional_secret()
-    # A configured Python attribute is used only as a fallback.
-    if secret is not None and hasattr(secret, name):
-        return getattr(secret, name)
-    # The caller controls the final fallback, which keeps defaults visible at
-    # each call site.
-    return default
+    return value if found else default
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
@@ -62,17 +48,9 @@ def require_https(name: str, url: str) -> str:
 
 
 def get_config_json(name: str, default: Any = None) -> Any:
-    """Return JSON config from env/.env, or raw Python value from optional secret."""
-    _load_dotenv_once()
-    # JSON parsing is only applied to environment values because a Python
-    # secret file can already contain native dict/list/scalar objects.
-    found, value = _env_value(name)
-    if found:
-        text = str(value).strip()
-        if not text:
-            return default
-        return json.loads(text)
-    return get_config(name, default)
+    """Return a JSON config value from the environment or `.env`, else `default`."""
+    text = (get_config(name) or "").strip()
+    return json.loads(text) if text else default
 
 
 def _env_value(name: str) -> tuple[bool, str | None]:
@@ -158,16 +136,3 @@ def _parse_dotenv_value(value: str) -> str:
         if rest is not None and (not rest or rest.startswith("#")):
             return value[1:end]
     return value.rstrip()
-
-
-def _optional_secret():
-    """Import the untracked `rotor.secret` module when it exists."""
-    try:
-        return importlib.import_module("rotor.secret")
-    except ModuleNotFoundError as exc:
-        # Suppress only the expected "module does not exist" case. If
-        # rotor.secret exists but one of its own imports fails, re-raise so the
-        # user sees the real configuration error.
-        if exc.name == "rotor.secret":
-            return None
-        raise

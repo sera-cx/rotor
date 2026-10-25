@@ -7,8 +7,7 @@ secret store and scheduled tasks.
 
 Manus stores the values you add to its secret store and injects them into the
 sandbox as **environment variables under the exact name you register**. Rotor
-reads config environment-first (`get_config`: env → `.env` → `rotor/secret.py` →
-default), so it consumes them directly.
+reads config environment-first (`get_config`: env → `.env` → default), so it consumes them directly.
 
 Register each secret using the **exact** name from
 [`.env.manus.example`](../.env.manus.example) — copy the names verbatim. The

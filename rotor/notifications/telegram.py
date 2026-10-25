@@ -5,8 +5,8 @@ channel that pushes a notification) and debug (heartbeat only). Important and
 debug fall back to the normal chat when unset.
 
 TELEGRAM_TOKEN and TELEGRAM_{NORMAL,IMPORTANT,DEBUG}_CHAT_ID resolve through
-`rotor.config.get_config`, so they may come from the environment, a root `.env`,
-or an untracked `rotor/secret.py`. With no token or chat id, sends become debug
+`rotor.config.get_config`, so they may come from the environment or a root `.env`.
+With no token or chat id, sends become debug
 dry-run log lines. Messages go straight to the Bot API over httpx. Telegram
 failures never raise into the market-making loop.
 """

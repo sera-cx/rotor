@@ -65,5 +65,5 @@ def market_to_iso_pair(
     except KeyError as exc:
         # Missing token mappings are configuration issues, not provider issues.
         raise ValueError(
-            f"no ISO mapping for token {exc.args[0]!r}; add PRICE_REFERENCE_TOKEN_TO_ISO"
+            f"no ISO mapping for token {exc.args[0]!r}; add PRICE_REFERENCE_TOKEN_TO_ISO_JSON"
         ) from exc

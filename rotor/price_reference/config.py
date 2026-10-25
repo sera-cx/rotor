@@ -91,12 +91,7 @@ def _seconds_override(*keys: str) -> float | None:
 
 def load_token_to_iso() -> dict[str, str]:
     """Return optional token-to-ISO overrides."""
-    # Prefer the explicit JSON env var, but also accept the Python config value
-    # used by `rotor.secret`.
-    configured = (
-        get_config_json("PRICE_REFERENCE_TOKEN_TO_ISO_JSON", None)
-        or get_config_json("PRICE_REFERENCE_TOKEN_TO_ISO", {})
-    )
+    configured = get_config_json("PRICE_REFERENCE_TOKEN_TO_ISO_JSON", {})
     # Normalize both sides to uppercase because token and ISO symbols are
     # compared case-insensitively throughout the reference layer.
     return {

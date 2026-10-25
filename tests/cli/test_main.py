@@ -101,3 +101,12 @@ def test_an_unexpected_unlock_failure_prints_only_its_type(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "could not unlock the wallet (RuntimeError)" in err
     assert secret not in err
+
+
+def test_a_leftover_secret_file_stops_rotor_with_a_reason(monkeypatch, tmp_path, capsys):
+    legacy = tmp_path / "secret.py"
+    legacy.write_text("SERA_PRIVATE_KEY = '0x...'\n")
+    monkeypatch.setattr(cli, "LEGACY_SECRET_FILE", legacy)
+
+    assert cli.main(["mm", "vl", "--check-config"]) == 2
+    assert "is no longer read" in capsys.readouterr().err

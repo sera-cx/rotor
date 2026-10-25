@@ -44,7 +44,7 @@ def build_client(*, dry_run: bool, log: logging.Logger) -> SeraClient:
     else:
         owner = wallet_key.wallet_address()
         signer = wallet_key.sign_typed_data
-    # Credentials and base URL resolve from env or optional rotor.secret.
+    # Credentials and base URL resolve from the environment or `.env`.
     return SeraClient(
         owner_address=owner,
         signer=signer,

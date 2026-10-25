@@ -2,29 +2,10 @@
 
 from __future__ import annotations
 
-import sys
-import types
-
 import pytest
 
 from rotor import config as config_module
 from rotor.config import get_config, get_config_json
-
-
-def test_get_config_prefers_environment_over_secret(monkeypatch):
-    secret = types.SimpleNamespace(SERA_API_KEY="from-secret")
-    monkeypatch.setitem(sys.modules, "rotor.secret", secret)
-    monkeypatch.setenv("SERA_API_KEY", "from-env")
-
-    assert get_config("SERA_API_KEY") == "from-env"
-
-
-def test_get_config_reads_optional_secret_when_env_absent(monkeypatch):
-    secret = types.SimpleNamespace(SERA_API_KEY="from-secret")
-    monkeypatch.setitem(sys.modules, "rotor.secret", secret)
-    monkeypatch.delenv("SERA_API_KEY", raising=False)
-
-    assert get_config("SERA_API_KEY") == "from-secret"
 
 
 def test_get_config_reads_dotenv_when_env_absent(monkeypatch, tmp_path):
@@ -56,16 +37,15 @@ def test_get_config_prefers_environment_over_dotenv(monkeypatch, tmp_path):
 
 
 def test_get_config_returns_default_when_missing(monkeypatch):
-    monkeypatch.delitem(sys.modules, "rotor.secret", raising=False)
     monkeypatch.delenv("NOT_CONFIGURED", raising=False)
 
     assert get_config("NOT_CONFIGURED", "fallback") == "fallback"
 
 
 def test_get_config_json_parses_environment_json(monkeypatch):
-    monkeypatch.setenv("PRICE_REFERENCE_TOKEN_TO_ISO", '{"xphp": "PHP"}')
+    monkeypatch.setenv("PRICE_REFERENCE_TOKEN_TO_ISO_JSON", '{"xphp": "PHP"}')
 
-    assert get_config_json("PRICE_REFERENCE_TOKEN_TO_ISO") == {"xphp": "PHP"}
+    assert get_config_json("PRICE_REFERENCE_TOKEN_TO_ISO_JSON") == {"xphp": "PHP"}
 
 
 def test_get_config_json_uses_default_for_blank_environment_value(monkeypatch):
