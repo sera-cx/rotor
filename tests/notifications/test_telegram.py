@@ -7,19 +7,28 @@ Covers the MM-focused notifier surface:
   * send_raw routing (normal / important / debug)
   * lifecycle helpers (startup, shutdown, quote, error)
   * heartbeat rate-limiting
-  * _async_send mocked python-telegram-bot Bot call
+  * the Bot API request sent over httpx
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
+import httpx
 import pytest
 
 from rotor.notifications import TelegramNotifier
-from rotor.notifications.telegram import HEARTBEAT_SECONDS
+from rotor.notifications.telegram import HEARTBEAT_SECONDS, MAX_MESSAGE_CHARS
+
+
+def _recording_client(sent: list, status: int = 200, body: dict | None = None) -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(status, json=body if body is not None else {"ok": True})
+    return httpx.Client(transport=httpx.MockTransport(handler))
 
 
 @pytest.fixture
@@ -67,17 +76,17 @@ def test_send_raw_debug_only(notifier):
 def test_important_falls_back_to_normal_when_unset():
     n = TelegramNotifier(token="t", normal_chat_id="normal",
                          important_chat_id="", dry_run=True)
-    with patch.object(n, "_async_send", new=AsyncMock()) as send:
+    with patch.object(n, "_post") as send:
         n._dry_run = False
         n._send("x", channel="important")
-    # chat_id passed to _async_send should be the normal chat (fallback)
+    # chat_id passed to _post should be the normal chat (fallback)
     assert send.call_args.args[1] == "normal"
 
 
 def test_debug_falls_back_to_normal_when_unset():
     n = TelegramNotifier(token="t", normal_chat_id="normal",
                          debug_chat_id="", dry_run=True)
-    with patch.object(n, "_async_send", new=AsyncMock()) as send:
+    with patch.object(n, "_post") as send:
         n._dry_run = False
         n._send("x", channel="debug")
     assert send.call_args.args[1] == "normal"
@@ -88,8 +97,8 @@ def test_send_unknown_channel_raises(notifier):
         notifier._send("x", channel="bogus")
 
 
-def test_dry_run_does_not_call_async_send(notifier):
-    with patch.object(notifier, "_async_send", new=AsyncMock()) as send:
+def test_dry_run_does_not_post(notifier):
+    with patch.object(notifier, "_post") as send:
         result = notifier._send("x", channel="normal")
     assert result is False
     send.assert_not_called()
@@ -98,8 +107,7 @@ def test_dry_run_does_not_call_async_send(notifier):
 def test_send_swallows_exceptions():
     n = TelegramNotifier(token="t", normal_chat_id="c")
     n._dry_run = False
-    with patch.object(n, "_async_send", new=MagicMock()), \
-            patch("asyncio.run", side_effect=RuntimeError("network")):
+    with patch.object(n, "_post", side_effect=RuntimeError("network")):
         # Must not raise into the MM loop.
         assert n._send("x", channel="normal") is False
 
@@ -132,63 +140,58 @@ def test_heartbeat_rate_limited(notifier):
 
 
 def test_token_is_trimmed():
-    n = TelegramNotifier(token=" 123:ABC \n", normal_chat_id="c")
-    n._dry_run = False
-    fake_bot = MagicMock()
-    fake_bot.__aenter__ = AsyncMock(return_value=fake_bot)
-    fake_bot.__aexit__ = AsyncMock(return_value=False)
-    fake_bot.send_message = AsyncMock()
-    fake_telegram = MagicMock()
-    fake_telegram.Bot.return_value = fake_bot
-    with patch.dict("sys.modules", {"telegram": fake_telegram}):
-        assert n._send("hello", channel="normal") is True
-    fake_telegram.Bot.assert_called_once_with("123:ABC")
+    sent = []
+    n = TelegramNotifier(token=" 123:ABC \n", normal_chat_id="c", http=_recording_client(sent))
+    assert n._send("hello", channel="normal") is True
+    assert sent[0].url.path == "/bot123:ABC/sendMessage"
 
 
 def test_send_failure_never_logs_the_token(caplog):
-    # python-telegram-bot's InvalidToken message quotes the token.
-    n = TelegramNotifier(token="123:SECRET", normal_chat_id="c")
-    n._dry_run = False
-    rejected = RuntimeError("The token `123:SECRET` was rejected by the server.")
-    with patch.object(n, "_async_send", new=MagicMock()), \
-            patch("asyncio.run", side_effect=rejected), \
-            caplog.at_level(logging.WARNING):
+    # httpx's status error quotes the request URL, which holds the token.
+    n = TelegramNotifier(token="123:SECRET", normal_chat_id="c",
+                         http=_recording_client([], status=401, body={"ok": False}))
+    with caplog.at_level(logging.WARNING):
         assert n._send("x", channel="normal") is False
     assert "123:SECRET" not in caplog.text
-    assert "The token `<TELEGRAM_TOKEN>` was rejected" in caplog.text
+    assert "/bot<TELEGRAM_TOKEN>/sendMessage" in caplog.text
 
 
-def test_async_send_invokes_bot():
-    n = TelegramNotifier(token="tok", normal_chat_id="c")
-    n._dry_run = False
-    fake_bot = MagicMock()
-    fake_bot.__aenter__ = AsyncMock(return_value=fake_bot)
-    fake_bot.__aexit__ = AsyncMock(return_value=False)
-    fake_bot.send_message = AsyncMock()
-    fake_telegram = MagicMock()
-    fake_telegram.Bot.return_value = fake_bot
-    with patch.dict("sys.modules", {"telegram": fake_telegram}):
-        assert n._send("hello", channel="normal") is True
-    fake_telegram.Bot.assert_called_once_with("tok")
+def test_send_posts_to_the_bot_api():
+    sent = []
+    n = TelegramNotifier(token="tok", normal_chat_id="c", http=_recording_client(sent))
+    assert n._send("hello", channel="normal") is True
+    assert str(sent[0].url) == "https://api.telegram.org/bottok/sendMessage"
     # The normal channel is the quiet one: no push notification.
-    fake_bot.send_message.assert_awaited_once_with(
-        chat_id="c", text="hello", disable_notification=True)
+    assert json.loads(sent[0].content) == {
+        "chat_id": "c", "text": "hello", "disable_notification": True}
 
 
-def test_async_send_missing_dependency_degrades(caplog):
-    n = TelegramNotifier(token="tok", normal_chat_id="c")
-    n._dry_run = False
-    with patch.dict("sys.modules", {"telegram": None}):
-        with caplog.at_level(logging.WARNING):
-            assert n._send("hello", channel="normal") is True
-    assert any(
-        "python-telegram-bot not installed" in r.message for r in caplog.records)
+def test_a_message_telegram_refuses_is_a_failed_send():
+    n = TelegramNotifier(token="tok", normal_chat_id="c",
+                         http=_recording_client([], body={"ok": False, "description": "bad"}))
+    assert n._send("hello", channel="normal") is False
+
+
+def test_a_long_alert_is_cut_to_telegrams_limit():
+    sent = []
+    n = TelegramNotifier(token="tok", normal_chat_id="c", http=_recording_client(sent))
+    assert n._send("x" * 9000, channel="normal") is True
+    text = json.loads(sent[0].content)["text"]
+    assert len(text) == MAX_MESSAGE_CHARS
+    assert text.endswith("[cut]")
+
+
+def test_a_token_without_a_chat_id_warns_and_dry_runs(caplog):
+    with caplog.at_level(logging.WARNING):
+        n = TelegramNotifier(token="tok", normal_chat_id="", important_chat_id="")
+    assert n._dry_run is True
+    assert "no TELEGRAM_NORMAL_CHAT_ID" in caplog.text
 
 
 def test_only_the_important_channel_notifies():
     n = TelegramNotifier(token="t", normal_chat_id="normal", important_chat_id="loud")
     n._dry_run = False
-    with patch.object(n, "_async_send", new=AsyncMock()) as send:
+    with patch.object(n, "_post") as send:
         n.send_raw("boom", important=True)
     assert [(c.args[1], c.kwargs["silent"]) for c in send.call_args_list] == [
         ("normal", True), ("loud", False)]
@@ -197,6 +200,6 @@ def test_only_the_important_channel_notifies():
 def test_an_important_message_is_sent_once_when_there_is_one_chat():
     n = TelegramNotifier(token="t", normal_chat_id="normal", important_chat_id="")
     n._dry_run = False
-    with patch.object(n, "_async_send", new=AsyncMock()) as send:
+    with patch.object(n, "_post") as send:
         n.send_raw("boom", important=True)
     assert [(c.args[1], c.kwargs["silent"]) for c in send.call_args_list] == [("normal", False)]

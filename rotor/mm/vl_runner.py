@@ -925,10 +925,9 @@ def run(
         level=getattr(logging, log_level.upper(), logging.WARNING),
         format="%(levelname).1s %(message)s",
     )
-    # HTTP and Telegram libraries log request URLs at INFO/DEBUG, and every
-    # Telegram URL carries the bot token. Rotor's own --log-level lines are
-    # unaffected.
-    for name in ("httpx", "httpcore", "telegram"):
+    # The HTTP libraries log request URLs at INFO/DEBUG, and every Telegram URL
+    # carries the bot token. Rotor's own --log-level lines are unaffected.
+    for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
     log = logging.getLogger("rotor.mm.vl")
     if order_ttl_seconds < MIN_ORDER_TTL_SECONDS:

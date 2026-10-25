@@ -20,24 +20,27 @@ come from the environment, a root `.env`, or an untracked `rotor/secret.py`:
     TELEGRAM_IMPORTANT_CHAT_ID  — loud error channel (optional)
     TELEGRAM_DEBUG_CHAT_ID      — heartbeat channel (optional)
 
-This module degrades gracefully: if no token is configured, or if
-`python-telegram-bot` is not installed, sends become debug dry-run log
-lines instead of network calls. Telegram failures never raise into the
-market-making loop.
+This module degrades gracefully: with no token or chat id configured,
+sends become debug dry-run log lines instead of network calls. Messages go
+straight to the Bot API over httpx, so no extra package is needed. Telegram
+failures never raise into the market-making loop.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 
-# `import telegram` is deferred to `_async_send` so importing this module
-# (e.g. for dry-run wiring or tests) does not require python-telegram-bot.
+import httpx
+
 from rotor.config import get_config
 
 # Heartbeat interval — if nothing has been sent this long, emit "still alive".
 HEARTBEAT_SECONDS = 60 * 60  # 1 hour
+# Telegram refuses messages over 4096 characters, so a longer alert (an error
+# that embeds a whole HTML error page) is cut rather than lost.
+MAX_MESSAGE_CHARS = 4000
+TELEGRAM_API = "https://api.telegram.org"
 
 
 class TelegramNotifier:
@@ -63,6 +66,7 @@ class TelegramNotifier:
         debug_chat_id: str | None = None,
         log: logging.Logger | None = None,
         dry_run: bool = False,
+        http: httpx.Client | None = None,
     ):
         """Wire up channel routing.
 
@@ -73,7 +77,9 @@ class TelegramNotifier:
             important_chat_id: Chat id for the loud error channel.
             debug_chat_id: Chat id for heartbeats.
             log: Optional logger; defaults to the module logger.
-            dry_run: If True (or if no token resolves), log instead of send.
+            dry_run: If True (or if no token or chat id resolves), log instead
+                of send.
+            http: Optional HTTP client, for tests.
         """
         # Explicit constructor args override config, which helps tests and
         # one-off scripts avoid environment mutations.
@@ -94,8 +100,9 @@ class TelegramNotifier:
         # Use runner logger when provided so notification logs stay in the same
         # output stream.
         self._log = log or logging.getLogger(__name__)
-        # dry_run is forced on later if no token exists.
+        # dry_run is forced on later if no token or chat id exists.
         self._dry_run = dry_run
+        self._http = http or httpx.Client(timeout=10.0)
 
         # Last time ANY message was sent — drives heartbeat rate-limiting.
         self._last_message_at: float = time.time()
@@ -105,6 +112,13 @@ class TelegramNotifier:
             self._log.warning(
                 "TelegramNotifier: TELEGRAM_TOKEN is empty — messages will be "
                 "dry-logged only."
+            )
+            self._dry_run = True
+        elif not (self._normal_chat_id or self._important_chat_id):
+            # A token alone sends nothing; say so instead of dropping alerts.
+            self._log.warning(
+                "TelegramNotifier: no TELEGRAM_NORMAL_CHAT_ID or "
+                "TELEGRAM_IMPORTANT_CHAT_ID — messages will be dry-logged only."
             )
             self._dry_run = True
 
@@ -207,16 +221,17 @@ class TelegramNotifier:
             self._log.debug("[telegram dry-run %s] %s", channel, text)
             return False
 
+        if len(text) > MAX_MESSAGE_CHARS:
+            cut = "\n…[cut]"
+            text = text[: MAX_MESSAGE_CHARS - len(cut)] + cut
         try:
-            # The public notifier API is sync, so run the async Telegram send
-            # inside a short-lived event loop.
             # Only the important channel pushes a notification.
-            asyncio.run(self._async_send(text, chat_id, silent=channel != "important"))
+            self._post(text, chat_id, silent=channel != "important")
             return True
         except Exception as e:
             # Telegram failures must NOT take down the MM loop.
-            # Telegram's errors can quote the token ("The token `...` was
-            # rejected by the server"); never let it reach the log.
+            # httpx errors quote the request URL, which holds the token; never
+            # let it reach the log.
             self._log.warning(
                 "TelegramNotifier: send failed (%s): %s",
                 channel,
@@ -224,22 +239,12 @@ class TelegramNotifier:
             )
             return False
 
-    async def _async_send(self, text: str, chat_id: str, *, silent: bool = False) -> None:
-        """Perform the actual `python-telegram-bot` `send_message` call.
-
-        The `import telegram` is local so the rest of the package imports
-        without python-telegram-bot installed.
-        """
-        try:
-            # Import locally so Telegram is optional for users who do not enable
-            # notifications.
-            import telegram
-        except ImportError:
-            self._log.warning("TelegramNotifier: python-telegram-bot not installed")
-            self._log.debug("[telegram dry-run fallback] %s", text)
-            return
-        # python-telegram-bot exposes Bot as an async context manager.
-        bot = telegram.Bot(self._token)
-        async with bot:
-            # Plain-text send; no markdown/HTML parsing is requested.
-            await bot.send_message(chat_id=chat_id, text=text, disable_notification=silent)
+    def _post(self, text: str, chat_id: str, *, silent: bool) -> None:
+        """Send one plain-text message with the Bot API's sendMessage."""
+        response = self._http.post(
+            f"{TELEGRAM_API}/bot{self._token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_notification": silent},
+        )
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            raise RuntimeError(f"Telegram refused the message: {response.text[:200]}")

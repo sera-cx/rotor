@@ -330,15 +330,11 @@ and network, for example `ROTOR_STATE_PATH=.rotor_state.testnet.sqlite` while
 testing and `.rotor_state.mainnet.sqlite` for real funds. A file written before
 rotor recorded this belongs to the next live run that opens it.
 
-Add `--telegram` to send lifecycle/error alerts through the optional Telegram
-notifier. Install the optional dependency with:
-
-```bash
-poetry install --extras telegram
-```
-
-If `TELEGRAM_TOKEN` is empty or the extra is not installed, notifier sends
-degrade to dry-run logs and never crash the trading loop.
+Add `--telegram` to send lifecycle/error alerts to Telegram. Messages go to the
+Bot API over httpx, so no extra package is needed. If `TELEGRAM_TOKEN` or both
+chat ids are empty, sends degrade to dry-run logs (with a warning), and a failed
+send never crashes the trading loop. Alerts longer than Telegram's limit are
+cut, not dropped.
 
 ## Logging
 

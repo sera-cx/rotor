@@ -99,10 +99,8 @@ The file belongs to the wallet and network that first used it, and rotor refuses
 to start on it with any other, so use one file per wallet and network (for
 example `.rotor_state.testnet.sqlite` and `.rotor_state.mainnet.sqlite`).
 
-Add `--telegram` to send lifecycle/error alerts through the optional Telegram
-notifier. Install the extra with `poetry install --extras telegram` when real
-Telegram sends are needed; without the extra or token, sends degrade to dry-run
-logs.
+Add `--telegram` to send lifecycle/error alerts to Telegram. It needs no extra
+package; without a token and chat id, sends degrade to dry-run logs.
 
 Daily FX sources (`ecb`, `fed`, `bnm`) publish nothing on weekends or
 public holidays. Instead of going dark until they publish again, Rotor keeps

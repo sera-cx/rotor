@@ -8,6 +8,6 @@ Files:
 - `telegram.py`: synchronous-safe Telegram notifier with normal, important, and
   debug/heartbeat channels.
 
-Notifications must not crash trading loops. The Telegram notifier uses debug
-dry-run logs when tokens, chat IDs, or the optional `python-telegram-bot`
-dependency are missing.
+Notifications must not crash trading loops. The Telegram notifier posts to the
+Bot API over httpx and uses debug dry-run logs when the token or chat IDs are
+missing.
