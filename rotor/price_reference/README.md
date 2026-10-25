@@ -1,7 +1,7 @@
 # Price Reference
 
-This package turns one named FX source into the benchmark rate used by each pair
-in `rotor mm vl`.
+This package turns one named FX source into the mid used by each pair in
+`rotor mm vl`, and prices every pair's normal orders through Wise.
 
 Files:
 
@@ -47,68 +47,6 @@ There is no MAS source: MAS's only public daily dataset (on data.gov.sg)
 stopped in October 2015, and its current API needs a registered key. ECB and
 BNM both publish SGD.
 
-Only `fed` requires a credential; `wise` (token optional), `ecb`, and `bnm` are
-keyless.
-
-## Freshness
-
-Each observation is stamped with the provider's **published** timestamp (Wise's
-quote time; the ECB `Cube time`; the FRED/BNM row date), not fetch time, so a
-stale (e.g. weekend or holiday) feed is detectable. A reply without a usable
-date is a failed read, never stamped with the current time. `ReferencePriceOracle`
-treats an observation older than the source's window as stale:
-
-- `wise`: 10 minutes (intraday).
-- `ecb` / `fed` / `bnm`: 48 hours (daily references legitimately carry
-  the same rate across a business day plus weekends).
-
-Override one source with `<SOURCE>_MAX_AGE_S` (e.g. `ECB_MAX_AGE_S=259200`), all
-of them with `PRICE_REFERENCE_MAX_AGE_S`, or everything at runtime with the
-`--max-reference-age` CLI flag.
-
-Past its window a daily reference is **carried forward** rather than rejected:
-`ecb`, `fed`, and `bnm` publish nothing on weekends or public holidays, so
-the oracle still returns the last published rate, marked `stale` with its
-`age_s`, until that rate is 7 days old. Past that it raises `ReferenceTooStale`,
-a `ReferenceUnavailable` subclass. `wise` declares no carry limit and is rejected
-as soon as it is stale, whatever limit is configured. Change a daily source's
-limit with `<SOURCE>_MAX_CARRY_AGE_S` or `PRICE_REFERENCE_MAX_CARRY_AGE_S`
-(neither applies to `wise`), or disable carrying with
-`ReferencePriceOracle(..., carry_stale=False)` (`--halt-on-stale-reference` on
-the CLI).
-
-The bot maps token markets to fiat ISO pairs before pricing:
-
-| Sera market | FX pair |
-| --- | --- |
-| `XSGD/USDC` | `SGD/USD` |
-| `MYRT/USDT` | `MYR/USD` |
-| `EURC/USDC` | `EUR/USD` |
-
-Environment config:
-
-```bash
-export WISE_API_TOKEN="..."            # optional: higher Wise rate limits
-export FRED_API_KEY="..."              # required for the fed source
-export FED_H10_SERIES_JSON='{"EUR":"DEXUSEU","MYR":"DEXMAUS","SGD":"DEXSIUS"}'
-export ECB_MAX_AGE_S="172800"          # optional per-source staleness override
-export BNM_MAX_CARRY_AGE_S="604800"    # optional: how long a stale daily rate is still quoted
-```
-
-The same `KEY=VALUE` lines can be placed in a root `.env`. Optional local
-`rotor/secret.py` config remains a Python fallback:
-
-```python
-WISE_API_TOKEN = "..."
-WISE_BASE_URL = "https://api.wise.com"
-ECB_RATES_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
-FRED_API_KEY = "..."  # free key: https://fred.stlouisfed.org/docs/api/api_key.html
-FRED_API_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
-FED_H10_SERIES_JSON = {"EUR": "DEXUSEU", "MYR": "DEXMAUS", "SGD": "DEXSIUS"}
-BNM_EXCHANGE_RATE_BASE_URL = "https://api.bnm.gov.my/public/exchange-rate"
-```
-
-ECB, Fed H.10, and BNM are official/reference sources. They are useful as
-transparent fallbacks or regional official feeds, but they are not live tick
-sources in the same way Wise can be. `fed` uses the official FRED API and needs
-a free `FRED_API_KEY`; ECB and BNM are keyless.
+Freshness windows, weekend carry-forward and their overrides are described in
+[docs/vl-mm.md](../../docs/vl-mm.md#price-freshness); every setting is listed in
+[`.env.example`](../../.env.example).

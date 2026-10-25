@@ -28,7 +28,7 @@ export SERA_BASE_URL="https://api.testnet.sera.cx/api/v1"  # must be https
 export SERA_API_KEY="..."
 export SERA_API_SECRET="..."
 export SERA_PRIVATE_KEY="0x..."
-export WISE_API_TOKEN="..."   # optional: raises Wise rate limits for price_source = wise
+export WISE_API_TOKEN="..."   # optional: only raises Wise's rate limits
 export FRED_API_KEY="..."     # for price_source = fed (free FRED API key)
 ```
 
@@ -66,22 +66,13 @@ qty_base = "300000"
 fixed_bps = "40"
 ```
 
-Supported FX sources are `wise`, `ecb`, `fed`, and `bnm`. `wise`, `ecb`, and
-`bnm` work without a key (`WISE_API_TOKEN` is optional and only
-raises Wise's rate limits); `fed` (the official FRED API) needs a free
-`FRED_API_KEY`. A pair's source sets its mid: the central-bank sources publish
-daily reference rates, and `wise` (for currencies none of them covers) uses
-Wise's mid-market rate.
-
-Every pair's normal quotes, whatever its source, are placed at Wise's after-fee
-prices for each order's own size: a bid at what converting that much of the base
-token through Wise pays, an ask at what buying it through Wise costs, by the
-cheapest enabled transfer method that does not involve a Wise balance. Wise's
-rates are live, so quotes follow the live market. Where Wise cannot price a
-side (a currency it cannot convert from, or Wise being down), that side sits
-`fallback_bps` from the mid, or `fallback_weekend_bps` on FX weekends, on a
-carried rate, or during an outage. The mid and `fixed_bps` shape the return
-orders that bring a position back after a fill.
+Supported FX sources are `wise`, `ecb`, `fed`, and `bnm`; only `fed` needs a
+key. A pair's source sets its mid, but every pair's normal quotes sit at Wise's
+after-fee prices for each order's size: the mid and `fixed_bps` shape the return
+orders, and the mid anchors a side Wise cannot price.
+[docs/vl-mm.md](docs/vl-mm.md#config) describes every setting, and
+[Price Freshness](docs/vl-mm.md#price-freshness) what happens on weekends and
+when a source is down.
 
 ## Run
 
@@ -91,43 +82,17 @@ poetry run rotor mm vl --config rotor/vl.config.toml --poll 305
 ```
 
 Run one rotor per wallet: rotor refuses to start if the wallet has open orders
-on its markets that it did not place. Live mode always cancels its own
-reattached orders on boot. If Sera's cancel
-cooldown is active, Rotor waits 5 minutes and retries before quoting.
+on its markets that it did not place.
 
-Rotor keeps a small state database at `.rotor_state.sqlite` by default. It
-stores active orders, placed orders whose fills are not yet counted, open
-positions, and open stale-reference alerts, and prunes rows once they resolve.
-Positions are the part that must survive: deleting the file forgets them, and
-rotor goes back to quoting both sides normally. Set `ROTOR_STATE_PATH` to move it.
-The file belongs to the wallet and network that first used it, and rotor refuses
-to start on it with any other, so use one file per wallet and network (for
-example `.rotor_state.testnet.sqlite` and `.rotor_state.mainnet.sqlite`).
+Rotor keeps open positions and other unresolved state in a small database
+(`.rotor_state.sqlite`, or `ROTOR_STATE_PATH`). Deleting it forgets positions, and a file belongs to one wallet
+and network, so use one file per wallet and network; see
+[Unresolved State](docs/vl-mm.md#unresolved-state).
 
-Add `--telegram` to send lifecycle/error alerts to Telegram. It needs no extra
-package; without a token and chat id, sends degrade to dry-run logs.
-
-Daily FX sources (`ecb`, `fed`, `bnm`) publish nothing on weekends or
-public holidays. Instead of going dark until they publish again, Rotor keeps
-quoting on a source's last published rate for up to 7 days past that rate's
-date. Past that limit, or whenever a source is down, the pair's mid is
-replaced by Wise's live mid-market rate and it keeps quoting (quotes are at
-Wise's prices either way; the mid only bounds return orders). With `--telegram`
-it warns when pairs start quoting on carried rates, repeats the warning quietly
-every 6 hours, says when a pair switches to Wise's mid, and reports when fresh
-rates return. `wise` never carries a stale quote. Pass
-`--halt-on-stale-reference` to use Wise's mid as soon as a rate is stale
-instead of carrying it, or change a source's limit with
-`<SOURCE>_MAX_CARRY_AGE_S`.
-
-For autonomous source checkouts, add `--auto-update`. Rotor checks once per day
-and runs `git pull --ff-only` unless tracked files were changed (untracked files
-such as your config do not block it). It restarts into new code only after that
-code passes `--check-config` with the same command; otherwise it keeps running
-and alerts. A checkout from before this check needs one manual `git pull`.
-
-Logs are intentionally small for lightweight servers. The default log level is
-`WARNING`; per-tick quote and placement traces require `--log-level DEBUG`.
+Add `--telegram` for lifecycle and error alerts, `--auto-update` to pull and
+restart into new code once a day
+([Autonomous Updates](docs/vl-mm.md#autonomous-updates)), and
+`--log-level DEBUG` for per-tick traces (the default level is `WARNING`).
 
 ## Development
 
@@ -136,21 +101,8 @@ poetry run ruff check rotor tests
 poetry run python -m pytest -q
 ```
 
-Opt-in real Sera testnet checks are skipped by default:
-
-```bash
-ROTOR_RUN_TESTNET=1 poetry run python -m pytest -q tests/testnet
-```
-
-Opt-in live FX source checks (keyless `ecb`/`bnm`/`wise`; `fed` runs when its
-key is set) are also skipped by default:
-
-```bash
-make live-prices   # or: ROTOR_RUN_LIVE_PRICES=1 poetry run python -m pytest -q tests/live
-```
-
-The two-wallet maker/taker E2E and the heavier live runner scenarios are
-separately gated because they place real testnet orders. See
+Opt-in live FX source checks and real Sera testnet checks are skipped by
+default; see [tests/README.md](tests/README.md) and
 [tests/testnet/README.md](tests/testnet/README.md).
 
 ## Deploy on Manus
