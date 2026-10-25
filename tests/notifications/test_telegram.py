@@ -1,14 +1,4 @@
-"""Tests for rotor.notifications.telegram.TelegramNotifier.
-
-Covers the MM-focused notifier surface:
-  * package re-export
-  * dry-run when no token is configured
-  * channel resolution + fallback (important/debug -> normal)
-  * send_raw routing (normal / important / debug)
-  * lifecycle helpers (startup, shutdown, quote, error)
-  * heartbeat rate-limiting
-  * the Bot API request sent over httpx
-"""
+"""Tests for rotor.notifications.telegram.TelegramNotifier."""
 
 from __future__ import annotations
 

@@ -21,15 +21,12 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 class LiveOrder:
     """Small local handle for one resting Sera order."""
 
-    # Side label used by local cancellation/requote logs.
     side: str
-    # Public Sera order id.
     order_id: str
     # Packed id required for cancel signatures.
     uuid_int: int
     # Local placement/reattach time used for cooldown guards.
     placed_at: float
-    # Market symbol this order belongs to, when the runner knows it.
     market: str = ""
     # Original base-token size when locally known; used to prune full fills.
     qty_base: Decimal | None = None
@@ -45,7 +42,6 @@ def build_client(*, dry_run: bool, log: logging.Logger) -> SeraClient:
             # A dry-run must never sign; this fails loudly if a code path tries.
             raise RuntimeError("dry-run signer should never be called")
     else:
-        # Live mode requires an unlocked wallet and a real signer.
         owner = wallet_key.wallet_address()
         signer = wallet_key.sign_typed_data
     # Credentials and base URL resolve from env or optional rotor.secret.
@@ -135,7 +131,6 @@ class StopFlag:
 
     def wait(self, timeout: float) -> bool:
         """Block up to `timeout` seconds, returning early if a stop is set."""
-        # Returns True if the stop was requested during the wait, else False.
         return self._event.wait(max(0.0, timeout))
 
     @property
@@ -157,6 +152,5 @@ class StopFlag:
                 self._forced.set()
             self._event.set()
 
-        # Ctrl-C and process termination both request graceful shutdown.
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)

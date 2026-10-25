@@ -15,11 +15,9 @@ class PriceObservation:
     pairs before asking the reference oracle for a price.
     """
 
-    # Provider identifier used in logs/errors to attribute the observation.
     source: str
     # ISO pair in BASE/QUOTE form, e.g. SGD/USD.
     pair: str
-    # Quote-per-base FX rate represented as Decimal for exact arithmetic.
     rate: Decimal
     # Observation timestamp as POSIX seconds for freshness checks.
     ts: float
@@ -29,13 +27,11 @@ class PriceObservation:
 class ReferencePrice:
     """Quote-safe mid price from the configured source."""
 
-    # ISO pair used by the market maker.
     pair: str
     # Quote-per-base mid rate: fresh, or carried forward when `stale`.
     rate: Decimal
     # POSIX timestamp copied from the accepted observation.
     ts: float
-    # Source name copied through for logs/audits.
     source: str
     # Seconds between the source's published timestamp and when it was read.
     age_s: float = 0.0

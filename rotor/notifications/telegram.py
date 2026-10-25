@@ -1,28 +1,13 @@
 """Telegram notifier for the Sera market maker.
 
-A small three-channel notifier the market-maker runners can use to push
-operational alerts to a phone:
+Three channels: normal (silent lifecycle messages), important (errors; the only
+channel that pushes a notification) and debug (heartbeat only). Important and
+debug fall back to the normal chat when unset.
 
-  * NORMAL channel    — routine lifecycle messages (startup, shutdown,
-                        recoveries). Sent silently (no push notification).
-  * IMPORTANT channel — errors and anything that needs a human now. The
-                        only channel that pushes a notification. With no
-                        important chat configured, important messages go
-                        once to the normal chat, with the notification.
-  * DEBUG channel     — heartbeat keep-alive only. Falls back to the normal
-                        channel when no debug chat is configured.
-
-Configuration is resolved through `rotor.config.get_config`, so values may
-come from the environment, a root `.env`, or an untracked `rotor/secret.py`:
-
-    TELEGRAM_TOKEN              — bot token from @BotFather
-    TELEGRAM_NORMAL_CHAT_ID     — silent lifecycle channel
-    TELEGRAM_IMPORTANT_CHAT_ID  — loud error channel (optional)
-    TELEGRAM_DEBUG_CHAT_ID      — heartbeat channel (optional)
-
-This module degrades gracefully: with no token or chat id configured,
-sends become debug dry-run log lines instead of network calls. Messages go
-straight to the Bot API over httpx, so no extra package is needed. Telegram
+TELEGRAM_TOKEN and TELEGRAM_{NORMAL,IMPORTANT,DEBUG}_CHAT_ID resolve through
+`rotor.config.get_config`, so they may come from the environment, a root `.env`,
+or an untracked `rotor/secret.py`. With no token or chat id, sends become debug
+dry-run log lines. Messages go straight to the Bot API over httpx. Telegram
 failures never raise into the market-making loop.
 """
 
@@ -35,8 +20,8 @@ import httpx
 
 from rotor.config import get_config
 
-# Heartbeat interval — if nothing has been sent this long, emit "still alive".
-HEARTBEAT_SECONDS = 60 * 60  # 1 hour
+# If nothing has been sent this long, emit "still alive".
+HEARTBEAT_SECONDS = 60 * 60
 # Telegram refuses messages over 4096 characters, so a longer alert (an error
 # that embeds a whole HTML error page) is cut rather than lost.
 MAX_MESSAGE_CHARS = 4000
@@ -44,19 +29,7 @@ TELEGRAM_API = "https://api.telegram.org"
 
 
 class TelegramNotifier:
-    """Three-channel Telegram notifier for market-maker lifecycle events.
-
-    Usage::
-
-        notifier = TelegramNotifier()          # reads tokens from config
-        notifier.notify_startup("XSGD/USDC mm started, qty=100")
-        notifier.notify_error("place bid", exc)
-        notifier.heartbeat()                    # self-rate-limited keep-alive
-        notifier.notify_shutdown("XSGD/USDC mm stopped")
-
-    All public methods are safe to call from the synchronous MM loop and
-    never raise on Telegram/network failures.
-    """
+    """Three-channel notifier; public methods never raise on Telegram failures."""
 
     def __init__(
         self,
@@ -97,10 +70,7 @@ class TelegramNotifier:
             debug_chat_id if debug_chat_id is not None
             else get_config("TELEGRAM_DEBUG_CHAT_ID", "")
         )
-        # Use runner logger when provided so notification logs stay in the same
-        # output stream.
         self._log = log or logging.getLogger(__name__)
-        # dry_run is forced on later if no token or chat id exists.
         self._dry_run = dry_run
         self._http = http or httpx.Client(timeout=10.0)
 
@@ -108,7 +78,6 @@ class TelegramNotifier:
         self._last_message_at: float = time.time()
 
         if not self._token:
-            # Missing token is non-fatal; the notifier becomes log-only.
             self._log.warning(
                 "TelegramNotifier: TELEGRAM_TOKEN is empty — messages will be "
                 "dry-logged only."
@@ -122,23 +91,16 @@ class TelegramNotifier:
             )
             self._dry_run = True
 
-    # -----------------------------------------------------------------------
-    # Public API: market-maker lifecycle events
-    # -----------------------------------------------------------------------
-
     def notify_startup(self, text: str) -> None:
         """Announce that the market maker has started (normal channel)."""
-        # Lifecycle messages go to the quiet normal channel.
         self.send_raw(f"🟢 {text}")
 
     def notify_shutdown(self, text: str) -> None:
         """Announce that the market maker is shutting down (normal channel)."""
-        # Shutdown is routine and therefore normal-channel only.
         self.send_raw(f"🔴 {text}")
 
     def notify_error(self, context: str, error: object) -> None:
         """Report an operational error to the normal AND important channels."""
-        # Errors get a timestamp and exception type for quick triage.
         timestamp = time.strftime("%H:%M:%S")
         self.send_raw(
             f"⚠️ error: {context}\n{type(error).__name__}: {error}\nat {timestamp}",
@@ -148,29 +110,19 @@ class TelegramNotifier:
     def heartbeat(self) -> bool:
         """Emit a "still alive" message if silent for `HEARTBEAT_SECONDS`.
 
-        Call on every loop tick; self-rate-limits. Goes to the debug channel
-        (falling back to normal if no debug chat is configured).
+        Call on every loop tick; self-rate-limits.
 
         Returns:
             True if a heartbeat was emitted this call, False otherwise.
         """
-        # Suppress heartbeats while recent messages prove the loop is alive.
         if time.time() - self._last_message_at < HEARTBEAT_SECONDS:
             return False
-        # Debug channel is intended for low-priority keep-alive signals.
         self._send("💓 rotor market maker alive.", channel="debug")
         self._last_message_at = time.time()
         return True
 
     def send_raw(self, text: str, *, important: bool = False, debug: bool = False) -> None:
-        """Send a raw text message.
-
-        Routing:
-          * ``debug=True``: send ONLY to the debug channel.
-          * ``important=True``: send to normal AND important.
-          * default: send to normal only.
-        """
-        # Debug messages are not duplicated into normal/important channels.
+        """Send to normal, to normal and important, or (`debug`) to debug only."""
         if debug:
             self._send(text, channel="debug")
         elif important and not self._important_chat_id:
@@ -186,17 +138,8 @@ class TelegramNotifier:
         # Any attempted send/log counts as activity for heartbeat suppression.
         self._last_message_at = time.time()
 
-    # -----------------------------------------------------------------------
-    # Internals
-    # -----------------------------------------------------------------------
-
     def _send(self, text: str, *, channel: str) -> bool:
-        """Resolve the target chat id for the channel and dispatch.
-
-        Channel routing:
-          * ``"normal"``    → normal_chat_id
-          * ``"important"`` → important_chat_id (fallback to normal)
-          * ``"debug"``     → debug_chat_id    (fallback to normal)
+        """Send `text` to the channel's chat.
 
         Returns:
             True if a real Telegram send happened, False on dry-run or a
@@ -205,8 +148,6 @@ class TelegramNotifier:
         Raises:
             ValueError: If `channel` is not one of the allowed values.
         """
-        # Resolve logical channel into a concrete chat id, with fallbacks for
-        # optional important/debug channels.
         if channel == "normal":
             chat_id = self._normal_chat_id
         elif channel == "important":
@@ -216,7 +157,6 @@ class TelegramNotifier:
         else:
             raise ValueError(f"unknown channel {channel!r}")
 
-        # Dry-run or missing chat id never attempts network I/O.
         if self._dry_run or not chat_id:
             self._log.debug("[telegram dry-run %s] %s", channel, text)
             return False

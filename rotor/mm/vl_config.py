@@ -16,7 +16,6 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10.
 
 from rotor.price_reference import parse_market_symbol
 
-# Closed set of external reference providers accepted per pair.
 PRICE_SOURCE_CHOICES = {"wise", "ecb", "fed", "bnm"}
 # Spreads around the mid for a side Wise cannot price: on weekdays with a live
 # or fresh mid, and on FX weekends, carried rates and Wise outages.
@@ -49,7 +48,6 @@ class PairConfig:
 
     # Sera market label, normalized to BASE/QUOTE.
     market: str
-    # Reference provider for this pair.
     price_source: str
     # Base-token order size before quantization.
     qty_base: Decimal
@@ -66,9 +64,7 @@ class PairConfig:
 class VLConfig:
     """Validated VL strategy config."""
 
-    # Shared budget caps available to the VL strategy.
     budgets: list[BudgetConfig]
-    # Market-specific quote configs.
     pairs: list[PairConfig]
     # Global defaults copied into pairs when pair-level values are absent.
     fixed_bps: Decimal
@@ -80,13 +76,11 @@ class VLConfig:
     @property
     def budget_tokens(self) -> set[str]:
         """Return the set of token symbols with configured VL budgets."""
-        # This makes budget reachability checks cheap and declarative.
         return {budget.token for budget in self.budgets}
 
 
 def load_vl_config(path: str | Path) -> VLConfig:
     """Load and validate a VL TOML config file."""
-    # Normalize the path object so logging/errors can include a stable source.
     config_path = Path(path)
     # TOML files must be opened as bytes for tomllib/tomli.
     with config_path.open("rb") as fh:
@@ -110,9 +104,7 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
     if return_window_hours <= 0:
         raise ValueError(f"{source}: return_window_hours must be > 0")
 
-    # Budgets define the shared spend caps that make VL safe.
     budgets = _parse_budgets(raw.get("budget"), source=source)
-    # Pairs define the markets that will consume those shared budgets.
     pairs = _parse_pairs(
         raw.get("pair"),
         source=source,
@@ -143,7 +135,6 @@ def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfi
 
 def _parse_budgets(value, *, source: str) -> list[BudgetConfig]:
     """Parse and validate one or more `[[budget]]` TOML tables."""
-    # TOML table parsing is normalized so callers can pass one dict or a list.
     rows = _list_table(value)
     if not rows:
         raise ValueError(f"{source}: at least one [[budget]] is required")
@@ -164,11 +155,9 @@ def _parse_budgets(value, *, source: str) -> list[BudgetConfig]:
             raise ValueError(f"{source}: [[budget]] #{i + 1} missing token")
         if token in seen:
             raise ValueError(f"{source}: duplicate budget token {token}")
-        # Amount is required and must be positive.
         amount = _decimal(row, "amount", None)
         if amount <= 0:
             raise ValueError(f"{source}: budget {token} amount must be > 0")
-        # Track duplicates and append the typed validated config row.
         seen.add(token)
         out.append(BudgetConfig(token=token, amount=amount))
     return out
@@ -200,7 +189,7 @@ def _parse_pairs(
                 f"{source}: [[pair]] {market} has unknown key(s) {', '.join(extra)}; "
                 "global settings must come before the first [[budget]] or [[pair]]"
             )
-        # Per-pair source controls where this market's benchmark comes from.
+        # Where this market's mid comes from.
         price_source = str(row.get("price_source", "wise")).strip().lower()
         if price_source == "mas":
             # Its public daily dataset stopped in 2015, and MAS's current API

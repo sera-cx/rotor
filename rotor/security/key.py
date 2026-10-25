@@ -57,7 +57,6 @@ def unlock() -> None:
             "no SERA_PRIVATE_KEY configured. Set it in the environment, root "
             ".env, or optional rotor/secret.py for the maker wallet."
         )
-    # Validate shape and derive the checksummed account address once.
     _account = _load_account(env_key)
     _address = _account.address
 
@@ -82,8 +81,6 @@ def sign_typed_data(domain: dict, types: dict, message: dict) -> str:
     # Never sign with a missing key; live order placement depends on this guard.
     if _account is None:
         raise WalletLocked("wallet not unlocked; call `unlock()` first")
-    # eth-account builds the signable digest from the domain, type schema, and
-    # message fields according to EIP-712.
     signable = encode_typed_data(
         domain_data=domain,
         message_types=types,
@@ -108,7 +105,6 @@ def lock() -> None:
 def _load_account(private_key: str) -> LocalAccount:
     """Validate SERA_PRIVATE_KEY and derive its account."""
     try:
-        # Enforce the expected string shape before handing it to eth-account.
         _validate_private_key(private_key)
         return Account.from_key(private_key)
     except Exception:
@@ -119,7 +115,6 @@ def _load_account(private_key: str) -> LocalAccount:
 
 def _validate_private_key(private_key: str) -> None:
     """Require the 0x-prefixed 32-byte private-key string shape and curve range."""
-    # This catches common copy/paste/config mistakes before signing is attempted.
     if not private_key.startswith("0x") or len(private_key) != PRIVATE_KEY_LEN:
         raise ValueError("private key must be 0x-prefixed 64-hex-char string")
     # Reject the zero scalar and any out-of-range value: eth-account would accept

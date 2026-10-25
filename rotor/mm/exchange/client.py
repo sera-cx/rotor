@@ -47,19 +47,15 @@ class MarketInfo:
 
     # Sera market label, for example XSGD/USDC.
     symbol: str
-    # Token symbols as returned by Sera.
     base_symbol: str
     quote_symbol: str
-    # ERC-20/token addresses used in signed order payloads.
     base_address: str
     quote_address: str
-    # Token decimal scales for raw amount conversions.
     base_decimals: int
     quote_decimals: int
     # Fallback precision metadata when exact step sizes are absent.
     tick_precision: int
     quantity_precision: int
-    # Optional exact price and amount grids.
     price_step: Decimal | None = None
     amount_step: Decimal | None = None
     # Sera's bid minimum is quote-token notional.
@@ -72,7 +68,6 @@ class MarketInfo:
 class OrderRecord:
     """Server-acknowledged order identifier."""
 
-    # Public order UUID string.
     order_id: str
     # Packed uint256 identifier used for signing/cancellation.
     uuid_int: int
@@ -82,9 +77,8 @@ class OrderRecord:
 class VLLeg:
     """Unsigned order intent for one VL batch sibling."""
 
-    # Market label for this sibling order.
     market: str
-    # Sera side string, normally "buy"/"sell" or API-equivalent.
+    # "bid" or "ask".
     side: str
     # Base-token quantity in human decimals.
     qty_base: Decimal
@@ -98,9 +92,7 @@ class VLLeg:
 class VLBatchAmendment:
     """Server-side quantity clip for one accepted VL sibling."""
 
-    # Order id of the leg Sera amended.
     order_id: str
-    # Amount accepted by Sera after clipping.
     actual_amount: str
 
 
@@ -115,9 +107,7 @@ class VLBatchResult:
 
     # Batch identifier used for later cancellation (the first leg's order id).
     vl_batch_id: str
-    # Order ids plus uuid_int values retained for local tracking.
     records: list[OrderRecord]
-    # Quantity clips returned by Sera.
     amendments: list[VLBatchAmendment]
     # Order ids of legs the matching engine dropped at placement.
     cancelled: list[str]
@@ -127,9 +117,7 @@ class VLBatchResult:
 class SignableOrder:
     """A limit order rotor built itself: the Order message it signs, and its wire form."""
 
-    # UUID string Rotor generated or reused for this order.
     order_id: str
-    # Packed identifier derived from the order/group/executor values.
     uuid_int: int
     # The EIP-712 Order message (eip712.ORDER_TYPES) rotor signs.
     struct: dict
@@ -184,31 +172,25 @@ class SeraClient:
         # header with an error that quotes it, secret included, into the logs.
         self._api_key = _clean_credential("SERA_API_KEY", api_key)
         self._api_secret = _clean_credential("SERA_API_SECRET", api_secret)
-        # Normalize the base URL once so later path joins are simple.
         self.base_url = base_url.rstrip("/")
         # Refuse to sign and submit orders over a non-TLS transport (outside of
         # localhost dev/mocks): an http:// or MITM'd endpoint could feed rotor
         # false market metadata, signing domain, or server time.
-        # The maker signs orders against this URL, so it must be TLS.
         require_https("SERA_BASE_URL", self.base_url)
-        # A single httpx client keeps connection behavior consistent.
         self._http = httpx.Client(timeout=timeout)
         # Next free request slot per rate-limit group (monotonic seconds).
         self._next_slot: dict[str, float] = {}
         # Swappable so tests can run without real waits.
         self._sleep = time.sleep
         self._monotonic = time.monotonic
-        # Use caller logger when provided; otherwise fall back to module logger.
         self._log = log or logging.getLogger(__name__)
 
-        # Populated by bootstrap from Sera's public config endpoint.
         self.eip712_domain: dict | None = None
         # Executor id affects uuid_int packing and comes from /health.
         self.executor_id: int = 0
         # Server-provided VL batch size limits; defaults are conservative.
         self.vl_batch_min: int = 2
         self.vl_batch_max: int = 50
-        # Market metadata cache keyed by Sera symbol.
         self.markets_by_symbol: dict[str, MarketInfo] = {}
 
     def close(self) -> None:
@@ -246,11 +228,9 @@ class SeraClient:
         vl_batch_min = int(vl_limits.get("min", self.vl_batch_min))
         vl_batch_max = int(vl_limits.get("max", self.vl_batch_max))
 
-        # `/health` exposes the executor id used in uuid_int packing.
         health = self._request("GET", "/health", authed=False)
         executor_id = _parse_healthy_executor_id(health)
 
-        # Market metadata drives amount/price grids and signed token addresses.
         markets = self._request("GET", "/markets", authed=False).get("markets")
         if not isinstance(markets, list):
             raise RuntimeError("GET /markets returned no markets list")
@@ -264,7 +244,6 @@ class SeraClient:
                 symbol = m.get("symbol") if isinstance(m, dict) else None
                 self._log.warning("skipping malformed GET /markets row %r: %s", symbol, exc)
                 continue
-            # Cache by exact Sera symbol for fast lookup during quoting.
             markets_by_symbol[info.symbol] = info
         _check_market_tokens(markets_by_symbol, int(domain["chainId"]))
 
@@ -308,7 +287,6 @@ class SeraClient:
         info = self._market(market)
         # VL legs pass their order id and group; standalone orders get a fresh UUID.
         final_order_id = order_id or eip712.new_order_id()
-        # Sera requires a packed uuid_int for signing and cancel flows.
         uuid_int = eip712.compose_uuid(
             final_order_id,
             executor_id=self.executor_id,
@@ -369,7 +347,6 @@ class SeraClient:
 
     def sign_vl_batch(self, legs: list[VLLeg]) -> SignedVLBatch:
         """Build and sign each sibling of one VL batch. Nothing is sent."""
-        # Enforce server batch-size limits locally before generating signatures.
         if len(legs) < self.vl_batch_min:
             raise ValueError(
                 f"VL batch requires at least {self.vl_batch_min} legs, got {len(legs)}"
@@ -441,7 +418,6 @@ class SeraClient:
             "signature": signature,
         }
         try:
-            # 204 is an allowed empty success response.
             self._request("POST", "/orders/cancel", json_body=wire, expect_status=(200, 204))
             return True
         except errors.SeraCancelCooldown:
@@ -455,7 +431,6 @@ class SeraClient:
             eip712.CANCEL_VL_BATCH_TYPES,
             {"owner": self.owner_address, "vlBatchId": str(vl_batch_id)},
         )
-        # Keep the wire key names aligned with Sera's cancel endpoint.
         wire = {
             "owner_address": self.owner_address,
             "vl_batch_id": str(vl_batch_id),
@@ -470,7 +445,6 @@ class SeraClient:
             )
             return True
         except errors.SeraCancelCooldown:
-            # Same cooldown behavior as single-order cancellation.
             return False
 
     def get_server_time(self) -> int:
@@ -614,7 +588,6 @@ class SeraClient:
         expect_status: tuple[int, ...] = (200, 201, 204),
     ) -> Any:
         """Make one Sera HTTP request and normalize success/error responses."""
-        # Join pre-normalized base URL with the endpoint path.
         url = f"{self.base_url}{path}"
         headers: dict[str, str] = {}
         if authed:
@@ -622,8 +595,6 @@ class SeraClient:
             headers["Authorization"] = f"Bearer {self._api_key}:{self._api_secret}"
         kwargs: dict[str, Any] = {"params": params}
         if json_body is not None:
-            # Compact JSON bytes keep signatures/payloads deterministic enough for
-            # API transport while avoiding whitespace churn.
             headers["Content-Type"] = "application/json"
             kwargs["content"] = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
         # API-key requests count against Sera's per-wallet limits; public ones
@@ -636,7 +607,6 @@ class SeraClient:
             if response.status_code in expect_status:
                 break
             try:
-                # Prefer structured errors when the server returns JSON.
                 body = response.json()
             except Exception:
                 # Preserve text bodies in the same envelope shape.
@@ -647,8 +617,7 @@ class SeraClient:
             wait = _retry_wait(response, attempt)
             self._log.debug("retrying %s %s in %.1fs after %s", method, path, wait, error)
             self._sleep(wait)
-        # An empty success (a 204 cancel) is an empty dict; every other Sera
-        # success is JSON.
+        # An empty success body reads as an empty dict; Sera answers JSON otherwise.
         return response.json() if response.content else {}
 
 
@@ -667,14 +636,12 @@ def _order_wire(
     """Build the unsigned order payload rotor signs and posts to Sera."""
     # Sera accepts human-decimal amount/price strings and token addresses.
     return {
-        # Owner and side identify who trades and direction.
         "owner_address": owner_address,
         "side": side,
         # Canonical decimal strings: Sera rejects an exponent (5E+3) or
         # trailing zeros (20.000000) as INVALID_DECIMAL_FORMAT.
         "amount": _canonical_decimal(qty_base),
         "price": _canonical_decimal(price),
-        # Rotor only places limit orders.
         "order_type": "limit",
         # Market token addresses identify the pair; Sera interprets direction
         # from the side field.

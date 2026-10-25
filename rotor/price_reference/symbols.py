@@ -39,9 +39,7 @@ DEFAULT_TOKEN_TO_ISO: dict[str, str] = {
 
 def parse_market_symbol(market: str) -> tuple[str, str]:
     """Split a Sera market symbol like `XSGD/USDC` into token symbols."""
-    # Accept underscores as a forgiving input format, then normalize casing.
     parts = [p.strip().upper() for p in market.replace("_", "/").split("/")]
-    # Reject missing sides or extra delimiters before downstream mapping.
     if len(parts) != 2 or not all(parts):
         raise ValueError(f"market must look like BASE/QUOTE, got {market!r}")
     return parts[0], parts[1]
@@ -63,7 +61,6 @@ def market_to_iso_pair(
     # Parse before mapping so the error for malformed market symbols is clear.
     base_token, quote_token = parse_market_symbol(market)
     try:
-        # Return ISO currencies in the same base/quote order as the market.
         return mapping[base_token], mapping[quote_token]
     except KeyError as exc:
         # Missing token mappings are configuration issues, not provider issues.

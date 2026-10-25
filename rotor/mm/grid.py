@@ -40,13 +40,11 @@ def _quantize_step(
     # Newer market metadata can provide an exact step; older metadata may only
     # provide decimal precision, so derive a quantum like 0.01 from precision=2.
     quantum = step or Decimal("1").scaleb(-precision)
-    # Divide by the grid, round to an integer grid count, then scale back.
     return (value / quantum).to_integral_value(rounding=rounding) * quantum
 
 
 def validate_minimums(info: MarketInfo, side: str, qty: Decimal, price: Decimal) -> None:
     """Reject an order below Sera's market minimum for its side (or empty)."""
-    # A zero/negative amount after quantization cannot produce a valid order.
     if qty <= 0:
         raise ValueError("quantity rounds to zero")
     # Bid minimums are quote-token notional minimums: base size times bid price.

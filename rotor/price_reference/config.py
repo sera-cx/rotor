@@ -27,14 +27,11 @@ def load_price_reference_source(name: str) -> RateSource:
     """
     source_name = str(name).lower()
     if source_name == "wise":
-        # Base URL is configurable so tests/deployments can point at mocks or
-        # alternate Wise environments.
         return WiseRateSource(
             base_url=_url("WISE_BASE_URL", "https://api.wise.com"),
             token_env="WISE_API_TOKEN",
         )
     if source_name == "ecb":
-        # ECB is configured by a single XML feed URL.
         return EcbRateSource(
             url=_url("ECB_RATES_URL", "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"),
             max_age_s=_max_age_override("ECB"),
@@ -63,7 +60,6 @@ def load_price_reference_source(name: str) -> RateSource:
 
 def _max_age_override(prefix: str) -> float | None:
     """Return a per-source (then global) staleness override in seconds, if set."""
-    # A source-specific window wins over the global one; both are optional.
     return _seconds_override(f"{prefix}_MAX_AGE_S", "PRICE_REFERENCE_MAX_AGE_S")
 
 
@@ -74,7 +70,6 @@ def _url(name: str, default: str) -> str:
 
 def _max_carry_age_override(prefix: str) -> float | None:
     """Return a per-source (then global) stale carry-forward limit, if set."""
-    # Same precedence as the freshness window: the source-specific key wins.
     return _seconds_override(f"{prefix}_MAX_CARRY_AGE_S", "PRICE_REFERENCE_MAX_CARRY_AGE_S")
 
 

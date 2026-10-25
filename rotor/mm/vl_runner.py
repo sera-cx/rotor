@@ -1,9 +1,10 @@
 """Multi-pair VL placement runner for Rotor market making.
 
-The runner keeps quote generation in the normal algorithm stack, then groups
-non-null order intents by spent token. Eligible same-spent-token groups use
-Sera Virtual Liquidity; singletons and unbudgeted groups use standalone order
-placement.
+Each tick, every pair builds a bid and an ask priced at Wise's after-fee rates;
+on the side that returns an open position, a return order takes the normal
+one's place. The order intents are then grouped by spent token: a group with at
+least Sera's VL batch minimum of legs goes out as Virtual Liquidity batches, a
+smaller one as standalone orders.
 """
 
 from __future__ import annotations
@@ -120,26 +121,23 @@ _INACTIVE_PAIR = re.compile(r"Pair (\S+) is not an active trading pair")
 class PairRuntime:
     """Runtime state for one configured market."""
 
-    # Validated static TOML row for this market.
     config: PairConfig
     # Sera market metadata from the bootstrapped client.
     info: object
-    # Freshness-checking price oracle for this pair's reference source.
     oracle: ReferencePriceOracle
     # ISO currency symbols used by the reference oracle.
     iso_base: str
     iso_quote: str
-    # Wise, for the after-fee rates no order may quote inside (every pair).
+    # Wise, at whose after-fee rates every pair's normal orders sit (return
+    # orders are exempt).
     settlement: object = None
 
 
 @dataclass(frozen=True)
 class OrderIntent:
-    """One non-null order emitted by the current algo."""
+    """One order rotor means to place this tick."""
 
-    # Sera market to quote.
     market: str
-    # Side to place, bid or ask.
     side: str
     # Base-token order size.
     qty_base: Decimal
@@ -161,9 +159,7 @@ class LivePlacement:
 
     # "standalone" or "vl"; controls cancellation path.
     kind: str
-    # Token whose budget/grouping this placement belongs to.
     spent_token: str
-    # Live orders inside this placement.
     orders: list[LiveOrder]
     # Local placement time for cooldown guards.
     placed_at: float
@@ -1105,7 +1101,6 @@ def run(
     )
     try:
         while not stop.requested:
-            # Record tick start so the loop can maintain poll cadence.
             tick_started = time.time()
             if notifier is not None:
                 notifier.heartbeat()
@@ -1236,9 +1231,9 @@ def run(
                     sleep_remaining(tick_started, poll_seconds, stop)
                     continue
 
-            # Phase 2: ask each pair's algo for a fresh quote and flatten it
-            # into per-leg intents. A market with an open position quotes its
-            # return order on that side instead of the normal one.
+            # Phase 2: build each pair's fresh quotes as per-leg intents. A market
+            # with an open position quotes its return order on that side instead
+            # of the normal one.
             tick_refs = TickReferences()
             try:
                 intents = _build_tick_intents(
@@ -1540,7 +1535,6 @@ def _start(
             log=log,
             skipped=skipped,
         )
-        # Ensure at least one configured budget can actually be spent by a pair.
     except Exception:
         with contextlib.suppress(Exception):
             client.close()
@@ -1692,7 +1686,6 @@ def _build_runtimes(
     """
     skipped = {} if skipped is None else skipped
     log = log or logging.getLogger("rotor.mm.vl")
-    # Token-to-ISO mapping is loaded once and reused for all configured pairs.
     token_to_iso = load_token_to_iso()
     # Reuse one source adapter per provider name to avoid duplicate HTTP clients.
     source_cache = {}
@@ -1710,14 +1703,12 @@ def _build_runtimes(
             skipped[pair.market] = str(exc)
             log.warning("not quoting %s: %s", pair.market, exc)
             continue
-        # Construct each provider adapter once per price_source.
         if pair.price_source not in source_cache:
             source_cache[pair.price_source] = load_price_reference_source(pair.price_source)
         source = source_cache[pair.price_source]
         # Every pair, whatever its mid source, quotes at Wise's after-fee prices.
         if "wise" not in source_cache:
             source_cache["wise"] = load_price_reference_source("wise")
-        # Store all runtime dependencies needed by the tick builder.
         runtimes.append(
             PairRuntime(
                 config=pair,
@@ -1757,12 +1748,11 @@ def _validate_budget_caps(
     batch counts as that leg. Each standalone order counts in full, and several
     batches or standalone orders on one token add up.
     """
-    # Convert list config into quick lookup by token symbol.
     budgets = {budget.token: budget.amount for budget in config.budgets}
     spend_by_token: dict[str, Decimal] = {}
     for spent_token, intents, use_vl in groups:
         if spent_token not in budgets:
-            # Unbudgeted tokens may still place standalone orders.
+            # An unbudgeted token has no cap to check.
             continue
         spends = [_intent_spend_amount(intent) for intent in intents]
         group_spend = max(spends) if use_vl else sum(spends, Decimal("0"))
@@ -1876,7 +1866,6 @@ def _intents_for_runtime(
             else:
                 if refs is not None:
                     refs.covered.add(runtime.config.market)
-    # Debug-only per-pair trace for operators and audits.
     log.debug(
         "%s mid=%s src=%s qty=%s%s",
         runtime.config.market,
@@ -1940,7 +1929,6 @@ def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list
     validate_minimums(info, "bid", qty, mid)
     validate_minimums(info, "ask", qty, mid)
     return [
-        # A bid spends quote tokens and buys base.
         OrderIntent(
             market=runtime.config.market,
             side="bid",
@@ -1950,7 +1938,6 @@ def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list
             spent_token=info.quote_symbol.upper(),
             benchmark_rate=mid,
         ),
-        # An ask spends/sells base tokens and receives quote.
         OrderIntent(
             market=runtime.config.market,
             side="ask",
@@ -2334,7 +2321,6 @@ def _place_vl_batch(
         _record_before_sending(state, batch.orders, legs)
         try:
             result = client.send_vl_batch(batch)
-            # Convert Sera's batch response into local cancellation/fill state.
             placement = _placement_from_vl_result(spent_token, result, legs)
         except Exception as exc:
             if not _refused(exc):
@@ -2677,7 +2663,6 @@ def _load_live_placements(
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            # Pull current open orders for the owner.
             rows = client.get_open_orders()
             break
         except Exception as exc:
@@ -2696,7 +2681,6 @@ def _load_live_placements(
     standalone: list[LivePlacement] = []
     batches: dict[str, list[LiveOrder]] = {}
     for row in rows:
-        # Accept both `symbol` and `market` response keys.
         market = str(row.get("symbol") or row.get("market") or "").upper()
         if market not in markets:
             continue
@@ -2719,12 +2703,10 @@ def _load_live_placements(
             market=market,
             qty_base=_open_order_qty_base(row),
         )
-        # Orders with a batch id are grouped into one VL placement.
         vl_batch_id = str(row.get("vl_batch_id") or "").strip()
         if vl_batch_id:
             batches.setdefault(vl_batch_id, []).append(live_order)
         else:
-            # Standalone orders become one-order placements.
             standalone.append(
                 LivePlacement(
                     kind="standalone",
@@ -2734,7 +2716,6 @@ def _load_live_placements(
                 )
             )
 
-    # Start output with standalone placements, then append reconstructed batches.
     out = list(standalone)
     for vl_batch_id, orders in batches.items():
         # Batch placed_at is the oldest sibling time for cooldown purposes.
@@ -3099,7 +3080,6 @@ def _log_groups(
     """
     emit = log.warning if dry_run else log.debug
     for spent_token, intents, use_vl in groups:
-        # Path tells whether this intent will be placed via VL or standalone.
         path = "VL" if use_vl else "standalone"
         for intent in intents:
             emit(

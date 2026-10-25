@@ -29,7 +29,6 @@ class ReferencePriceOracle:
         max_carry_age_s: float | None = None,
     ) -> None:
         """Store the source adapter and its freshness and carry-forward limits."""
-        # Source adapters are injected to keep HTTP/provider behavior testable.
         self.source = source
         # Freshness is enforced centrally so runners do not quote stale mids.
         # When no explicit override is given, each source carries its own window
@@ -59,18 +58,14 @@ class ReferencePriceOracle:
         `amount` is the base-currency size being worked; it is forwarded to the
         source so Wise can price its after-fee rates for that size.
         """
-        # Normalize the pair label for consistent operator-facing errors.
         pair = f"{base.upper()}/{quote.upper()}"
         try:
-            # Delegate provider-specific HTTP/parsing to the configured source.
             obs = self.source.quote(base, quote, amount=amount)
         except Exception as exc:
-            # Wrap provider failures in one domain-level exception type.
             raise ReferenceUnavailable(
                 f"{pair}: {self.source.name} failed ({type(exc).__name__}: {exc})"
             ) from exc
 
-        # Compare wall-clock time to provider observation time.
         age_s = time.time() - obs.ts
         stale = age_s > self.max_age_s
         if stale and not self._can_carry(age_s):

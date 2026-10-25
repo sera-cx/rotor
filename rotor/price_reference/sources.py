@@ -37,8 +37,8 @@ DAILY_MAX_CARRY_AGE_S = 7 * 24 * 60 * 60.0  # 7 days
 DAILY_REUSE_S = 60.0
 
 # Default HTTP read/connect timeout for source fetches. Generous enough for slow
-# public endpoints (e.g. FRED's CSV graph) while staying well under the poll
-# cadence so a stuck request only costs one tick.
+# public endpoints while staying well under the poll cadence, so a stuck request
+# only costs one tick.
 DEFAULT_TIMEOUT_S = 30.0
 
 
@@ -650,7 +650,6 @@ def _parse_ts(value: Any) -> float:
 
 def _parse_ecb_xml(text: str) -> tuple[str, dict[str, Decimal]]:
     """Extract the ECB publication date and currency-rate table from XML."""
-    # ElementTree parses provider XML; malformed XML naturally raises here.
     root = ElementTree.fromstring(text)
     # ECB rates are quoted against EUR, so seed EUR at 1 for crossing.
     rates = {"EUR": Decimal("1")}

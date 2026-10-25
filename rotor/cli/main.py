@@ -10,14 +10,12 @@ def cmd_mm_vl(args) -> int:
     """Run the TOML-driven multi-pair VL market-maker loop."""
     if args.check_config:
         return _check_config(args.config)
-    # Live VL mode needs a signer before any order placement.
     if not args.dry_run and not _unlock_wallet():
         return 1
 
     # Import lazily so config-only CLI operations stay lightweight.
     from rotor.mm.vl_runner import run as run_vl_mm
 
-    # The VL runner reads detailed strategy settings from the TOML file.
     return run_vl_mm(
         config_path=args.config,
         poll_seconds=args.poll,
@@ -60,7 +58,6 @@ def _unlock_wallet() -> bool:
             f"wallet unlocked: address={key.wallet_address()}", file=sys.stderr)
         return True
     except key.WalletNotInitialized as exc:
-        # Missing config is the most common operator boot failure.
         print(f"error: {exc}", file=sys.stderr)
         return False
     except key.InvalidPrivateKey:
@@ -76,18 +73,15 @@ def _unlock_wallet() -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level Rotor argparse command tree."""
-    # Top-level parser owns command-group dispatch.
     parser = argparse.ArgumentParser(
         prog="rotor",
         description="Basic Sera market-making tools",
     )
     top = parser.add_subparsers(dest="group", required=True)
 
-    # Market-maker command group.
     mm_g = top.add_parser("mm", help="Sera market maker")
     mm_sub = mm_g.add_subparsers(dest="cmd", required=True)
 
-    # TOML-driven multi-pair virtual-liquidity runner command.
     p_mm_vl = mm_sub.add_parser(
         "vl",
         help="multi-pair MM loop with automatic Virtual Liquidity placement",
@@ -127,7 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
                          help="load the runner and the config, then exit 0 if both are "
                               "fine (no network, wallet, or state); auto-update runs this "
                               "on new code before restarting into it")
-    # Store the command handler so main() can dispatch after parsing.
     p_mm_vl.set_defaults(func=cmd_mm_vl)
 
     return parser
@@ -135,7 +128,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI args and run the selected command handler."""
-    # Passing argv keeps tests deterministic; None uses sys.argv.
     parser = build_parser()
     args = parser.parse_args(argv)
     # Subparsers attach `func`; required=True guarantees it exists.
@@ -143,5 +135,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    # Convert the command return code into a process exit code.
     sys.exit(main())

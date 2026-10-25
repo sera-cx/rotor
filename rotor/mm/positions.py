@@ -50,7 +50,6 @@ def apply_fill(
     ts: float,
 ) -> Position | None:
     """Return the position after one fill, or None once it is flat."""
-    # A bid buys base and an ask sells it.
     signed = qty_base if side == "bid" else -qty_base
     if position is None:
         return Position(signed, price, ts) if signed else None
