@@ -306,7 +306,8 @@ expires, and the loop exits with code 1.
 
 Only one instance may use a given state file at a time: Rotor takes an exclusive
 lock on `<state>.lock` at startup and refuses to start if another process holds
-it (set `ROTOR_STATE_PATH` to run a second instance on different state). Before
+it. Run one rotor per wallet: a different `ROTOR_STATE_PATH` is for a different
+wallet, and moving a wallet to a new state file forgets its positions. Before
 signing, Rotor builds every order itself and signs only that, never a struct a
 server returns, and it refuses to start if `GET /config` names a contract other
 than Sera's for mainnet or Sepolia, or if `GET /markets` gives a mainnet token

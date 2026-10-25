@@ -347,8 +347,11 @@ class StateStore:
         except OSError as exc:
             lock_fp.close()
             raise RuntimeError(
-                f"another rotor instance is using {self.path}; refusing to start "
-                "(set ROTOR_STATE_PATH to run a second instance on different state)"
+                f"another rotor instance is using {self.path}; refusing to start. "
+                "Run one rotor per wallet: on a schedule, this is the previous run "
+                "still going, and the next run tries again. A different "
+                "ROTOR_STATE_PATH is only for a different wallet; switching this "
+                "wallet to a new file forgets its positions"
             ) from exc
         self._lock_fp = lock_fp
 
