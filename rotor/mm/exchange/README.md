@@ -1,4 +1,4 @@
-# Exchange Package
+# Sera Client Package
 
 This package contains Sera-specific REST and signing payload helpers.
 

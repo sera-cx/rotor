@@ -1,4 +1,4 @@
-"""Sera exchange client helpers.
+"""Client helpers for Sera, the settlement layer rotor quotes on.
 
 Modules:
     client:  REST wrapper for config, health, markets, locally built order
@@ -8,5 +8,5 @@ Modules:
     errors:  `SeraError` + `SeraCancelCooldown` typed envelope parser.
 """
 
-# This package marker documents the exchange layer but intentionally avoids
+# This package marker documents the Sera client layer but intentionally avoids
 # imports so HTTP/signing dependencies load only from their concrete modules.
