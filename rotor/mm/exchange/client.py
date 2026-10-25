@@ -29,6 +29,10 @@ RATE_LIMITS = {"read": 10.0, "trade": 5.0, "cancel": 2.0}
 MAX_RETRIES = 2
 # The longest Retry-After wait honoured before a retry, in seconds.
 MAX_RETRY_WAIT_S = 5.0
+# How far Sera's clock may be from this machine's before rotor refuses to sign
+# expirations with it: a wrong or hostile SERA_BASE_URL could otherwise get
+# orders signed that stay valid for up to a year.
+MAX_CLOCK_SKEW_S = 120
 # POSTs that are safe to repeat after a server error: a repeated cancel changes
 # nothing. Placements are not here: a 503 can come after Sera booked the order,
 # and Sera refuses a repeated order_id with a 400, which would read as "never
@@ -572,7 +576,13 @@ class SeraClient:
 
     def expiration_from_server_time(self, ttl_seconds: int) -> int:
         """Return a signed-payload expiration derived from Sera server time."""
-        return self.get_server_time() + int(ttl_seconds)
+        server = self.get_server_time()
+        skew = server - time.time()
+        if abs(skew) > MAX_CLOCK_SKEW_S:
+            raise RuntimeError(
+                f"Sera's clock is {skew:+.0f} s from this machine's; refusing to sign "
+                "expirations with it (check SERA_BASE_URL and the system clock)")
+        return server + int(ttl_seconds)
 
     def get_vault_balances(self) -> dict[str, Decimal]:
         """Return each token's vault total (available + frozen) by symbol, in token units.

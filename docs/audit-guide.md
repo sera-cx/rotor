@@ -177,6 +177,12 @@ Sera signing and API:
   returns. Fee, recipient, and initial deposit are always zero, and expiration
   and uuid are rotor's own. Golden vectors from testnet's preview endpoint
   prove the local struct is the one the server verifies.
+- Expirations are Sera's server time plus the TTL, but only while that time is
+  within `MAX_CLOCK_SKEW_S` (120 s) of the local clock; otherwise the tick is
+  skipped, so a wrong or hostile base URL cannot get long-lived orders signed.
+- Wire amounts and prices are canonical decimal strings (`_canonical_decimal`:
+  no exponent, no trailing zeros), which Sera requires; the signed struct is
+  built from the same Decimal values.
 - Bootstrap refuses a `/config` that names any contract other than the known
   Sera contract for mainnet (chain 1) or Sepolia (chain 11155111); an unknown
   chain is allowed with a warning.

@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
+from rotor.mm.exchange import client as client_mod
 from rotor.mm.exchange import eip712
 from rotor.mm.exchange import errors as errors_mod
 from rotor.mm.exchange.client import SeraClient, VLLeg
@@ -460,15 +461,27 @@ def test_bootstrap_reads_vl_batch_limits_from_config():
 
     assert (client.vl_batch_min, client.vl_batch_max) == (4, 9)
 
-def test_server_time_is_public_and_drives_expiration():
+def test_server_time_is_public_and_drives_expiration(monkeypatch):
     routes = _build_mock_routes({"GET /system/time": {"timestamp": "1713168000"}})
     captured: list[dict] = []
     client = _make_client(routes, captured)
+    monkeypatch.setattr(client_mod.time, "time", lambda: 1713168030.0)
 
     assert client.get_server_time() == 1713168000
     assert client.expiration_from_server_time(600) == 1713168600
     requests = [r for r in captured if r["path"].endswith("/system/time")]
     assert [r["headers"].get("authorization") for r in requests] == [None, None]
+
+
+def test_a_server_clock_far_from_ours_is_not_signed_with(monkeypatch):
+    # A wrong or hostile base URL answering a year ahead would otherwise get
+    # orders signed that stay valid for that long.
+    year_ahead = 1713168000 + 364 * 86400
+    client = _make_client(_build_mock_routes({"GET /system/time": {"timestamp": str(year_ahead)}}))
+    monkeypatch.setattr(client_mod.time, "time", lambda: 1713168000.0)
+
+    with pytest.raises(RuntimeError, match="refusing to sign"):
+        client.expiration_from_server_time(600)
 
 
 def test_server_time_rejects_missing_timestamp():
