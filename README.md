@@ -37,7 +37,8 @@ export FRED_API_KEY="..."     # for price_source = fed (free FRED API key)
 `http://` is rejected outside `localhost`.
 
 For file-based local config, copy `.env.example` to the gitignored root `.env`
-and fill in real values. Real environment variables override `.env`.
+and fill in real values. Real environment variables override `.env`; within
+`.env`, a later line for the same name wins, as in a shell.
 
 ## VL Config
 

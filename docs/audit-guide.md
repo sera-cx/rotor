@@ -249,7 +249,8 @@ VL behavior:
 - Local budget checks count spend the way Sera locks it: a VL batch counts as
   its largest leg (siblings share one budget and only one can fill at a time),
   each standalone order counts in full, and batches and standalone orders on one
-  token add up. A tick is rejected when that exceeds the token's budget.
+  token add up. Placements that would take a token over its budget (possible
+  only when its orders span several batches) are left out, and the tick goes on.
 - Before that check, any single order that would spend more than its token's
   budget, or than the vault holds of that token (from one `GET /balances` per
   tick), is trimmed to fit (size rounded down), or dropped if trimming takes it
@@ -264,8 +265,9 @@ VL behavior:
 Autonomous updates:
 
 - `--auto-update` is disabled by default.
-- The updater only runs `git pull --ff-only` (plus read-only `rev-parse` and
-  `status`).
+- The updater only runs `git fetch`, `git merge --ff-only @{u}` (plus
+  read-only `rev-parse`, `status`, and `diff`), and refuses an update that adds
+  a path already present as a local file, since Git overwrites ignored files.
 - Changed tracked files, detached branches, non-Git directories, and pull
   failures skip the update without stopping the loop, logged as warnings and
   alerted with `--telegram`. Untracked files do not block a pull.

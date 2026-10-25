@@ -23,7 +23,6 @@ from rotor.mm.positions import Position
 from rotor.mm.vl_config import PairConfig
 from rotor.mm.vl_runner import (
     _place_groups,
-    _validate_budget_caps,
     _without_self_cross,
     group_intents,
 )
@@ -46,15 +45,6 @@ def test_group_intents_uses_vl_for_multi_leg_groups():
     assert [i.market for i in groups[0][1]] == ["XSGD/USDC", "EURC/USDC"]
     assert groups[1][0] == "XSGD"
     assert groups[1][2] is False
-
-
-def test_validate_budget_caps_rejects_oversized_budgeted_intent():
-    cfg = vl_config(budget="50")
-
-    with pytest.raises(ValueError, match="above configured budget"):
-        _validate_budget_caps([
-            ("USDC", [intent("XSGD/USDC", "bid", "USDC", price="1.10", qty="100")], False)
-        ], cfg)
 
 
 def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
@@ -848,3 +838,37 @@ def test_a_pair_with_no_mid_anywhere_is_skipped():
 
     with pytest.raises(vr.ReferenceUnavailable, match="ecb failed; Wise's mid failed too"):
         vr._pair_mid(runtime, now=NOW, refs=None)
+
+
+class _RisingWise(_Wise):
+    """Wise's rate ticks up 5 bp after every bid it prices."""
+
+    def sell_rate(self, base, quote, qty_base):
+        obs = super().sell_rate(base, quote, qty_base)
+        self.live *= Decimal("1.0005")
+        return obs
+
+
+def test_a_bid_trimmed_to_its_budget_still_fits_after_wise_reprices_it():
+    # Sized to 1,100 SGD against a 1,000 USDC budget: trimmed on the first
+    # price, then priced again at its new size, by when Wise's rate has risen.
+    runtime = replace(
+        _runtime(), oracles=[_Oracle("1.0000")], settlement=_RisingWise(),
+        config=replace(_runtime().config, qty_base=Decimal("1100")))
+
+    out = vr._intents_for_runtime(
+        runtime, vl_config(), None, expiration=int(NOW) + 600, log=LOG, now=NOW,
+        budgets=BUDGETS, funds=None)
+
+    bid = next(i for i in out if i.side == "bid")
+    assert bid.qty_base * bid.price <= BUDGETS["USDC"]
+
+
+def test_dust_below_the_market_minimum_is_dropped_without_a_warning(caplog):
+    # A fill left 4.2 XSGD; the market's minimum ask is 10.
+    ask = intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="1000")
+
+    out = vr._within_limits([ask], market(min_ask="10"), {}, {"XSGD": Decimal("4.2")}, LOG)
+
+    assert out == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

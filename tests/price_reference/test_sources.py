@@ -188,6 +188,41 @@ def test_wise_reuses_a_recent_reply_and_falls_back_to_it_when_a_request_fails(mo
         wise.sell_rate("SGD", "USD", Decimal("2000"))  # nothing to fall back on
 
 
+def test_wise_not_answering_costs_one_timeout_a_minute_not_one_per_request(monkeypatch):
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr("rotor.price_reference.sources.time.time", lambda: clock["now"])
+    calls = {"n": 0, "hang": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["hang"]:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
+
+    wise = wise_source(handler)
+    for amount in ("1000", "2000", "3000"):
+        with pytest.raises(httpx.ReadTimeout):
+            wise.sell_rate("SGD", "USD", Decimal(amount))
+    assert calls["n"] == 1
+
+    clock["now"] += 61
+    calls["hang"] = False
+    assert wise.sell_rate("SGD", "USD", Decimal("1000")).rate == Decimal("0.777")
+    assert calls["n"] == 2
+
+
+def test_a_wise_token_with_a_line_break_is_refused_by_name_never_echoed(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not be sent")
+
+    monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
+    monkeypatch.setenv("WISE_API_TOKEN", "secret-part\nmore-secret")
+
+    with pytest.raises(ValueError, match="WISE_API_TOKEN contains whitespace") as raised:
+        wise_source(handler).sell_rate("SGD", "USD", Decimal("1000"))
+    assert "secret" not in str(raised.value)
+
+
 def test_ecb_source_crosses_rates_through_eur():
     src = ecb_source("2026-05-31")
 

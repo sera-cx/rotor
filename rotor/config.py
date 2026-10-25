@@ -85,8 +85,14 @@ def _dotenv_paths() -> list[Path]:
 
 
 def _load_dotenv_file(path: Path) -> None:
-    """Parse a small KEY=VALUE `.env` file; the first file to set a key wins."""
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    """Parse a small KEY=VALUE `.env` file.
+
+    Within a file the last line for a key wins, as in a shell; across files the
+    first file to set a key wins (the working directory's before the package's).
+    """
+    values: dict[str, str] = {}
+    # utf-8-sig drops a byte-order mark, which would otherwise hide the first key.
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -99,7 +105,9 @@ def _load_dotenv_file(path: Path) -> None:
             # typo'd key is not silently dropped into the call-site default.
             _log.warning("ignoring malformed .env line in %s (invalid key)", path.name)
             continue
-        _DOTENV.setdefault(key, _parse_dotenv_value(value.strip()))
+        values[key] = _parse_dotenv_value(value.strip())
+    for key, value in values.items():
+        _DOTENV.setdefault(key, value)
 
 
 def _valid_env_key(key: str) -> bool:

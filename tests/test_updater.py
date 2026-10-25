@@ -109,6 +109,28 @@ def test_untracked_operator_files_do_not_block_an_update(tmp_path):
     assert (deploy / "rotor" / "vl.config.toml").read_text() == 'fixed_bps = "50"\n'
 
 
+def test_an_update_that_adds_an_operators_ignored_file_is_refused(tmp_path):
+    # Git overwrites an ignored file without asking: the operator's config must
+    # not silently become the maintainer's.
+    upstream, deploy = _deployment(tmp_path)
+    (upstream / ".gitignore").write_text("rotor/vl.config.toml\n")
+    _git(upstream, "add", ".gitignore")
+    _git(upstream, "commit", "-q", "-m", "ignore the config")
+    assert pull_latest(repo_path=deploy).status == "updated"
+    (upstream / "rotor").mkdir()
+    (upstream / "rotor" / "vl.config.toml").write_text('fixed_bps = "999"\n')
+    _git(upstream, "add", "-f", "rotor/vl.config.toml")
+    _git(upstream, "commit", "-q", "-m", "track a config")
+    before = _git(deploy, "rev-parse", "HEAD")
+
+    result = pull_latest(repo_path=deploy)
+
+    assert result.status == "skipped"
+    assert "rotor/vl.config.toml" in result.message
+    assert (deploy / "rotor" / "vl.config.toml").read_text() == 'fixed_bps = "50"\n'
+    assert _git(deploy, "rev-parse", "HEAD") == before
+
+
 def test_a_changed_tracked_file_still_blocks_an_update(tmp_path):
     _upstream, deploy = _deployment(tmp_path)
     (deploy / "README.md").write_text("edited by hand\n")

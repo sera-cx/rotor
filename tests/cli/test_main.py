@@ -48,13 +48,16 @@ def test_vl_flags_pass_to_the_runner(monkeypatch, flags, changed):
     assert {key: captured[key] for key in _DEFAULTS} == {**_DEFAULTS, **changed}
 
 
-def test_live_vl_requires_wallet_unlock(monkeypatch, capsys):
+def test_live_vl_requires_wallet_unlock(monkeypatch, tmp_path, caplog):
+    # Unlocking is rotor's first startup step, so a missing key is a failed
+    # start: logged, and alerted with --telegram.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(wallet_key, "_account", None)
     monkeypatch.delenv("SERA_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
 
     assert cli.main(["mm", "vl", "--config", "vl.toml"]) == 1
-    assert "no SERA_PRIVATE_KEY" in capsys.readouterr().err
+    assert "startup failed: no SERA_PRIVATE_KEY" in caplog.text
 
 
 _GOOD_CONFIG = """fixed_bps = "50"
@@ -77,7 +80,7 @@ def test_check_config_loads_the_runner_and_config_without_the_wallet(
     def no_wallet():
         raise AssertionError("--check-config must not unlock the wallet")
 
-    monkeypatch.setattr(cli, "_unlock_wallet", no_wallet)
+    monkeypatch.setattr(wallet_key, "unlock", no_wallet)
     good = tmp_path / "good.toml"
     good.write_text(_GOOD_CONFIG)
     bad = tmp_path / "bad.toml"
@@ -89,7 +92,8 @@ def test_check_config_loads_the_runner_and_config_without_the_wallet(
     assert "'mas' was removed" in capsys.readouterr().err
 
 
-def test_an_unexpected_unlock_failure_prints_only_its_type(monkeypatch, capsys):
+def test_an_unexpected_unlock_failure_reports_only_its_type(monkeypatch, tmp_path, caplog):
+    monkeypatch.chdir(tmp_path)
     secret = "0x" + "ab" * 32
 
     def unlock():
@@ -98,9 +102,8 @@ def test_an_unexpected_unlock_failure_prints_only_its_type(monkeypatch, capsys):
     monkeypatch.setattr(wallet_key, "unlock", unlock)
 
     assert cli.main(["mm", "vl", "--config", "vl.toml"]) == 1
-    err = capsys.readouterr().err
-    assert "could not unlock the wallet (RuntimeError)" in err
-    assert secret not in err
+    assert "could not unlock the wallet (RuntimeError)" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_a_leftover_secret_file_stops_rotor_with_a_reason(monkeypatch, tmp_path, capsys):

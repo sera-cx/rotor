@@ -147,7 +147,7 @@ def pull_latest(
     repo_path: str | Path | None = None,
     timeout_seconds: float = 120.0,
 ) -> GitUpdateResult:
-    """Run `git pull --ff-only` safely and report whether HEAD changed."""
+    """Fast-forward to the upstream branch safely and report whether HEAD changed."""
     repo = Path(repo_path) if repo_path is not None else default_repo_root()
     inside = _run_git(repo, ["rev-parse", "--is-inside-work-tree"], timeout_seconds)
     if inside.returncode != 0 or inside.stdout.strip() != "true":
@@ -158,8 +158,8 @@ def pull_latest(
         )
 
     # Only changed tracked files block a pull. Untracked files (the config,
-    # state, and .env that live in the checkout) cannot conflict with a
-    # fast-forward unless it adds the same path, which fails the pull safely.
+    # state, and .env that live in the checkout) are safe unless the update
+    # adds the same path, which is checked below.
     dirty = _run_git(repo, ["status", "--porcelain", "--untracked-files=no"], timeout_seconds)
     if dirty.returncode != 0:
         return GitUpdateResult(
@@ -196,11 +196,44 @@ def pull_latest(
         )
     before = before_result.stdout.strip()
 
-    pulled = _run_git(repo, ["pull", "--ff-only"], timeout_seconds)
+    fetched = _run_git(repo, ["fetch"], timeout_seconds)
+    if fetched.returncode != 0:
+        return GitUpdateResult(
+            status="failed",
+            message="git fetch failed",
+            before=before,
+            output=_combined_output(fetched),
+        )
+    # Git overwrites ignored files without asking, so an update that adds a
+    # path the operator keeps locally (the config, .env, the state file) would
+    # silently replace it. Such an update is refused, naming the path.
+    added = _run_git(
+        repo, ["diff", "--name-only", "--diff-filter=A", "HEAD", "@{u}"], timeout_seconds)
+    if added.returncode != 0:
+        return GitUpdateResult(
+            status="failed",
+            message="could not compare the checkout with its upstream branch",
+            before=before,
+            output=_combined_output(added),
+        )
+    local = [
+        path for path in added.stdout.splitlines()
+        if (repo / path).exists() or (repo / path).is_symlink()
+    ]
+    if local:
+        return GitUpdateResult(
+            status="skipped",
+            message=(
+                f"the update adds {', '.join(local)}, which this checkout already "
+                "has as a local file; move it aside (or rename it) to auto-update"
+            ),
+            before=before,
+        )
+    pulled = _run_git(repo, ["merge", "--ff-only", "@{u}"], timeout_seconds)
     if pulled.returncode != 0:
         return GitUpdateResult(
             status="failed",
-            message="git pull --ff-only failed",
+            message="git merge --ff-only failed",
             before=before,
             output=_combined_output(pulled),
         )

@@ -429,6 +429,8 @@ def _install_runner_hooks(
         stop.request()
 
     monkeypatch.setattr(vr, "build_client", build_client)
+    # The maker client carries its own key; run() must not look for SERA_PRIVATE_KEY.
+    monkeypatch.setattr(vr, "_unlock_wallet", lambda: None)
     monkeypatch.setattr(vr, "load_price_reference_source", lambda _name: source)
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
     monkeypatch.setattr(vr, "sleep_remaining", sleep_remaining)

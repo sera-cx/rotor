@@ -58,6 +58,7 @@ from rotor.price_reference import (
     market_to_iso_pair,
 )
 from rotor.price_reference.sources import WiseNoRoute, parse_ts
+from rotor.security import key as wallet_key
 from rotor.updater import (
     DEFAULT_UPDATE_INTERVAL_SECONDS,
     DailyGitUpdater,
@@ -203,8 +204,10 @@ class StaleAlertState:
     status: str
     # Published timestamp of the carried rate; None for "wise".
     published_ts: float | None
-    # When the operator was last told about this episode.
+    # When the operator was last told about this episode; 0 until they are.
     alerted_at: float
+    # When the episode began.
+    since: float = 0.0
 
 
 @dataclass
@@ -290,13 +293,16 @@ class StateStore:
             )
         """)
         self._db.execute("""
-            CREATE TABLE IF NOT EXISTS reference_alerts (
+            CREATE TABLE IF NOT EXISTS reference_episodes (
                 market TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 published_ts REAL,
-                alerted_at REAL NOT NULL
+                alerted_at REAL NOT NULL,
+                since REAL NOT NULL
             )
         """)
+        # Superseded by reference_episodes, which also keeps when each began.
+        self._db.execute("DROP TABLE IF EXISTS reference_alerts")
         self._db.commit()
 
     def claim(self, identity: dict[str, str]) -> None:
@@ -530,16 +536,16 @@ class StateStore:
     def replace_reference_alerts(self, episodes: dict[str, StaleAlertState]) -> None:
         """Replace open stale-reference alert episodes, pruning resolved ones."""
         rows = [
-            (market, episode.status, episode.published_ts, float(episode.alerted_at))
-            for market, episode in episodes.items()
+            (market, e.status, e.published_ts, float(e.alerted_at), float(e.since))
+            for market, e in episodes.items()
         ]
         with self._db:
-            self._db.execute("DELETE FROM reference_alerts")
+            self._db.execute("DELETE FROM reference_episodes")
             self._db.executemany(
                 """
-                INSERT OR REPLACE INTO reference_alerts (
-                    market, status, published_ts, alerted_at
-                ) VALUES (?, ?, ?, ?)
+                INSERT INTO reference_episodes (
+                    market, status, published_ts, alerted_at, since
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -568,10 +574,11 @@ class StateStore:
                 status=status,
                 published_ts=None if published_ts is None else float(published_ts),
                 alerted_at=float(alerted_at),
+                since=float(since),
             )
-            for market, status, published_ts, alerted_at in self._db.execute(
-                "SELECT market, status, published_ts, alerted_at "
-                "FROM reference_alerts ORDER BY market"
+            for market, status, published_ts, alerted_at, since in self._db.execute(
+                "SELECT market, status, published_ts, alerted_at, since "
+                "FROM reference_episodes ORDER BY market"
             )
         }
 
@@ -713,7 +720,9 @@ class StaleReferenceAlerts:
     whose source is unavailable altogether, and so uses Wise's mid, is announced
     once too. Episodes live in the state store so fire-once runs do not
     re-announce the same weekend every run. Every message also reaches the
-    log, with or without --telegram.
+    log, with or without --telegram. The switch to Wise's mid is announced only
+    once it has lasted `fallback_window`, so a source that fails now and then
+    does not alert on every tick it fails.
     """
 
     def __init__(
@@ -722,6 +731,7 @@ class StaleReferenceAlerts:
         *,
         state: StateStore | None = None,
         reminder_seconds: float = STALE_REMINDER_SECONDS,
+        fallback_window: float = NOT_QUOTING_ALERT_SECONDS,
     ) -> None:
         # Each pair's carry limit, so a warning can say how long it may last.
         self._carry_limit = {
@@ -729,6 +739,7 @@ class StaleReferenceAlerts:
         }
         self._state = state
         self.reminder_seconds = reminder_seconds
+        self.fallback_window = fallback_window
         loaded = {} if state is None else state.load_reference_alerts()
         # Drop episodes for markets that are no longer configured.
         self._episodes = {
@@ -755,7 +766,10 @@ class StaleReferenceAlerts:
         for market, reason in sorted(refs.fallback.items(), key=lambda item: item[0]):
             episode = self._episodes.get(market)
             if episode is None or episode.status != "wise":
-                self._episodes[market] = StaleAlertState("wise", None, now)
+                episode = self._episodes[market] = StaleAlertState("wise", None, 0.0, now)
+                changed = True
+            if not episode.alerted_at and now - episode.since >= self.fallback_window:
+                episode.alerted_at = now
                 switched.append(f"{market}: {_first_line(reason)}")
                 changed = True
         for market, ref in sorted(refs.quoted.items(), key=lambda item: item[0]):
@@ -766,14 +780,15 @@ class StaleReferenceAlerts:
             episode = self._episodes.get(market)
             if not ref.stale:
                 if episode is not None:
-                    # A fresh rate closes the episode.
+                    # A fresh rate closes the episode, quietly if it was never told.
                     del self._episodes[market]
-                    recovered.append(f"{market}: {ref.source} rate {_rate_date(ref.ts)}")
+                    if episode.alerted_at:
+                        recovered.append(f"{market}: {ref.source} rate {_rate_date(ref.ts)}")
                     changed = True
                 continue
             line = self._carry_line(market, ref)
             if episode is None or episode.status != "carrying":
-                self._episodes[market] = StaleAlertState("carrying", ref.ts, now)
+                self._episodes[market] = StaleAlertState("carrying", ref.ts, now, now)
                 started.append(line)
                 changed = True
             elif now - episode.alerted_at >= self.reminder_seconds:
@@ -1184,19 +1199,12 @@ def run(
             # legs goes through VL, otherwise each leg is placed standalone.
             groups = group_intents(intents, client.vl_batch_min, client.vl_batch_max)
 
-            # Phase 4: reject the whole tick if any budgeted token could spend
-            # more than its configured budget, counted the way Sera locks it (a
-            # local guard; Sera's shared vl_group budget is the authoritative cap).
-            # Each order is already trimmed to its budget, so this only trips
-            # when one token's orders are split across batches (over 50 pairs).
-            try:
-                _validate_budget_caps(groups, config)
-            except Exception as exc:
-                log.warning("skip tick: %s", exc)
-                if once:
-                    return 1
-                sleep_remaining(tick_started, poll_seconds, stop)
-                continue
+            # Phase 4: leave out placements that would take a budgeted token
+            # over its budget, counted the way Sera locks it (a local guard;
+            # Sera's shared vl_group budget is the authoritative cap). Each
+            # order is already trimmed to its budget, so this only bites when
+            # one token's orders are split across batches (over 50 pairs).
+            groups, over_budget = _fit_budget_caps(groups, config, log)
             _log_groups(groups, log, dry_run=dry_run)
 
             if dry_run:
@@ -1248,10 +1256,24 @@ def run(
                 # would only leave orders Sera will not let us cancel yet.
                 break
 
+            # A tick that ran long (a hanging source, a slow cancel) would place
+            # orders with almost no life left, which Sera sweeps within 60 s of
+            # expiry; skip it, and the next tick signs fresh ones.
+            elapsed = time.time() - tick_started
+            if elapsed > order_ttl_seconds - MIN_ORDER_TTL_SECONDS:
+                log.warning(
+                    "skip tick: it ran %.0fs, leaving its orders under %ds to live",
+                    elapsed, MIN_ORDER_TTL_SECONDS,
+                )
+                if once:
+                    return 1
+                sleep_remaining(tick_started, poll_seconds, stop)
+                continue
+
             # Phase 7: place exactly the fresh quote set. Every order is recorded
             # for settlement before it is sent; an order or VL batch Sera rejects
             # is skipped and the rest still go out.
-            issues = PlacementIssues()
+            issues = PlacementIssues(refused=over_budget)
             placed = _place_groups(client, groups, log, state=state, issues=issues)
             for market in sorted(issues.inactive):
                 log.error("%s is not active on Sera; not quoting it until the next refresh", market)
@@ -1410,7 +1432,10 @@ def _start(
     carry_stale: bool,
     log: logging.Logger,
 ) -> tuple[VLConfig, SeraClient, list[PairRuntime], dict[str, str]]:
-    """One startup attempt: load the config, bootstrap Sera, and build the pairs."""
+    """One startup attempt: unlock the wallet, load the config, bootstrap Sera,
+    and build the pairs."""
+    if not dry_run:
+        _unlock_wallet()
     config = load_vl_config(config_path)
     # Construction rejects a non-TLS base URL; bootstrap loads the signing
     # domain, VL batch limits, executor id, and markets.
@@ -1432,6 +1457,19 @@ def _start(
             client.close()
         raise
     return config, client, runtimes, skipped
+
+
+def _unlock_wallet() -> None:
+    """Unlock the maker wallet; a failure names the problem, never the key."""
+    try:
+        wallet_key.unlock()
+    except wallet_key.WalletNotInitialized as exc:
+        raise RuntimeError(str(exc)) from None
+    except wallet_key.InvalidPrivateKey:
+        raise RuntimeError("invalid SERA_PRIVATE_KEY") from None
+    except Exception as exc:
+        # Its message or traceback could carry the key: name the type only.
+        raise RuntimeError(f"could not unlock the wallet ({type(exc).__name__})") from None
 
 
 def _is_temporary(exc: Exception) -> bool:
@@ -1627,35 +1665,46 @@ def _unlisted_reason(market: str, markets_by_symbol: dict) -> str:
     return "Sera does not list this market"
 
 
-def _validate_budget_caps(
+def _fit_budget_caps(
     groups: list[tuple[str, list[OrderIntent], bool]],
     config: VLConfig,
-) -> None:
-    """Reject when a budgeted token's placements could spend more than its budget.
+    log: logging.Logger,
+) -> tuple[list[tuple[str, list[OrderIntent], bool]], dict[str, Exception]]:
+    """Leave out placements that would take a budgeted token over its budget.
 
     Spend is counted the way Sera locks it. A VL batch's legs share one budget
     and only one can fill at a time, so Sera freezes just its largest leg; the
     batch counts as that leg. Each standalone order counts in full, and several
-    batches or standalone orders on one token add up.
+    batches or standalone orders on one token add up. Placements are kept in
+    order while they fit. Returns the kept groups and, for each market that
+    lost an order, why.
     """
     budgets = {budget.token: budget.amount for budget in config.budgets}
-    spend_by_token: dict[str, Decimal] = {}
+    spent: dict[str, Decimal] = {}
+    kept_groups: list[tuple[str, list[OrderIntent], bool]] = []
+    left_out: dict[str, Exception] = {}
     for spent_token, intents, use_vl in groups:
-        if spent_token not in budgets:
-            # An unbudgeted token has no cap to check.
+        budget = budgets.get(spent_token)
+        if budget is None:
+            kept_groups.append((spent_token, intents, use_vl))
             continue
-        spends = [_intent_spend_amount(intent) for intent in intents]
-        group_spend = max(spends) if use_vl else sum(spends, Decimal("0"))
-        spend_by_token[spent_token] = (
-            spend_by_token.get(spent_token, Decimal("0")) + group_spend
-        )
-    for token, spend in spend_by_token.items():
-        budget = budgets[token]
-        if spend > budget:
-            raise ValueError(
-                f"{token} orders could spend {fmt(spend)}, "
-                f"above configured budget {fmt(budget)}"
-            )
+        kept: list[OrderIntent] = []
+        for unit in [intents] if use_vl else [[intent] for intent in intents]:
+            spend = max(_intent_spend_amount(intent) for intent in unit)
+            if spent.get(spent_token, Decimal("0")) + spend > budget:
+                for intent in unit:
+                    left_out.setdefault(intent.market, RuntimeError(
+                        f"its {spent_token} order would take {spent_token} over its "
+                        f"budget of {fmt(budget)} (more orders than one VL batch holds)"))
+                continue
+            spent[spent_token] = spent.get(spent_token, Decimal("0")) + spend
+            kept.extend(unit)
+        if kept:
+            kept_groups.append((spent_token, kept, use_vl))
+    if left_out:
+        log.warning(
+            "left out orders on %s: they would go over a budget", ", ".join(sorted(left_out)))
+    return kept_groups, left_out
 
 
 def _intent_spend_amount(intent: OrderIntent) -> Decimal:
@@ -1754,6 +1803,9 @@ def _intents_for_runtime(
     # Sizes are final now; Wise's fees fall with size, so price them again
     # (a reply for an unchanged size is reused, not re-requested).
     intents = _at_wise_prices(intents, runtime, ref, now=now, log=log, refs=refs)
+    # The new price can raise a trimmed bid's spend a hair over its cap; trim
+    # it again at that price (a smaller size only lowers Wise's bid).
+    intents = _within_limits(intents, runtime.info, budgets, funds, log)
     intents = _without_self_cross(intents, log)
     if refs is not None:
         refs.quoted[runtime.config.market] = ref
@@ -1917,7 +1969,10 @@ def _within_limits(
         try:
             validate_minimums(info, intent.side, qty, intent.price)
         except ValueError as exc:
-            log.warning(
+            # A balance below the market minimum (dust left by a fill) lasts
+            # until the next fill, so it is not worth a warning every tick.
+            log.log(
+                logging.DEBUG if source == "balance" else logging.WARNING,
                 "%s %s dropped: trimmed to its %s %s it is too small (%s)",
                 intent.market, intent.side, intent.spent_token, source, exc,
             )

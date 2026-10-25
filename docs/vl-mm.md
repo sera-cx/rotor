@@ -382,10 +382,12 @@ poetry run rotor mm vl \
   --auto-update
 ```
 
-Rotor checks the checkout on the first tick and then once per day. It runs
-`git pull --ff-only` only on a branch with no changed tracked files; untracked
-files (your config, state files, `.env`) do not block it. A skipped or failed
-check is logged as a warning and, with `--telegram`, sent as an important alert.
+Rotor checks the checkout on the first tick and then once per day. It fetches
+and fast-forwards only on a branch with no changed tracked files; untracked
+files (your config, state files, `.env`) do not block it. Git would overwrite an
+ignored file without asking, so an update that adds a path you already have as
+a local file is skipped, naming the path. A skipped or failed check is logged
+as a warning and, with `--telegram`, sent as an important alert.
 
 Before restarting into new code, Rotor runs it once with the same command plus
 `--check-config`, which loads the runner and your config and touches no network,

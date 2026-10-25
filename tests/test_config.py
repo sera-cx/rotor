@@ -101,3 +101,21 @@ def test_a_comment_after_a_quoted_value_is_dropped(monkeypatch, tmp_path, line, 
     (tmp_path / ".env").write_text(line + "\n", encoding="utf-8")
 
     assert get_config("KEY") == value
+
+
+def test_a_later_dotenv_line_wins_like_in_a_shell_and_a_bom_is_ignored(monkeypatch, tmp_path):
+    # An operator appends their own URL under the template's; `source .env`
+    # would use the appended one, so rotor must too.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SERA_BASE_URL", raising=False)
+    monkeypatch.delenv("ROTOR_FIRST_KEY", raising=False)
+    monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
+    (tmp_path / ".env").write_text(
+        "ROTOR_FIRST_KEY=kept\n"
+        "SERA_BASE_URL=https://api.sera.cx/api/v1\n"
+        "SERA_BASE_URL=https://testnet.sera.cx/api/v1\n",
+        encoding="utf-8-sig",
+    )
+
+    assert get_config("SERA_BASE_URL") == "https://testnet.sera.cx/api/v1"
+    assert get_config("ROTOR_FIRST_KEY") == "kept"

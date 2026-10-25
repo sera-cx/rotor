@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -359,6 +360,7 @@ def _wire_runner(
         source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
     monkeypatch.setattr(vr, "load_vl_config", lambda _path: config)
     monkeypatch.setattr(vr, "build_client", lambda **_kwargs: client)
+    monkeypatch.setattr(vr, "_unlock_wallet", lambda: None)
     monkeypatch.setattr(vr, "load_price_reference_source", lambda _name: source)
     monkeypatch.setattr(vr, "load_token_to_iso", lambda: {
         "XSGD": "SGD",
@@ -1519,15 +1521,21 @@ def test_run_with_halt_on_stale_reference_quotes_on_wises_mid_not_weekend_rates(
     source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
     _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    clock = _frozen_clock(monkeypatch, T0)
 
-    result = vr.run(config_path="unused.toml", once=True, telegram=True,
-                    halt_on_stale_reference=True, state_path=tmp_path / "state.sqlite")
+    def fire() -> int:
+        result = vr.run(config_path="unused.toml", once=True, telegram=True,
+                        halt_on_stale_reference=True, state_path=tmp_path / "state.sqlite")
+        clock["now"] += 305.0
+        return result
 
     # No quote rests on a weekend rate: the stale mids are replaced by Wise's
-    # live mid (quotes are at Wise's prices either way), with one alert.
-    assert result == 0
+    # live mid (quotes are at Wise's prices either way), with one alert once
+    # that has lasted 15 minutes (the fourth fire, 915 s in).
+    assert [fire() for _ in range(3)] == [0, 0, 0]
     assert client.batch_places != []
+    assert not notifier.containing("use Wise's mid-market rate instead")
+    assert [fire(), fire()] == [0, 0]
     assert not notifier.containing("not updating")
     assert len(notifier.containing("use Wise's mid-market rate instead")) == 1
 
@@ -1604,12 +1612,14 @@ def test_a_rate_past_its_carry_limit_is_replaced_by_wises_mid_with_one_alert(
     source = _AgedSource(WEEKEND_RATES, age_s=9 * DAY)
     notifier = _RecordingNotifier()
     _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    clock = _frozen_clock(monkeypatch, T0)
 
     def fire() -> int:
-        return _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
+        result = _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
+        clock["now"] += 305.0
+        return result
 
-    assert [fire(), fire()] == [0, 0]
+    assert [fire() for _ in range(5)] == [0] * 5
     assert len(notifier.containing("use Wise's mid-market rate instead")) == 1
     assert not notifier.containing("Stopped quoting")
     assert not notifier.containing("Not quoting these pairs")
@@ -1884,3 +1894,56 @@ def test_a_boot_leftover_is_cancelled_before_anything_new_is_placed(
     # On cooldown, tick 1 places nothing, so only tick 2's batch goes out.
     assert len(client.batch_places) == (1 if on_cooldown else 2)
 
+
+
+def test_a_bad_wallet_key_is_alerted_once_across_fires(monkeypatch, tmp_path):
+    clock = _frozen_clock(monkeypatch, T0)
+    client = _FakeClient()
+    notifier = _RecordingNotifier()
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
+
+    def bad_key():
+        raise vr.wallet_key.InvalidPrivateKey("0x" + "ab" * 31)
+
+    monkeypatch.setattr(vr.wallet_key, "unlock", bad_key)
+    monkeypatch.setattr(vr, "_unlock_wallet", _real_unlock_wallet)
+
+    for _ in range(3):
+        assert _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite") == 1
+        clock["now"] += 305.0
+
+    alerts = notifier.containing("rotor could not start")
+    assert [text for text, _ in alerts] == [
+        "error: rotor could not start: invalid SERA_PRIVATE_KEY"]
+    assert _boots(client) == 0
+
+
+_real_unlock_wallet = vr._unlock_wallet
+
+
+def test_a_source_that_fails_now_and_then_is_not_alerted_but_a_lasting_failure_is():
+    alerts = _stale_alerts()
+    notifier = _RecordingNotifier()
+    fresh = _refs(stale=False, age_s=60.0, ts=FRIDAY)
+
+    def fell_back() -> vr.TickReferences:
+        refs = _refs(stale=False, age_s=0.0, ts=FRIDAY)
+        refs.quoted["XSGD/USDC"] = replace(refs.quoted["XSGD/USDC"], source="wise")
+        refs.fallback["XSGD/USDC"] = ReferenceUnavailable("bnm failed (ReadTimeout)")
+        return refs
+
+    # Failing every other tick for an hour: never a window in a row.
+    for tick in range(12):
+        alerts.update(fell_back() if tick % 2 else fresh, notifier=notifier, log=LOG,
+                      now=tick * 305.0)
+    assert notifier.messages == []
+    # Then down for good: one alert, 15 minutes in, and one when it is back.
+    for tick in range(12, 16):
+        alerts.update(fell_back(), notifier=notifier, log=LOG, now=tick * 305.0)
+    alerts.update(fresh, notifier=notifier, log=LOG, now=16 * 305.0)
+
+    assert [heading for heading, _ in _headings(notifier)] == [
+        "🟡 These pairs' reference rates are unavailable, so they use Wise's mid-market "
+        "rate instead (it bounds return orders; quotes are at Wise's prices either way):",
+        RECOVERED,
+    ]

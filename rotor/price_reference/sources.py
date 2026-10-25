@@ -133,6 +133,8 @@ class WiseRateSource(RateSource):
         self.token_env = token_env
         # (source, target, amount field, amount) -> (fetched at, reply)
         self._replies: dict[tuple[str, str, str, str], tuple[float, dict]] = {}
+        # When Wise last failed to answer at all, and how.
+        self._unreachable: tuple[float, Exception] | None = None
 
     def quote(
         self, base: str, quote: str, *, amount: Decimal | None = None
@@ -192,7 +194,9 @@ class WiseRateSource(RateSource):
 
         A reply fetched within REUSE_S is reused. If a request fails, the last
         reply for the same amount is returned instead; callers reject it once
-        its rate is older than the freshness window.
+        its rate is older than the freshness window. Once Wise fails to answer
+        at all (a hang, a refused connection), it is not asked again for
+        REUSE_S, so a tick waits out one timeout rather than one per request.
         """
         amount = _positive_decimal(amount)
         key = (source.upper(), target.upper(), amount_field, str(amount))
@@ -200,9 +204,17 @@ class WiseRateSource(RateSource):
         cached = self._replies.get(key)
         if cached is not None and now - cached[0] < self.REUSE_S:
             return cached[1]
+        if self._unreachable is not None and now - self._unreachable[0] < self.REUSE_S:
+            if cached is not None:
+                return cached[1]
+            raise self._unreachable[1]
         headers = {"Content-Type": "application/json"}
         # Wise answers anonymous quote requests too; a token only raises limits.
         token = str(get_config(self.token_env, "") or "").strip()
+        if any(char.isspace() or not char.isprintable() for char in token):
+            # An HTTP library error would quote the header, token and all.
+            raise ValueError(
+                f"{self.token_env} contains whitespace or a control character; check its value")
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
@@ -219,6 +231,8 @@ class WiseRateSource(RateSource):
             response.raise_for_status()
             body = response.json()
         except Exception as exc:
+            if isinstance(exc, httpx.TransportError):
+                self._unreachable = (now, exc)
             if cached is not None:
                 return cached[1]
             # Wise answers 422 for a route it does not offer.
@@ -231,6 +245,7 @@ class WiseRateSource(RateSource):
             k: v for k, v in self._replies.items() if now - v[0] <= self.default_max_age_s
         }
         self._replies[key] = (now, body)
+        self._unreachable = None
         return body
 
 

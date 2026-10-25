@@ -11,8 +11,6 @@ def cmd_mm_vl(args) -> int:
     """Run the TOML-driven multi-pair VL market-maker loop."""
     if args.check_config:
         return _check_config(args.config)
-    if not args.dry_run and not _unlock_wallet():
-        return 1
 
     # Import lazily so config-only CLI operations stay lightweight.
     from rotor.mm.vl_runner import run as run_vl_mm
@@ -45,31 +43,6 @@ def _check_config(config_path: str) -> int:
         return 1
     print("config ok")
     return 0
-
-
-def _unlock_wallet() -> bool:
-    """Unlock the configured maker wallet and report operator-friendly errors."""
-    # Import lazily to keep wallet dependencies out of parser construction.
-    from rotor.security import key
-
-    try:
-        # unlock() is idempotent, so repeated checks are safe.
-        key.unlock()
-        print(
-            f"wallet unlocked: address={key.wallet_address()}", file=sys.stderr)
-        return True
-    except key.WalletNotInitialized as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return False
-    except key.InvalidPrivateKey:
-        # Avoid printing the bad private key value.
-        print("error: invalid SERA_PRIVATE_KEY", file=sys.stderr)
-        return False
-    except Exception as exc:
-        # Anything else: name the error type only; its message or traceback
-        # could carry the key.
-        print(f"error: could not unlock the wallet ({type(exc).__name__})", file=sys.stderr)
-        return False
 
 
 def build_parser() -> argparse.ArgumentParser:
