@@ -944,7 +944,7 @@ def test_run_retries_every_minute_and_reminds_while_sera_stays_down(monkeypatch,
     assert _boots(client) == 421
     assert stop.waits[:420] == [60.0] * 420
     # The outage is alerted when it begins and again six hours in.
-    assert [text.split(": None")[0] for text, _ in notifier.containing("start")] == [
+    assert [text.split(": Service")[0] for text, _ in notifier.containing("start")] == [
         "error: rotor could not start; retrying every 60s",
         "error: rotor still cannot start after 6h 0m; retrying every 60s",
         "✅ rotor started after failing to start for 7h 0m",
@@ -1030,7 +1030,7 @@ def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkey
     assert client.inactive_rejections == ["XSGD/USDC", "XSGD/USDC"]
     assert [text for text, _ in notifier.containing("XSGD/USDC")] == [
         "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
-        "XSGD/USDC for 15m: None: Pair XSGD/USDC is not an active trading pair. "
+        "XSGD/USDC for 15m: Pair XSGD/USDC is not an active trading pair. "
         "See GET /markets for available pairs. (HTTP 400)",
         "✅ Quoting again:\nXSGD/USDC after 55m",
     ]

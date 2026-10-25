@@ -868,3 +868,10 @@ def test_nothing_is_signed_before_bootstrap():
 
     with pytest.raises((RuntimeError, KeyError), match="bootstrap"):
         client.sign_order("MYRC/USDC", "bid", Decimal("1"), Decimal("0.25"), 999)
+
+
+def test_an_error_without_a_code_reads_as_seras_message_alone():
+    assert str(errors_mod.SeraError(None, "Rate limit exceeded", 429)) == (
+        "Rate limit exceeded (HTTP 429)")
+    assert str(errors_mod.SeraError("PAIR_INACTIVE", "Invalid request", 400)) == (
+        "PAIR_INACTIVE: Invalid request (HTTP 400)")

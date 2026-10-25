@@ -20,8 +20,10 @@ class SeraError(Exception):
         self.error_code = error_code or ""
         self.detail = detail
         self.status_code = status_code
-        # Exception text includes the Sera code and HTTP status for one-line logs.
-        super().__init__(f"{error_code}: {detail} (HTTP {status_code})")
+        # Exception text includes the Sera code (when there is one) and HTTP
+        # status for one-line logs and alerts.
+        prefix = f"{self.error_code}: " if self.error_code else ""
+        super().__init__(f"{prefix}{detail} (HTTP {status_code})")
 
 
 class SeraCancelCooldown(SeraError):
