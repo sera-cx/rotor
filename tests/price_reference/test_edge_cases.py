@@ -46,28 +46,14 @@ def test_load_token_to_iso_uppercases_json_overrides(monkeypatch):
     assert load_token_to_iso() == {"XPHP": "PHP"}
 
 
-def test_an_empty_fed_series_setting_means_the_built_in_series(monkeypatch):
-    from rotor import config as config_module
-    from rotor.price_reference.sources import FedH10RateSource
-
-    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
-    monkeypatch.setattr(config_module, "_DOTENV", {})
-    monkeypatch.setenv("FED_H10_SERIES_JSON", "{}")
-
-    src = load_price_reference_source("fed")
-
-    assert src.series_by_currency == {
-        currency.upper(): series for currency, series in FedH10RateSource.DEFAULT_SERIES.items()}
-
-
 def test_load_price_reference_source_rejects_unknown_source():
-    with pytest.raises(ValueError, match="wise, ecb, fed, bnm"):
+    with pytest.raises(ValueError, match="wise, ecb, bnm"):
         load_price_reference_source("manual")
 
 
-@pytest.mark.parametrize("name", ["wise", "ecb", "fed", "bnm"])
+@pytest.mark.parametrize("name", ["wise", "ecb", "bnm"])
 def test_load_price_reference_source_accepts_supported_sources(name):
-    assert load_price_reference_source(name).name in {name, "fed"}
+    assert load_price_reference_source(name).name == name
 
 
 def test_wise_source_rejects_response_without_enabled_options():
@@ -237,30 +223,9 @@ def test_a_bnm_reply_without_dates_is_a_failed_read_not_a_fresh_rate():
         src.quote("SGD", "USD")
 
 
-def test_a_fred_error_never_carries_the_api_key():
-    import traceback
-
-    from rotor.price_reference.sources import FedH10RateSource
-
-    secret = "fredkey0123456789abcdef01234567"
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error_message": "boom"})
-
-    src = FedH10RateSource(
-        api_key=secret, http=httpx.Client(transport=httpx.MockTransport(handler)))
-
-    with pytest.raises(RuntimeError) as raised:
-        src.quote("SGD", "USD")
-
-    printed = "".join(traceback.format_exception(raised.value))
-    assert secret not in printed
-    assert "<FRED_API_KEY>" in printed and "HTTPStatusError" in printed
-
-
 @pytest.mark.parametrize(("name", "source"), [
     ("WISE_BASE_URL", "wise"), ("ECB_RATES_URL", "ecb"),
-    ("FRED_API_BASE_URL", "fed"), ("BNM_EXCHANGE_RATE_BASE_URL", "bnm"),
+    ("BNM_EXCHANGE_RATE_BASE_URL", "bnm"),
 ])
 def test_price_sources_refuse_plain_http_urls(monkeypatch, name, source):
     # The Wise token and every price travel on these URLs.

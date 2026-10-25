@@ -8,11 +8,11 @@ Files:
 - `__init__.py`: re-exports the oracle, its errors, the config loaders, and the
   symbol helpers the runner uses.
 - `aggregator.py`: freshness-checking `ReferencePriceOracle` wrapper.
-- `config.py`: config-driven factory for `wise`, `ecb`, `fed`, and `bnm`
-  sources plus optional token-to-ISO overrides.
+- `config.py`: config-driven factory for `wise`, `ecb`, and `bnm` sources plus
+  optional token-to-ISO overrides.
 - `models.py`: dataclasses for raw source observations and quote-safe reference
   prices.
-- `sources.py`: Wise, ECB, Fed H.10, and BNM source adapters.
+- `sources.py`: Wise, ECB, and BNM source adapters.
 - `symbols.py`: Sera token symbol to ISO currency mapping.
 
 Available sources:
@@ -30,15 +30,6 @@ Available sources:
   for 60 seconds, and on a failed request the last reply comes back for the
   caller's freshness check.
 - `ecb`: ECB daily euro reference rates, crossed through EUR. Keyless. Pure mid.
-- `fed`: Federal Reserve H.10 rates via the official FRED API
-  (`api.stlouisfed.org/fred/series/observations`), crossed through USD. Needs a
-  free `FRED_API_KEY` (the legacy `fredgraph.csv` scrape endpoint is fronted by
-  Akamai Bot Manager and unreliable from servers). Built-in series cover AUD,
-  BRL, CAD, CHF, EUR, GBP, JPY, MXN, MYR, NZD, SGD, and ZAR. Which way a series
-  quotes is read from its FRED id: `DEXUS<cc>` is U.S. dollars per unit (AUD,
-  EUR, GBP, NZD in the H.10 release) and `DEX<cc>US` is units per U.S. dollar;
-  a series named neither way is rejected at startup. `FED_H10_SERIES_JSON`
-  replaces the built-in list.
 - `bnm`: Bank Negara Malaysia OpenAPI FX rates, crossed through MYR. Keyless.
   `ecb` and `bnm` each publish one list of every currency; it is fetched at
   most once a minute (`DAILY_REUSE_S`) and shared by all pairs, and a failed

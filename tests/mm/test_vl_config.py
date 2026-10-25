@@ -61,10 +61,10 @@ def test_parse_vl_config_normalizes_market_names():
 def test_price_source_is_one_name_or_a_list_in_priority_order():
     cfg = parse_vl_config(_config(pair=[
         {"market": "XSGD/USDC", "price_source": "ECB", "qty_base": "100"},
-        {"market": "EURC/USDC", "price_source": ["fed", "ecb", "bnm"], "qty_base": "100"},
+        {"market": "EURC/USDC", "price_source": ["bnm", "ecb"], "qty_base": "100"},
     ]))
 
-    assert [pair.price_sources for pair in cfg.pairs] == [("ecb",), ("fed", "ecb", "bnm")]
+    assert [pair.price_sources for pair in cfg.pairs] == [("ecb",), ("bnm", "ecb")]
 
 
 def _pair(**fields):
@@ -80,6 +80,8 @@ def _pair(**fields):
                  id="unknown-source"),
     pytest.param({"pair": [_pair(price_source="mas")]}, "'mas' was removed .* use 'ecb' or 'bnm'",
                  id="mas-removed"),
+    pytest.param({"pair": [_pair(price_source=["ecb", "fed"])]},
+                 "'fed' was removed .* weekly, not daily", id="fed-removed"),
     pytest.param({"budget": [{"token": "USDC", "amount": "0"}]}, "budget USDC amount must be > 0",
                  id="budget-zero"),
     pytest.param({"budget": [{"token": "USDC", "amount": "1"}, {"token": "usdc", "amount": "2"}]},

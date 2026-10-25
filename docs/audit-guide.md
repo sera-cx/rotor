@@ -46,7 +46,7 @@ Pricing:
 - The source rate is quote-per-base and is the pair's mid: the first fresh rate
   among the pair's `price_sources`, in order (`_pair_mid`), then Wise's live mid
   if every rate is only carried, then the first carried rate, then Wise's mid
-  with an alert if every source failed. `ecb`/`fed`/`bnm`
+  with an alert if every source failed. `ecb`/`bnm`
   are published reference rates; `wise` is Wise's mid-market rate (from the
   buy-direction reply, inverted, when Wise cannot convert from the base).
 - Every normal order is priced at Wise's after-fee rate for its own final
@@ -66,7 +66,7 @@ Pricing:
 - Observation timestamps are the provider's published date, not fetch time, so a
   stale daily feed is detectable; a reply without a usable date is a failed
   read (never stamped "now"). Staleness windows are per-source (intraday for
-  `wise`, daily for `ecb`/`fed`/`bnm`), overridable via config/CLI.
+  `wise`, daily for `ecb`/`bnm`), overridable via config/CLI.
 - A stale daily reference is set aside for Wise's live mid when Wise answers
   (`TickReferences.covered`, no alert). Only when Wise has no mid is it carried
   forward, until its carry limit (default 7 days from the published date),
@@ -243,8 +243,8 @@ Sera signing and API:
   HTTP library would otherwise quote the rejected header, secret included).
 - An invalid `SERA_PRIVATE_KEY` raises without a chained cause (`from None`),
   since int()'s message would quote it; any other unlock failure prints only
-  its type. FRED takes its key in the URL, so FRED errors are re-raised with
-  the key replaced by `<FRED_API_KEY>`.
+  its type. A `WISE_API_TOKEN` with whitespace or a control character is
+  refused by name before any request could quote it.
 - API keys stay in headers; private keys, bearer tokens, signatures, and API
   secrets must not appear in logs.
 

@@ -12,7 +12,6 @@ from price_helpers import ecb_source, wise_source
 from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
-    FedH10RateSource,
     WiseNoRoute,
     parse_ts,
 )
@@ -231,75 +230,6 @@ def test_ecb_source_crosses_rates_through_eur():
     # EUR itself is seeded at 1, so it works on either side of a pair.
     assert src.quote("EUR", "USD").rate == Decimal("1.20")
     assert src.quote("SGD", "EUR").rate == Decimal("0.6666666666666666666666666667")
-
-
-def test_fed_h10_source_crosses_rates_through_usd():
-    # FRED API observations, newest first; the latest day may be unpublished (".").
-    payloads = {
-        "DEXSIUS": {"observations": [
-            {"date": "2026-06-03", "value": "."},
-            {"date": "2026-06-02", "value": "1.50"},
-        ]},
-        "DEXUSEU": {"observations": [
-            {"date": "2026-06-02", "value": "1.20"},
-        ]},
-    }
-    seen: dict[str, str] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        series = request.url.params["series_id"]
-        seen["api_key"] = request.url.params.get("api_key", "")
-        seen["file_type"] = request.url.params.get("file_type", "")
-        return httpx.Response(200, json=payloads[series])
-
-    src = FedH10RateSource(
-        api_key="test-key",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-    obs = src.quote("EUR", "SGD")
-
-    assert obs.rate == Decimal("1.800")
-    assert obs.pair == "EUR/SGD"
-    # The FRED API key and JSON format are sent on the request.
-    assert seen["api_key"] == "test-key"
-    assert seen["file_type"] == "json"
-
-
-def test_fed_h10_source_reads_each_series_the_way_it_quotes():
-    # The H.10 release quotes GBP, AUD, NZD and EUR as U.S. dollars per unit
-    # (DEXUS<cc>) and the rest as units per U.S. dollar (DEX<cc>US).
-    payloads = {
-        "DEXUSUK": "1.2700", "DEXUSAL": "0.6600", "DEXUSNZ": "0.6000",
-        "DEXJPUS": "150.00", "DEXSZUS": "0.8000",
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        value = payloads[request.url.params["series_id"]]
-        return httpx.Response(200, json={"observations": [{"date": "2026-06-02", "value": value}]})
-
-    src = FedH10RateSource(api_key="k", http=httpx.Client(transport=httpx.MockTransport(handler)))
-
-    def rate(base: str, quote: str) -> Decimal:
-        # Crossing through USD divides twice; compare to 20 places.
-        return round(src.quote(base, quote).rate, 20)
-
-    assert rate("GBP", "USD") == Decimal("1.27")
-    assert rate("AUD", "USD") == Decimal("0.66")
-    assert rate("NZD", "USD") == Decimal("0.6")
-    assert rate("JPY", "USD") == round(Decimal("1") / Decimal("150"), 20)
-    assert rate("GBP", "CHF") == Decimal("1.016")
-
-
-def test_fed_h10_source_rejects_a_series_it_cannot_orient():
-    with pytest.raises(ValueError, match="cannot tell which way FRED series 'GBPUSD' quotes"):
-        FedH10RateSource(series_by_currency={"GBP": "GBPUSD"})
-
-
-def test_fed_h10_source_requires_api_key():
-    src = FedH10RateSource()  # no api_key configured
-
-    with pytest.raises(ValueError, match="FRED_API_KEY"):
-        src.quote("SGD", "USD")
 
 
 def test_bnm_source_crosses_rates_through_myr_and_averages_when_middle_missing():

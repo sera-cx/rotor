@@ -10,7 +10,7 @@ from typing import Any
 
 from rotor.price_reference import parse_market_symbol
 
-PRICE_SOURCE_CHOICES = {"wise", "ecb", "fed", "bnm"}
+PRICE_SOURCE_CHOICES = {"wise", "ecb", "bnm"}
 # Spreads around the mid for a side Wise cannot price: on weekdays with a live
 # or fresh mid, and on FX weekends, carried rates and Wise outages.
 DEFAULT_FALLBACK_BPS = Decimal("50")
@@ -226,6 +226,12 @@ def _price_sources(value: Any, *, where: str) -> tuple[str, ...]:
             raise ValueError(
                 f"{where}: price_source 'mas' was removed (MAS publishes no public "
                 "daily rate API); use 'ecb' or 'bnm', which both publish SGD")
+        if name == "fed":
+            # FRED's H.10 series come out weekly, so a Fed rate is never fresh
+            # by the daily window, and every currency it had, ECB has too.
+            raise ValueError(
+                f"{where}: price_source 'fed' was removed (the Fed publishes its "
+                "rates weekly, not daily); use 'ecb', which covers every currency it had")
         if name not in PRICE_SOURCE_CHOICES:
             raise ValueError(f"{where}: unsupported price_source {name!r}")
         if name in out:

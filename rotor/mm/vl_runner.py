@@ -735,7 +735,7 @@ class QuotingAlerts:
 class StaleReferenceAlerts:
     """Tell the operator when pairs quote on reference rates that stopped updating.
 
-    Official daily FX sources (BNM, ECB, the Fed) publish nothing on
+    Official daily FX sources (BNM, ECB) publish nothing on
     weekends or public holidays, so the oracle carries their last rate forward.
     While Wise answers, its live mid is used instead and nothing is announced;
     a carried rate is quoted on only when Wise has no mid either. Each such

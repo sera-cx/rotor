@@ -8,7 +8,6 @@ from rotor.config import get_config, get_config_json, require_https
 from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
-    FedH10RateSource,
     RateSource,
     WiseRateSource,
 )
@@ -17,7 +16,6 @@ from rotor.price_reference.sources import (
 _SOURCES: dict[str, tuple[type[RateSource], str]] = {
     "wise": (WiseRateSource, "WISE_BASE_URL"),
     "ecb": (EcbRateSource, "ECB_RATES_URL"),
-    "fed": (FedH10RateSource, "FRED_API_BASE_URL"),
     "bnm": (BnmRateSource, "BNM_EXCHANGE_RATE_BASE_URL"),
 }
 
@@ -36,22 +34,17 @@ def load_price_reference_source(name: str) -> RateSource:
     source_name = str(name).lower()
     if source_name not in _SOURCES:
         # Keep accepted source names closed so misspellings fail loudly.
-        raise ValueError(f"price source {name!r} must be one of: wise, ecb, fed, bnm")
+        raise ValueError(f"price source {name!r} must be one of: wise, ecb, bnm")
     cls, url_setting = _SOURCES[source_name]
     url = _url(url_setting, cls.DEFAULT_URL)
     if cls is WiseRateSource:
         return WiseRateSource(url=url)
     prefix = source_name.upper()
-    kwargs = {
-        "url": url,
-        "max_age_s": _max_age_override(prefix),
-        "max_carry_age_s": _max_carry_age_override(prefix),
-    }
-    if cls is FedH10RateSource:
-        kwargs["api_key"] = str(get_config("FRED_API_KEY", "") or "")
-        # An empty or missing map means the built-in series.
-        kwargs["series_by_currency"] = get_config_json("FED_H10_SERIES_JSON", None) or None
-    return cls(**kwargs)
+    return cls(
+        url=url,
+        max_age_s=_max_age_override(prefix),
+        max_carry_age_s=_max_carry_age_override(prefix),
+    )
 
 
 def _max_age_override(prefix: str) -> float | None:

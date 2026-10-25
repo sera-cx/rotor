@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import re
 import time
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
@@ -16,7 +15,7 @@ from rotor.config import get_config
 from rotor.price_reference.models import PriceObservation
 
 # Default per-source staleness windows. Intraday providers (Wise) should be
-# rejected after minutes; daily-published official references (ECB/Fed/BNM)
+# rejected after minutes; daily-published official references (ECB/BNM)
 # legitimately carry the same rate across a business day plus weekends, so they
 # get a wider default. Both are overridable per source via config.
 INTRADAY_MAX_AGE_S = 600.0          # 10 minutes
@@ -293,133 +292,6 @@ class EcbRateSource(RateSource):
         return _parse_ecb_xml(response.text)
 
 
-class FedH10RateSource(RateSource):
-    """Federal Reserve H.10 FX rates via the official FRED API.
-
-    Uses the FRED ``series/observations`` JSON API at ``api.stlouisfed.org``,
-    which requires a free ``FRED_API_KEY``. The legacy ``fredgraph.csv`` graph
-    endpoint is fronted by Akamai Bot Manager and tarpits/resets headless
-    clients, so it is not used.
-
-    The adapter crosses through USD. Each series' id says which way it quotes,
-    following the H.10 release: ``DEXUS<cc>`` is U.S. dollars per currency unit
-    (the release's asterisked currencies: AUD, EUR, GBP, NZD) and ``DEX<cc>US``
-    is currency units per U.S. dollar (all others). A series named neither way
-    is rejected when the source is built, rather than guessed.
-    """
-
-    name = "fed"
-    # FRED daily series lag publication and pause on US holidays.
-    DEFAULT_MAX_AGE_S = DAILY_MAX_AGE_S
-    DEFAULT_MAX_CARRY_AGE_S = DAILY_MAX_CARRY_AGE_S
-
-    # Every H.10 currency a token maps to (rotor.price_reference.symbols).
-    DEFAULT_SERIES = {
-        "AUD": "DEXUSAL",
-        "BRL": "DEXBZUS",
-        "CAD": "DEXCAUS",
-        "CHF": "DEXSZUS",
-        "EUR": "DEXUSEU",
-        "GBP": "DEXUSUK",
-        "JPY": "DEXJPUS",
-        "MXN": "DEXMXUS",
-        "MYR": "DEXMAUS",
-        "NZD": "DEXUSNZ",
-        "SGD": "DEXSIUS",
-        "ZAR": "DEXSFUS",
-    }
-
-    DEFAULT_URL = "https://api.stlouisfed.org/fred/series/observations"
-
-    def __init__(
-        self,
-        *,
-        api_key: str = "",
-        series_by_currency: dict[str, str] | None = None,
-        **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-        # The free FRED API key; read lazily so the source constructs without it
-        # and only fails (clearly) when a quote is actually requested.
-        self.api_key = api_key
-        configured = self.DEFAULT_SERIES if series_by_currency is None else series_by_currency
-        self.series_by_currency = {
-            key.upper(): value
-            for key, value in configured.items()
-        }
-        # Checked here so a misnamed series fails at startup, not mid-quote.
-        self._usd_per_unit = {
-            currency: _fred_quotes_usd_per_unit(series)
-            for currency, series in self.series_by_currency.items()
-        }
-
-    def quote(
-        self, base: str, quote: str, *, amount: Decimal | None = None
-    ) -> PriceObservation:
-        """Fetch Fed H.10/FRED rates and cross through USD."""
-        base = base.upper()
-        quote = quote.upper()
-        base_per_usd, base_raw = self._currency_per_usd(base)
-        quote_per_usd, quote_raw = self._currency_per_usd(quote)
-        return PriceObservation(
-            source=self.name,
-            pair=_pair(base, quote),
-            rate=quote_per_usd / base_per_usd,
-            # Use the oldest input observation date so a stale leg is detectable.
-            ts=_published_ts(base_raw.get("date"), quote_raw.get("date")),
-        )
-
-    def _currency_per_usd(self, currency: str) -> tuple[Decimal, dict[str, str]]:
-        if currency == "USD":
-            return Decimal("1"), {"currency": "USD", "rate": "1"}
-        series = self.series_by_currency.get(currency)
-        if not series:
-            raise KeyError(f"Fed H.10 series not configured for {currency}")
-        if not self.api_key:
-            raise ValueError(
-                "FRED_API_KEY is required for the fed price source "
-                "(free key: https://fred.stlouisfed.org/docs/api/api_key.html)"
-            )
-        # Request the most recent observations, newest first, and use the first
-        # usable (non-".") value — the very latest day may be unpublished.
-        try:
-            response = self._http.get(
-                self.url,
-                params={
-                    "series_id": series,
-                    "api_key": self.api_key,
-                    "file_type": "json",
-                    "sort_order": "desc",
-                    "limit": 10,
-                },
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            # FRED takes the key in the URL, and httpx's errors quote the URL;
-            # these messages reach logs and Telegram alerts.
-            raise RuntimeError(
-                f"FRED {series} request failed ({type(exc).__name__}): "
-                + str(exc).replace(self.api_key, "<FRED_API_KEY>")
-            ) from None
-        date, raw_rate = _parse_fred_observations(response.json(), series)
-        rate = _positive_decimal(raw_rate)
-        if self._usd_per_unit[currency]:
-            rate = Decimal("1") / rate
-        return rate, {"currency": currency, "series": series, "date": date, "rate": raw_rate}
-
-
-def _fred_quotes_usd_per_unit(series: str) -> bool:
-    """Return whether an H.10 FRED series quotes U.S. dollars per currency unit."""
-    if re.fullmatch(r"DEXUS[A-Z]{2}", series):
-        return True
-    if re.fullmatch(r"DEX[A-Z]{2}US", series):
-        return False
-    raise ValueError(
-        f"cannot tell which way FRED series {series!r} quotes; H.10 series are "
-        "named DEXUS<cc> (U.S. dollars per unit) or DEX<cc>US (units per U.S. dollar)"
-    )
-
-
 class BnmRateSource(RateSource):
     """Bank Negara Malaysia OpenAPI FX rates crossed through MYR."""
 
@@ -625,27 +497,6 @@ def _parse_ecb_xml(text: str) -> tuple[str, dict[str, Decimal]]:
     if not date or len(rates) == 1:
         raise ValueError("ECB XML did not contain daily rates")
     return date, rates
-
-
-def _parse_fred_observations(body: Any, series: str) -> tuple[str, str]:
-    """Return the latest usable (date, value) from a FRED API observations body.
-
-    The API returns ``{"observations": [{"date": ..., "value": ...}, ...]}``.
-    With ``sort_order=desc`` the newest row is first; missing values are ".".
-    """
-    if not isinstance(body, dict):
-        raise ValueError(f"FRED API returned a non-object body for {series}")
-    observations = body.get("observations")
-    if not isinstance(observations, list):
-        raise ValueError(f"FRED API response has no observations for {series}")
-    for row in observations:
-        if not isinstance(row, dict):
-            continue
-        date = str(row.get("date") or "").strip()
-        value = str(row.get("value") or "").strip()
-        if date and value and value not in {".", "na", "NA"}:
-            return date, value
-    raise ValueError(f"FRED API returned no usable values for {series}")
 
 
 def _parse_bnm_rate(row: dict) -> Decimal:

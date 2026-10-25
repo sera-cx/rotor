@@ -1,12 +1,8 @@
 """Opt-in live tests for the FX reference sources.
 
 These hit real external endpoints, so they are skipped unless
-``ROTOR_RUN_LIVE_PRICES=1``. Two groups:
-
-  * Public (keyless): ECB (XML), Bank Negara Malaysia, and
-    Wise (anonymous quotes; ``WISE_API_TOKEN`` is used if set).
-  * Credentialed: ``fed`` (FRED API — needs ``FRED_API_KEY``); skipped unless
-    its key is configured.
+``ROTOR_RUN_LIVE_PRICES=1``. Every source is keyless: ECB (XML), Bank Negara
+Malaysia, and Wise (anonymous quotes; ``WISE_API_TOKEN`` is used if set).
 
 Run them with::
 
@@ -40,7 +36,7 @@ def _flag(name: str) -> bool:
 def _quote_or_skip(name: str, base: str, quote: str) -> PriceObservation:
     """Fetch a live quote, skipping (not failing) on transient network errors.
 
-    A timeout/connection error is environmental (e.g. a slow FRED endpoint), not
+    A timeout/connection error is environmental (e.g. a slow endpoint), not
     a code bug — these tests exist to validate parsing and cross-rate
     orientation, so only a reachable-but-wrong response should fail.
     """
@@ -92,32 +88,12 @@ PUBLIC_CASES = [
     ("wise", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
 ]
 
-# Sources that need a credential. fed uses the FRED API (the legacy fredgraph.csv
-# scrape endpoint is bot-walled). Skipped unless the corresponding key is
-# configured.
-CREDENTIALED_CASES = [
-    ("fed", "FRED_API_KEY", "SGD", "USD", Decimal("0.5"), Decimal("1.1")),
-    ("fed", "FRED_API_KEY", "EUR", "USD", Decimal("0.7"), Decimal("1.7")),
-]
-
-
 @pytest.mark.parametrize(
     ("name", "base", "quote", "low", "high"),
     PUBLIC_CASES,
     ids=[f"{name}-{base}{quote}" for name, base, quote, _lo, _hi in PUBLIC_CASES],
 )
 def test_public_source_returns_sane_live_quote(name, base, quote, low, high):
-    _assert_sane(name, base, quote, low, high, _quote_or_skip(name, base, quote))
-
-
-@pytest.mark.parametrize(
-    ("name", "env_var", "base", "quote", "low", "high"),
-    CREDENTIALED_CASES,
-    ids=[f"{name}-{base}{quote}" for name, _e, base, quote, _lo, _hi in CREDENTIALED_CASES],
-)
-def test_credentialed_source_returns_sane_live_quote(name, env_var, base, quote, low, high):
-    if not str(get_config(env_var, "") or "").strip():
-        pytest.skip(f"set {env_var} to live-test the {name} source")
     _assert_sane(name, base, quote, low, high, _quote_or_skip(name, base, quote))
 
 

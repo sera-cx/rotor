@@ -22,8 +22,7 @@ required set for a live deployment is:
 | `WISE_API_TOKEN` | (optional) Wise quotes API token; raises rate limits |
 | `ROTOR_STATE_PATH` | (recommended) unresolved-state DB path; one per wallet and network |
 
-Add `FRED_API_KEY` only if a pair uses `price_source = fed`, and `TELEGRAM_*`
-only with `--telegram`.
+Add `TELEGRAM_*` only with `--telegram`.
 
 **Verify in the sandbox** once secrets are set:
 
@@ -86,8 +85,7 @@ The wrapper honors `ROTOR_CONFIG`, `ROTOR_ORDER_TTL`, and `ROTOR_LOG_LEVEL`.
 - **One instance per wallet.** Rotor takes an advisory lock on
   `<state>.lock`; do not let scheduled runs overlap against the same wallet.
 - **Egress.** The sandbox needs outbound HTTPS to Sera and your price source
-  (Wise/ECB/BNM/FRED-API). The legacy FRED scrape endpoint is bot-walled,
-  which is why `fed` uses the FRED API.
+  (Wise/ECB/BNM).
 - **`SERA_BASE_URL` must be `https://`** (rotor refuses a plain-http endpoint
   outside `localhost`).
 - **Auto-update.** `--auto-update` is independent of the schedule; leave it off
