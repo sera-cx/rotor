@@ -273,15 +273,18 @@ def _refs(*, quoted=(), skipped=()) -> vr.TickReferences:
     return refs
 
 
+class _Notifier:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send_raw(self, text, *, important=False):
+        self.sent.append(text)
+
+
 def test_a_brief_skip_is_not_alerted_and_a_long_one_is_alerted_once():
-    sent: list[str] = []
-
-    class Notifier:
-        def send_raw(self, text, *, important=False):
-            sent.append(text)
-
-    alerts = vr.DarkPairAlerts({"XSGD/USDC", "EURC/USDC"})
-    log = logging.getLogger("test")
+    notifier = _Notifier()
+    alerts = vr.QuotingAlerts(
+        {"XSGD/USDC", "EURC/USDC"}, notifier=notifier, log=logging.getLogger("test"), now=0.0)
     timeline = [
         (0, _refs(skipped=["EURC/USDC"], quoted=["XSGD/USDC"])),
         (300, _refs(quoted=["EURC/USDC", "XSGD/USDC"])),  # a blip: no message
@@ -292,9 +295,10 @@ def test_a_brief_skip_is_not_alerted_and_a_long_one_is_alerted_once():
         (2100, _refs(quoted=["EURC/USDC", "XSGD/USDC"])),
     ]
     for now, refs in timeline:
-        alerts.update(refs, notifier=Notifier(), log=log, now=float(now))
+        alerts.update(refs, placed=True, now=float(now))
+        alerts.check(now=float(now))
 
-    assert sent == [
+    assert notifier.sent == [
         "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
         "XSGD/USDC for 15m: XSGD/USDC source down",
         "✅ Quoting again:\nXSGD/USDC after 25m",
@@ -302,41 +306,86 @@ def test_a_brief_skip_is_not_alerted_and_a_long_one_is_alerted_once():
 
 
 def test_not_quoting_episodes_survive_restarts(tmp_path):
-    sent: list[str] = []
-
-    class Notifier:
-        def send_raw(self, text, *, important=False):
-            sent.append(text)
-
+    notifier = _Notifier()
     path = tmp_path / "state.sqlite"
     log = logging.getLogger("test")
+    markets = {"XSGD/USDC", "EURC/USDC"}
     store = vr.StateStore(path)
     try:
-        vr.DarkPairAlerts({"XSGD/USDC"}, state=store).update(
-            _refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log, now=0.0)
+        vr.QuotingAlerts(markets, state=store, notifier=notifier, log=log, now=0.0).update(
+            _refs(skipped=["XSGD/USDC"], quoted=["EURC/USDC"]), placed=True, now=0.0)
     finally:
         store.close()
-    assert sent == []
+    assert notifier.sent == []
     # A --once fire 15 minutes later is a new process; the episode carried over.
     store = vr.StateStore(path)
     try:
-        alerts = vr.DarkPairAlerts({"XSGD/USDC"}, state=store)
-        alerts.update(_refs(skipped=["XSGD/USDC"]), notifier=Notifier(), log=log, now=900.0)
-        alerts.update(_refs(quoted=["XSGD/USDC"]), notifier=Notifier(), log=log, now=1200.0)
-        assert store.load_dark_pairs() == {}
+        alerts = vr.QuotingAlerts(
+            markets, state=store, notifier=notifier, log=log, carry_over=True, now=900.0)
+        alerts.update(_refs(skipped=["XSGD/USDC"], quoted=["EURC/USDC"]), placed=True, now=900.0)
+        alerts.update(_refs(quoted=["XSGD/USDC", "EURC/USDC"]), placed=True, now=1200.0)
+        assert set(store.load_quoting()) == {vr.ANY_PAIR}
     finally:
         store.close()
 
-    assert [text.splitlines()[0] for text in sent] == [
+    assert [text.splitlines()[0] for text in notifier.sent] == [
         "⚠️ Not quoting these pairs; the other pairs are quoting:", "✅ Quoting again:"]
 
 
-def test_wise_being_unreachable_for_the_window_is_alerted_once(tmp_path):
-    sent: list[str] = []
+def test_no_order_going_out_is_one_alert_with_each_pairs_reason_not_one_per_pair():
+    # Both pairs go dark at 300 s. The no-order alert lists why and repeats
+    # every window. XSGD's return is the "resumed" message; EURC, still dark,
+    # was covered by that alert, so only its own return is reported.
+    notifier = _Notifier()
+    alerts = vr.QuotingAlerts(
+        {"XSGD/USDC", "EURC/USDC"}, notifier=notifier, log=logging.getLogger("test"), now=0.0)
+    alerts.update(_refs(quoted=["XSGD/USDC", "EURC/USDC"]), placed=True, now=0.0)
+    for now in range(300, 2100, 300):
+        alerts.check(now=float(now))
+        alerts.update(_refs(skipped=["XSGD/USDC", "EURC/USDC"]), placed=False, now=float(now))
+    for now in range(2100, 3000, 300):
+        alerts.update(_refs(quoted=["XSGD/USDC"], skipped=["EURC/USDC"]), placed=True,
+                      now=float(now))
+    alerts.update(_refs(quoted=["XSGD/USDC", "EURC/USDC"]), placed=True, now=3000.0)
 
-    class Notifier:
-        def send_raw(self, text, *, important=False):
-            sent.append(text)
+    assert notifier.sent == [
+        "⚠️ VL quoting stalled: no order has gone out for 15m.\n"
+        "EURC/USDC: EURC/USDC source down\n"
+        "XSGD/USDC: XSGD/USDC source down",
+        "⚠️ VL quoting stalled: no order has gone out for 30m.\n"
+        "EURC/USDC: EURC/USDC source down\n"
+        "XSGD/USDC: XSGD/USDC source down",
+        "✅ VL quoting resumed after 35m without a placement.",
+        "✅ Quoting again:\nEURC/USDC after 45m",
+    ]
+
+
+def test_a_continuous_restart_restarts_the_no_order_clock_but_keeps_pair_records(tmp_path):
+    notifier = _Notifier()
+    log = logging.getLogger("test")
+    markets = {"XSGD/USDC", "EURC/USDC"}
+    store = vr.StateStore(tmp_path / "state.sqlite")
+    try:
+        # The last run placed at 0, then both pairs went dark until it stopped.
+        alerts = vr.QuotingAlerts(markets, state=store, notifier=notifier, log=log, now=0.0)
+        alerts.update(_refs(skipped=["XSGD/USDC", "EURC/USDC"]), placed=False, now=300.0)
+        # Restarted hours later with both pairs still dark: their records are
+        # old enough to alert, but with no pair quoting that is the no-order
+        # alert's job, and its clock starts at boot.
+        alerts = vr.QuotingAlerts(markets, state=store, notifier=notifier, log=log, now=9000.0)
+        alerts.check(now=9000.0)
+        alerts.update(_refs(skipped=["XSGD/USDC", "EURC/USDC"]), placed=False, now=9000.0)
+        assert notifier.sent == []
+        alerts.check(now=9900.0)
+    finally:
+        store.close()
+
+    assert [text.splitlines()[0] for text in notifier.sent] == [
+        "⚠️ VL quoting stalled: no order has gone out for 15m."]
+
+
+def test_wise_being_unreachable_for_the_window_is_alerted_once(tmp_path):
+    notifier = _Notifier()
 
     def outage():
         refs = _refs(quoted=["XSGD/USDC", "EURC/USDC"])
@@ -347,24 +396,24 @@ def test_wise_being_unreachable_for_the_window_is_alerted_once(tmp_path):
     log = logging.getLogger("test")
     store = vr.StateStore(tmp_path / "state.sqlite")
     try:
-        alerts = vr.DarkPairAlerts({"XSGD/USDC", "EURC/USDC"}, state=store)
-        alerts.update(outage(), notifier=Notifier(), log=log, now=0.0)
-        alerts.update(outage(), notifier=Notifier(), log=log, now=600.0)
-        assert sent == []
-        alerts.update(outage(), notifier=Notifier(), log=log, now=900.0)
-        alerts.update(outage(), notifier=Notifier(), log=log, now=1200.0)
+        alerts = vr.QuotingAlerts(
+            {"XSGD/USDC", "EURC/USDC"}, state=store, notifier=notifier, log=log, now=0.0)
+        alerts.update(outage(), placed=True, now=0.0)
+        alerts.update(outage(), placed=True, now=600.0)
+        assert notifier.sent == []
+        alerts.update(outage(), placed=True, now=900.0)
+        alerts.update(outage(), placed=True, now=1200.0)
         # The episode is persisted, so --once fires share it.
-        assert vr.WISE_OUTAGE in store.load_dark_pairs()
-        alerts.update(_refs(quoted=["XSGD/USDC", "EURC/USDC"]), notifier=Notifier(), log=log,
-                      now=1500.0)
-        assert store.load_dark_pairs() == {}
+        assert vr.WISE_OUTAGE in store.load_quoting()
+        alerts.update(_refs(quoted=["XSGD/USDC", "EURC/USDC"]), placed=True, now=1500.0)
+        assert vr.WISE_OUTAGE not in store.load_quoting()
     finally:
         store.close()
 
-    assert len(sent) == 2
-    assert sent[0].startswith("⚠️ Wise is not answering")
-    assert "for 15m (EURC/USDC, XSGD/USDC): ReadTimeout" in sent[0]
-    assert sent[1].startswith("✅ Wise is answering again")
+    assert len(notifier.sent) == 2
+    assert notifier.sent[0].startswith("⚠️ Wise is not answering")
+    assert notifier.sent[1].startswith("✅ Wise is answering again")
+
 
 
 def test_state_store_drops_the_superseded_pending_returns_table(tmp_path):

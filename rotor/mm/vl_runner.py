@@ -84,25 +84,23 @@ DEFAULT_STATE_PATH = ".rotor_state.sqlite"
 # While pairs quote on carried-forward reference rates, repeat the warning at
 # most this often, so a weekend produces a handful of messages, not one per tick.
 STALE_REMINDER_SECONDS = 6 * 60 * 60.0
-# A pair that produces no quote this long while others may still quote (its
-# price source failing, say) is alerted once; quoting again is reported.
-DARK_PAIR_ALERT_SECONDS = 15 * 60.0
-# DarkPairAlerts' episode key for Wise being unreachable (not a market name).
+# A pair placing nothing this long (its price source failing, say), Wise
+# unreachable this long, or no order going out at all, is alerted.
+NOT_QUOTING_ALERT_SECONDS = 15 * 60.0
+# QuotingAlerts' records that are not markets: when any order last went out,
+# and Wise being unreachable.
+ANY_PAIR = "*any*"
 WISE_OUTAGE = "*wise*"
 # An order's fills are counted this long after it expires, so a match made just
 # before expiry has time to show up in its fill list.
 SETTLE_GRACE_SECONDS = 60.0
-# An order whose fills cannot be read this many ticks in a row (about an hour at
-# the default cadence) is reported as an error instead of only a warning.
-READ_FAILURE_ALERT_TICKS = 12
 # When the cancel-cooldown guard clears within this many seconds, the tick waits
 # for it instead of being skipped.
 MAX_GUARD_WAIT_SECONDS = 60.0
-# Startup attempts allowed per clock hour; after that rotor waits for the next
-# hour. The count is kept beside the state file so restarts share it.
-BOOT_ATTEMPTS_PER_HOUR = 3
-# Seconds to wait before the 2nd and 3rd startup attempt within an hour.
-BOOT_RETRY_WAITS = (30.0, 60.0)
+# A temporary startup failure is retried this often; a --once fire exits instead.
+BOOT_RETRY_SECONDS = 60.0
+# A startup outage is alerted when it begins and again after this long.
+BOOT_REMINDER_SECONDS = 6 * 60 * 60.0
 # A running rotor re-reads Sera's metadata (config, health, markets) this often,
 # and no sooner than EARLY_REFRESH_SECONDS after the last read when a rejection
 # suggests it went stale. Markets Sera rejects as inactive sit out until then.
@@ -209,6 +207,18 @@ class StaleAlertState:
     alerted_at: float
 
 
+@dataclass
+class QuotingEpisode:
+    """A stretch without quoting: one pair's, Wise's, or every pair's."""
+
+    # When it began; for ANY_PAIR, when an order last went out.
+    since: float
+    # When it was last alerted; 0 until it is.
+    alerted_at: float = 0.0
+    # Why the pair placed nothing, as of the latest tick that knew.
+    reason: str = ""
+
+
 class StateStore:
     """Tiny unresolved-state store; this is not a trade-history database."""
 
@@ -260,21 +270,18 @@ class StateStore:
                 opened_at REAL NOT NULL
             )
         """)
-        # Pairs not quoting, so --once fires share the episode (see DarkPairAlerts).
+        # Not-quoting records, so --once fires share them (see QuotingAlerts).
         self._db.execute("""
-            CREATE TABLE IF NOT EXISTS dark_pairs (
-                market TEXT PRIMARY KEY,
-                since REAL NOT NULL,
-                alerted INTEGER NOT NULL
-            )
-        """)
-        # The stall watchdog's clock, so --once fires share it (see StallWatchdog).
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS watchdog (
+            CREATE TABLE IF NOT EXISTS quoting (
                 key TEXT PRIMARY KEY,
-                value REAL NOT NULL
+                since REAL NOT NULL,
+                alerted_at REAL NOT NULL,
+                reason TEXT NOT NULL
             )
         """)
+        # Superseded by quoting; their rows only timed alerts, safe to drop.
+        self._db.execute("DROP TABLE IF EXISTS dark_pairs")
+        self._db.execute("DROP TABLE IF EXISTS watchdog")
         # The wallet and Sera deployment this file belongs to (see claim()).
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS identity (
@@ -537,34 +544,21 @@ class StateStore:
                 rows,
             )
 
-    def replace_dark_pairs(self, episodes: dict[str, tuple[float, bool]]) -> None:
-        """Replace the open not-quoting episodes (market -> since, alerted)."""
+    def replace_quoting(self, episodes: dict[str, QuotingEpisode]) -> None:
+        """Replace the not-quoting records."""
         with self._db:
-            self._db.execute("DELETE FROM dark_pairs")
+            self._db.execute("DELETE FROM quoting")
             self._db.executemany(
-                "INSERT INTO dark_pairs (market, since, alerted) VALUES (?, ?, ?)",
-                [(market, since, int(alerted)) for market, (since, alerted) in episodes.items()],
+                "INSERT INTO quoting (key, since, alerted_at, reason) VALUES (?, ?, ?, ?)",
+                [(key, e.since, e.alerted_at, e.reason) for key, e in episodes.items()],
             )
 
-    def load_dark_pairs(self) -> dict[str, tuple[float, bool]]:
-        """Load the open not-quoting episodes."""
+    def load_quoting(self) -> dict[str, QuotingEpisode]:
+        """Load the not-quoting records."""
         return {
-            market: (float(since), bool(alerted))
-            for market, since, alerted in self._db.execute(
-                "SELECT market, since, alerted FROM dark_pairs")
-        }
-
-    def save_watchdog(self, values: dict[str, float]) -> None:
-        """Store the stall watchdog's timestamps."""
-        with self._db:
-            self._db.executemany(
-                "INSERT OR REPLACE INTO watchdog (key, value) VALUES (?, ?)", values.items())
-
-    def load_watchdog(self) -> dict[str, float]:
-        """Load the stall watchdog's timestamps."""
-        return {
-            key: float(value)
-            for key, value in self._db.execute("SELECT key, value FROM watchdog")
+            key: QuotingEpisode(float(since), float(alerted_at), reason)
+            for key, since, alerted_at, reason in self._db.execute(
+                "SELECT key, since, alerted_at, reason FROM quoting")
         }
 
     def load_reference_alerts(self) -> dict[str, StaleAlertState]:
@@ -582,85 +576,19 @@ class StateStore:
         }
 
 
-class StallWatchdog:
-    """Alert when no fresh quote set has gone out for `window` seconds.
+class QuotingAlerts:
+    """Alert when pairs stop quoting, and once more when they quote again.
 
-    Every skipped tick (unreadable prices or fills, a stuck cancel, a budget
-    rejection) leaves quoting stalled while the heartbeat still says "alive".
-    A continuous run checks at each tick and starts the clock at boot. A
-    `--once` fire checks only after placing nothing, and its clock is kept in
-    the state file, so fires share it as one long run would. Placing again
-    after an alert sends one "resumed" message.
-    """
-
-    def __init__(
-        self,
-        window: float,
-        *,
-        state: StateStore | None,
-        notifier: TelegramNotifier | None,
-        log: logging.Logger,
-        carry_over: bool,
-    ) -> None:
-        now = time.time()
-        stored = state.load_watchdog() if state is not None else {}
-        self.window = window
-        self.last_quote_ok = stored.get("last_quote_ok", now) if carry_over else now
-        self.last_alert = stored.get("last_alert", 0.0)
-        self.quoted_this_run = False
-        self._state = state
-        self._notifier = notifier
-        self._log = log
-        self._save()
-
-    def quoted(self) -> None:
-        """A fresh quote set went out."""
-        now = time.time()
-        if self.last_alert >= self.last_quote_ok:
-            self._log.warning(
-                "quoting resumed after %s without a placement",
-                _fmt_duration(now - self.last_quote_ok))
-            if self._notifier is not None:
-                self._notifier.send_raw(
-                    "✅ VL quoting resumed after "
-                    f"{_fmt_duration(now - self.last_quote_ok)} without a placement.",
-                    important=True,
-                )
-        self.last_quote_ok = now
-        self.quoted_this_run = True
-        self._save()
-
-    def check(self) -> None:
-        """Alert, at most once per window, if quoting has stalled for a window."""
-        now = time.time()
-        stalled_for = now - self.last_quote_ok
-        if stalled_for < self.window or now - self.last_alert < self.window:
-            return
-        self._log.error("VL quoting stalled: no successful placement for %.0fs", stalled_for)
-        if self._notifier is not None:
-            self._notifier.notify_error(
-                "VL quoting stalled",
-                RuntimeError(f"no successful placement for {stalled_for:.0f}s"),
-            )
-        self.last_alert = now
-        self._save()
-
-    def _save(self) -> None:
-        if self._state is not None:
-            self._state.save_watchdog(
-                {"last_quote_ok": self.last_quote_ok, "last_alert": self.last_alert})
-
-
-class DarkPairAlerts:
-    """Alert when one pair stops quoting while the others may carry on.
-
-    The stall watchdog sees only whether anything was placed, so a single pair
-    whose price source keeps failing would otherwise show up only as a log
-    line per tick. A pair skipped on every tick for DARK_PAIR_ALERT_SECONDS
-    gets one alert with the reason; its next quote sends one "quoting again".
-    Wise being unreachable that long, so normal orders sit at the mid +/- the
-    weekend/outage spread, is one more episode (under WISE_OUTAGE). Episodes
-    are kept in the state file, so --once fires share them.
+    Each pair placing nothing has a record with the latest reason (its price
+    source failing, its fills unreadable, Sera refusing its orders or calling
+    the market inactive, no funds for an order). A pair dark for `window`
+    while others quote is alerted once. No order going out at all for
+    `window` (every pair dark, or every tick skipped) is alerted with each
+    pair's reason, and again every `window` while it lasts. Wise unreachable
+    for `window`, so normal orders sit at the mid +/- the weekend/outage
+    spread, is one more record. The end of an alerted stretch is reported
+    once. Records live in the state file, so --once fires share them; a
+    continuous run starts the no-order clock at boot.
     """
 
     def __init__(
@@ -668,68 +596,109 @@ class DarkPairAlerts:
         markets: set[str],
         *,
         state: StateStore | None = None,
-        window: float = DARK_PAIR_ALERT_SECONDS,
-    ) -> None:
-        self._state = state
-        self.window = window
-        loaded = {} if state is None else state.load_dark_pairs()
-        # market (or WISE_OUTAGE) -> (first seen at, alerted yet)
-        self._episodes = {
-            m: e for m, e in loaded.items() if m in markets or m == WISE_OUTAGE}
-
-    def update(
-        self,
-        refs: TickReferences,
-        *,
-        notifier: TelegramNotifier | None,
+        notifier: TelegramNotifier | None = None,
         log: logging.Logger,
+        window: float = NOT_QUOTING_ALERT_SECONDS,
+        carry_over: bool = False,
         now: float | None = None,
     ) -> None:
-        """Advance each pair's episode from this tick and alert on changes."""
+        self.window = window
+        self._state = state
+        self._notifier = notifier
+        self._log = log
+        loaded = {} if state is None else state.load_quoting()
+        self._episodes = {
+            key: episode for key, episode in loaded.items()
+            if key in markets or key == WISE_OUTAGE or (key == ANY_PAIR and carry_over)
+        }
+        self._episodes.setdefault(ANY_PAIR, QuotingEpisode(time.time() if now is None else now))
+        self._save()
+
+    def update(self, refs: TickReferences, *, placed: bool, now: float | None = None) -> None:
+        """Advance the records from one tick and alert on changes.
+
+        `refs.quoted` holds the pairs that sent an order this tick and
+        `refs.skipped` why the others did not (see _not_quoting); `placed`
+        says whether Sera accepted any order.
+        """
         now = time.time() if now is None else now
-        dark: list[str] = []
         back: list[str] = []
-        outage: list[str] = []
-        recovered: list[str] = []
-        before = dict(self._episodes)
-        for market, error in sorted(refs.skipped.items(), key=lambda item: item[0]):
-            since, alerted = self._episodes.get(market, (now, False))
-            if not alerted and now - since >= self.window:
-                alerted = True
-                dark.append(f"{market} for {_fmt_duration(now - since)}: {_first_line(error)}")
-            self._episodes[market] = (since, alerted)
         for market in sorted(refs.quoted):
             episode = self._episodes.pop(market, None)
-            if episode is not None and episode[1]:
-                back.append(f"{market} after {_fmt_duration(now - episode[0])}")
+            if episode is not None and episode.alerted_at:
+                back.append(f"{market} after {_fmt_duration(now - episode.since)}")
+        dark: list[str] = []
+        for market, error in sorted(refs.skipped.items(), key=lambda item: item[0]):
+            episode = self._episodes.setdefault(market, QuotingEpisode(now))
+            episode.reason = _first_line(error)
+            # With no pair quoting, the no-order alert speaks for this one.
+            if refs.quoted and not episode.alerted_at and now - episode.since >= self.window:
+                episode.alerted_at = now
+                dark.append(f"{market} for {_fmt_duration(now - episode.since)}: {episode.reason}")
+        resumed: list[str] = []
+        stalled = self._episodes[ANY_PAIR]
+        if placed:
+            if stalled.alerted_at:
+                # Says it for every pair that quotes again with it.
+                resumed.append(
+                    f"VL quoting resumed after {_fmt_duration(now - stalled.since)} "
+                    "without a placement.")
+                back = []
+            self._episodes[ANY_PAIR] = QuotingEpisode(now)
+        outage: list[str] = []
+        recovered: list[str] = []
         if refs.wise_outage:
-            since, alerted = self._episodes.get(WISE_OUTAGE, (now, False))
-            if not alerted and now - since >= self.window:
-                alerted = True
+            episode = self._episodes.setdefault(WISE_OUTAGE, QuotingEpisode(now))
+            if not episode.alerted_at and now - episode.since >= self.window:
+                episode.alerted_at = now
                 first = next(iter(refs.wise_outage.values()))
                 outage.append(
-                    f"for {_fmt_duration(now - since)} ({', '.join(sorted(refs.wise_outage))}): "
-                    f"{_first_line(first)}")
-            self._episodes[WISE_OUTAGE] = (since, alerted)
+                    f"for {_fmt_duration(now - episode.since)} "
+                    f"({', '.join(sorted(refs.wise_outage))}): {_first_line(first)}")
         else:
             episode = self._episodes.pop(WISE_OUTAGE, None)
-            if episode is not None and episode[1]:
-                recovered.append(f"after {_fmt_duration(now - episode[0])}")
-        if self._episodes != before and self._state is not None:
-            self._state.replace_dark_pairs(self._episodes)
+            if episode is not None and episode.alerted_at:
+                recovered.append(f"after {_fmt_duration(now - episode.since)}")
+        self._save()
         for lines, icon, heading in (
             (dark, "⚠️", "Not quoting these pairs; the other pairs are quoting:"),
             (back, "✅", "Quoting again:"),
+            (resumed, "✅", None),
             (outage, "⚠️", "Wise is not answering, so normal orders sit at the mid "
                            "+/- each pair's fallback_weekend_bps:"),
             (recovered, "✅", "Wise is answering again; normal orders are back at its prices:"),
         ):
-            if not lines:
-                continue
-            body = "\n".join([heading, *lines])
-            log.warning("%s", body.replace("\n", " | "))
-            if notifier is not None:
-                notifier.send_raw(f"{icon} {body}", important=True)
+            if lines:
+                self._send(icon, [heading, *lines] if heading else lines)
+
+    def check(self, *, now: float | None = None) -> None:
+        """Alert, and again every `window`, while no order has gone out for `window`."""
+        now = time.time() if now is None else now
+        stalled = self._episodes[ANY_PAIR]
+        if now - stalled.since < self.window or now - stalled.alerted_at < self.window:
+            return
+        stalled.alerted_at = now
+        reasons = []
+        for key, episode in sorted(self._episodes.items()):
+            if key not in (ANY_PAIR, WISE_OUTAGE):
+                # Alerted with this, so the pair quoting again is reported.
+                episode.alerted_at = episode.alerted_at or now
+                reasons.append(f"{key}: {episode.reason}")
+        self._save()
+        self._send("⚠️", [
+            f"VL quoting stalled: no order has gone out for {_fmt_duration(now - stalled.since)}.",
+            *(reasons or ["The log says why each tick was skipped."]),
+        ], error=True)
+
+    def _send(self, icon: str, lines: list[str], *, error: bool = False) -> None:
+        body = "\n".join(lines)
+        (self._log.error if error else self._log.warning)("%s", body.replace("\n", " | "))
+        if self._notifier is not None:
+            self._notifier.send_raw(f"{icon} {body}", important=True)
+
+    def _save(self) -> None:
+        if self._state is not None:
+            self._state.replace_quoting(self._episodes)
 
 
 class StaleReferenceAlerts:
@@ -932,26 +901,14 @@ def run(
     notifier = TelegramNotifier(log=log, dry_run=not telegram)
     stop = StopFlag()
     stop.install()
-    budget = BootBudget(
-        None if dry_run else _boot_budget_path(state_path or _state_path()))
+    outage = StartupOutage(
+        None if dry_run else _startup_outage_path(state_path or _state_path()))
     # Startup: load the config, bootstrap Sera, and build the pairs. Temporary
-    # failures (network, Sera 5xx/429, a degraded /health) are retried, at most
-    # BOOT_ATTEMPTS_PER_HOUR attempts per clock hour; then rotor waits for the
-    # next hour. Anything else (config, a wrong contract or token, no quotable
-    # pair) stops rotor at once. Every attempt counts toward the hour.
+    # failures (network, Sera 5xx/429, a degraded /health) are retried every
+    # BOOT_RETRY_SECONDS; a --once fire exits and leaves that to the next fire.
+    # Anything else (config, a wrong contract or token, no quotable pair) stops
+    # rotor at once.
     while True:
-        if budget.exhausted():
-            resume = _fmt_utc(budget.next_hour())
-            log.error(
-                "startup failed %d times this hour; next attempt at %s",
-                budget.failures_this_hour(), resume,
-            )
-            if once:
-                return 1
-            if stop.wait(budget.next_hour() - time.time()):
-                return 1
-            budget.start_new_hour()
-            continue
         try:
             config, client, runtimes, skipped = _start(
                 config_path,
@@ -962,28 +919,12 @@ def run(
             )
             break
         except Exception as exc:
-            failures = budget.record_failure()
-            temporary = _is_temporary(exc)
-            retrying = temporary and not once and failures < BOOT_ATTEMPTS_PER_HOUR
+            retrying = _is_temporary(exc) and not once
             log.error(
-                "startup failed (attempt %d of %d this hour%s): %s",
-                failures, BOOT_ATTEMPTS_PER_HOUR,
-                f"; retrying in {BOOT_RETRY_WAITS[failures - 1]:.0f}s" if retrying else "",
-                exc,
-            )
-            # Alert on the hour's first failure and when the hour's attempts run
-            # out, not on every attempt.
-            if failures == 1 or failures >= BOOT_ATTEMPTS_PER_HOUR:
-                notifier.notify_error(
-                    f"rotor could not start (attempt {failures} of "
-                    f"{BOOT_ATTEMPTS_PER_HOUR} this hour"
-                    + (f"; next attempt at {_fmt_utc(budget.next_hour())})"
-                       if failures >= BOOT_ATTEMPTS_PER_HOUR and temporary else ")"),
-                    exc,
-                )
-            if not temporary or once:
-                return 1
-            if retrying and stop.wait(BOOT_RETRY_WAITS[failures - 1]):
+                "startup failed%s: %s",
+                f"; retrying in {BOOT_RETRY_SECONDS:.0f}s" if retrying else "", exc)
+            outage.failed(exc, notifier, retrying=retrying)
+            if not retrying or stop.wait(BOOT_RETRY_SECONDS):
                 return 1
     markets = {rt.config.market for rt in runtimes}
 
@@ -998,18 +939,12 @@ def run(
             state = StateStore(state_path or _state_path())
             state.claim(_identity(client))
     except Exception as exc:
-        budget.record_failure()
         log.error("state store failed: %s", exc)
         notifier.notify_error("rotor could not use its state file", exc)
         if state is not None:
             state.close()
         return 1
-    if budget.failures_this_hour():
-        notifier.send_raw(
-            f"✅ rotor started after {budget.failures_this_hour()} failed attempt(s)",
-            important=True,
-        )
-    budget.clear()
+    outage.ended(notifier)
     # Say which network and wallet this run trades on: a testnet run with
     # mainnet expectations (or the reverse) should be obvious at a glance.
     started = (
@@ -1029,8 +964,6 @@ def run(
         )
     # Throttled warnings while pairs quote on carried-forward daily rates.
     stale_alerts = StaleReferenceAlerts(runtimes, state=state)
-    # One alert when a single pair stops quoting for a while, one when it is back.
-    dark_pairs = DarkPairAlerts(markets, state=state)
     # Reattach to any orders already resting on Sera for the configured markets
     # so a restart does not orphan or duplicate live quotes. In dry-run we never
     # touch live state.
@@ -1069,23 +1002,21 @@ def run(
     stuck_settlements: set[str] = set()
     # Whether shutdown cleanup left orders live (see _cancel_before_exit).
     left_live = False
-    # order id -> consecutive ticks its fills could not be read.
-    read_failures: dict[str, int] = {}
-    # Markets Sera rejected as inactive: not quoted until the next metadata
-    # refresh. Each is alerted once, until it places again.
-    inactive: set[str] = set()
-    inactive_alerted: set[str] = set()
+    # Markets Sera rejected as inactive (market -> its refusal): not quoted
+    # until the next metadata refresh.
+    inactive: dict[str, Exception] = {}
     last_refresh = time.time()
     next_refresh = last_refresh + METADATA_REFRESH_SECONDS
     # True while metadata refreshes fail; alerted when it starts and ends.
     refresh_failing = False
-    # Stall watchdog: alert (once per window) when no fresh quote set has gone
-    # out for a while. Dry-run never places, so it is not watched.
-    watchdog = StallWatchdog(
-        max(poll_seconds * 3, 900.0),
+    # Alerts when a pair stops quoting, Wise stops answering, or no order goes
+    # out at all for a while. Dry-run never places, so it is not watched.
+    quoting = QuotingAlerts(
+        markets,
         state=state,
         notifier=notifier,
         log=log,
+        window=max(poll_seconds * 3, NOT_QUOTING_ALERT_SECONDS),
         carry_over=once,
     )
     try:
@@ -1093,7 +1024,7 @@ def run(
             tick_started = time.time()
             notifier.heartbeat()
             if not dry_run and not once:
-                watchdog.check()
+                quoting.check()
             if updater is not None:
                 update_result = updater.run_if_due(log)
                 if update_result is not None and update_result.updated:
@@ -1178,7 +1109,7 @@ def run(
             # A market with an order whose fills could not be read is not quoted
             # this tick, rather than quoted on missing fills; other markets are.
             positions: dict[str, Position] = {}
-            unreadable: set[str] = set()
+            unreadable: dict[str, Exception] = {}
             funds: dict[str, Decimal] | None = None
             if not dry_run:
                 funds = _read_funds(client, log)
@@ -1188,9 +1119,7 @@ def run(
                         *(order.order_id for order in unsettled),
                         *(order.order_id for placement in live for order in placement.orders),
                     ])
-                    unreadable = _markets_of(failed, unsettled, live)
-                    read_failures = _report_read_failures(
-                        failed, unsettled, live, read_failures, log=log, notifier=notifier)
+                    unreadable = _unreadable_markets(failed, unsettled, live, log=log)
                     live = _prune_fully_filled_placements(
                         live, _filled_quantities(fills), log)
                     if state is not None:
@@ -1223,8 +1152,7 @@ def run(
                     expiration=tick_expiration,
                     log=log,
                     refs=tick_refs,
-                    skip=inactive,
-                    unreadable=unreadable,
+                    skip={**inactive, **unreadable},
                     funds=funds,
                 )
             except Exception as exc:
@@ -1244,8 +1172,8 @@ def run(
             if not intents:
                 # No emitted sides means nothing can be safely placed this tick.
                 if not dry_run:
-                    _update_dark_pairs(dark_pairs, tick_refs, set(), PlacementIssues(),
-                                       notifier=notifier, log=log)
+                    _update_quoting(quoting, tick_refs, set(), PlacementIssues(),
+                                    placed=False, log=log)
                 log.warning("skip tick: no emitted order intents")
                 if once:
                     return 1
@@ -1325,19 +1253,11 @@ def run(
             # is skipped and the rest still go out.
             issues = PlacementIssues()
             placed = _place_groups(client, groups, log, state=state, issues=issues)
-            for market in sorted(issues.inactive - inactive_alerted):
+            for market in sorted(issues.inactive):
                 log.error("%s is not active on Sera; not quoting it until the next refresh", market)
-                notifier.send_raw(
-                    f"⚠️ Sera says {market} is not active. Not quoting it until "
-                    "the next market refresh; the other pairs are quoting.",
-                    important=True,
-                )
-            inactive |= issues.inactive
-            inactive_alerted |= issues.inactive
-            inactive_alerted -= {o.market for p in placed for o in p.orders}
-            if not dry_run:
-                sent = {o.market for p in placed + issues.unanswered for o in p.orders}
-                _update_dark_pairs(dark_pairs, tick_refs, sent, issues, notifier=notifier, log=log)
+                inactive[market] = issues.refused[market]
+            sent = {o.market for p in placed + issues.unanswered for o in p.orders}
+            _update_quoting(quoting, tick_refs, sent, issues, placed=bool(placed), log=log)
             if issues.stale_metadata:
                 next_refresh = min(next_refresh, last_refresh + EARLY_REFRESH_SECONDS)
             # Placements Sera may have booked without answering are tracked too,
@@ -1346,10 +1266,6 @@ def run(
             live = placed + issues.unanswered
             if state is not None:
                 state.replace_active(live)
-            if placed:
-                # A fresh quote set went out: reset the stall watchdog. (No
-                # message per tick: the stall alert reports a run of failures.)
-                watchdog.quoted()
             if once:
                 return 0 if placed else 1
             sleep_remaining(tick_started, poll_seconds, stop)
@@ -1360,9 +1276,9 @@ def run(
         notifier.notify_error("rotor stopped on an unexpected error", exc)
         raise
     finally:
-        # A --once fire that placed nothing checks for a stall shared across fires.
-        if once and not dry_run and not watchdog.quoted_this_run:
-            watchdog.check()
+        # A --once fire checks the no-order clock it shares with other fires.
+        if once and not dry_run:
+            quoting.check()
         # Shutdown cleanup cancels tracked placements in live mode. An
         # auto-update restart always cancels first (even without --cancel-on-exit)
         # so the next process does not boot into stale-priced resting quotes that
@@ -1526,65 +1442,59 @@ def _is_temporary(exc: Exception) -> bool:
         exc.status_code == 429 or exc.status_code >= 500)
 
 
-class BootBudget:
-    """Failed startup attempts in the current clock hour, kept in a small file.
+class StartupOutage:
+    """A run of failed startups, in a marker file beside the state file.
 
-    The file lets `--once` fires and supervisor restarts share one hourly
-    budget. Without a path (dry-run, in-memory state) the count lives only in
-    this process. A file that cannot be read or written counts as empty.
+    The marker lets --once fires and supervisor restarts share one outage: it
+    is alerted when it begins and again every BOOT_REMINDER_SECONDS, and the
+    start that ends it says so. Without a path (dry-run, in-memory state) it
+    lives in this process only; an unreadable marker counts as none.
     """
 
     def __init__(self, path: str | None) -> None:
         self.path = path
-        self._hour, self._failures = -1, 0
+        self.since: float | None = None
+        self.alerted_at = 0.0
         if path is not None:
             with contextlib.suppress(OSError, ValueError, TypeError, KeyError):
                 saved = json.loads(Path(path).read_text())
-                self._hour, self._failures = int(saved["hour"]), int(saved["failures"])
+                self.since, self.alerted_at = float(saved["since"]), float(saved["alerted_at"])
 
-    @staticmethod
-    def _current_hour() -> int:
-        return int(time.time() // 3600)
+    def failed(self, exc: Exception, notifier: TelegramNotifier, *, retrying: bool) -> None:
+        """Count a failed start, alerting if the outage is new or due a reminder."""
+        now = time.time()
+        if self.since is None:
+            self.since, context = now, "rotor could not start"
+        elif now - self.alerted_at >= BOOT_REMINDER_SECONDS:
+            context = f"rotor still cannot start after {_fmt_duration(now - self.since)}"
+        else:
+            return
+        self.alerted_at = now
+        if retrying:
+            context += f"; retrying every {BOOT_RETRY_SECONDS:.0f}s"
+        notifier.notify_error(context, exc)
+        if self.path is not None:
+            with contextlib.suppress(OSError):
+                Path(self.path).write_text(
+                    json.dumps({"since": self.since, "alerted_at": self.alerted_at}))
 
-    def failures_this_hour(self) -> int:
-        return self._failures if self._hour == self._current_hour() else 0
-
-    def exhausted(self) -> bool:
-        return self.failures_this_hour() >= BOOT_ATTEMPTS_PER_HOUR
-
-    def next_hour(self) -> float:
-        """POSIX time at which the next clock hour starts."""
-        return (self._current_hour() + 1) * 3600.0
-
-    def record_failure(self) -> int:
-        """Count a failed attempt and return the hour's total so far."""
-        self._failures = self.failures_this_hour() + 1
-        self._hour = self._current_hour()
-        self._save()
-        return self._failures
-
-    def start_new_hour(self) -> None:
-        """Begin a fresh count after waiting out an exhausted hour."""
-        self._hour, self._failures = self._current_hour(), 0
-        self._save()
-
-    def clear(self) -> None:
-        """Forget all failures once rotor has started."""
-        self._hour, self._failures = -1, 0
+    def ended(self, notifier: TelegramNotifier) -> None:
+        """Report and forget the outage once rotor has started."""
+        if self.since is None:
+            return
+        notifier.send_raw(
+            "✅ rotor started after failing to start for "
+            f"{_fmt_duration(time.time() - self.since)}",
+            important=True,
+        )
+        self.since = None
         if self.path is not None:
             with contextlib.suppress(OSError):
                 Path(self.path).unlink(missing_ok=True)
 
-    def _save(self) -> None:
-        if self.path is None:
-            return
-        with contextlib.suppress(OSError):
-            Path(self.path).write_text(
-                json.dumps({"hour": self._hour, "failures": self._failures}))
 
-
-def _boot_budget_path(state_path: str | Path) -> str | None:
-    """The startup-attempt file beside the state file, or None for in-memory state."""
+def _startup_outage_path(state_path: str | Path) -> str | None:
+    """The startup-outage marker beside the state file, or None for in-memory state."""
     if str(state_path) == ":memory:":
         return None
     return str(Path(state_path).expanduser()) + ".boot.json"
@@ -1766,14 +1676,14 @@ def _build_tick_intents(
     log: logging.Logger,
     refs: TickReferences | None = None,
     now: float | None = None,
-    skip: set[str] | frozenset[str] = frozenset(),
-    unreadable: set[str] | frozenset[str] = frozenset(),
+    skip: dict[str, Exception] | None = None,
     funds: dict[str, Decimal] | None = None,
 ) -> list[OrderIntent]:
-    """Build all order intents for one loop tick, leaving out `skip` markets.
+    """Build all order intents for one loop tick.
 
-    Markets in `unreadable` (fills that could not be read) are left out too,
-    and recorded in `refs.skipped` so the not-quoting alert covers them.
+    Markets in `skip` (market -> why: Sera called it inactive, or its fills
+    could not be read) are left out, and recorded in `refs.skipped` so the
+    not-quoting alert covers them.
 
     Each pair is isolated: a pair Wise cannot price (its own reference failing
     falls back to Wise's mid), or a quote that fails market minimums, skips
@@ -1784,12 +1694,11 @@ def _build_tick_intents(
     now = time.time() if now is None else now
     budgets = {budget.token: budget.amount for budget in config.budgets}
     out: list[OrderIntent] = []
+    skip = skip or {}
     for runtime in runtimes:
         if runtime.config.market in skip:
-            continue
-        if runtime.config.market in unreadable:
             if refs is not None:
-                refs.skipped[runtime.config.market] = RuntimeError("its fills could not be read")
+                refs.skipped[runtime.config.market] = skip[runtime.config.market]
             continue
         try:
             out.extend(
@@ -2207,20 +2116,20 @@ class PlacementIssues:
             self.stale_metadata = True
 
 
-def _update_dark_pairs(
-    dark_pairs: DarkPairAlerts,
+def _update_quoting(
+    quoting: QuotingAlerts,
     refs: TickReferences,
     sent: set[str],
     issues: PlacementIssues,
     *,
-    notifier: TelegramNotifier | None,
+    placed: bool,
     log: logging.Logger,
 ) -> None:
     """Advance the not-quoting alerts from what this tick actually placed."""
     _not_quoting(refs, sent, issues)
     # An alert failure must never cost a tick, so it is only logged.
     try:
-        dark_pairs.update(refs, notifier=notifier, log=log)
+        quoting.update(refs, placed=placed)
     except Exception as exc:
         log.warning("not-quoting alert failed: %s", exc)
 
@@ -2229,12 +2138,11 @@ def _not_quoting(refs: TickReferences, sent: set[str], issues: PlacementIssues) 
     """Move pairs that placed nothing this tick from `quoted` to `skipped`.
 
     A pair counts as quoting only if one of its orders went out (or may have:
-    unanswered). One whose orders Sera refuses every tick, or that had no order
-    to place, is not quoting even while the other pairs are. Markets Sera
-    called inactive have their own alert and are left as they are.
+    unanswered). One whose orders Sera refuses (or calls inactive) every tick,
+    or that had no order to place, is not quoting even while the other pairs are.
     """
     for market in list(refs.quoted):
-        if market in sent or market in issues.inactive:
+        if market in sent:
             continue
         refs.skipped[market] = issues.refused.get(market) or RuntimeError(
             "no order to place (no funds for it, or under the market minimum)")
@@ -2339,6 +2247,7 @@ def _place_vl_batch(
                 )
                 return []
             issues.inactive.add(inactive)
+            issues.refused.setdefault(inactive, exc)
             log.warning(
                 "%s is not active on Sera; sending the %s batch without it",
                 inactive, spent_token,
@@ -2390,11 +2299,9 @@ def _place_standalone(
         if state is not None:
             state.remove_unsettled([order.order_id])
         issues.note(exc)
-        inactive = _inactive_market(exc, [intent])
-        if inactive is not None:
-            issues.inactive.add(inactive)
-        else:
-            issues.refused.setdefault(intent.market, exc)
+        if _inactive_market(exc, [intent]) is not None:
+            issues.inactive.add(intent.market)
+        issues.refused.setdefault(intent.market, exc)
         log.error(
             "could not place %s %s spent=%s: %s",
             intent.market,
@@ -2821,40 +2728,31 @@ def _markets_of(
     return {market_of[order_id] for order_id in order_ids if market_of.get(order_id)}
 
 
-def _report_read_failures(
+def _unreadable_markets(
     failed: dict[str, Exception],
     unsettled: list[UnsettledOrder],
     live: list[LivePlacement],
-    previous: dict[str, int],
     *,
     log: logging.Logger,
-    notifier: TelegramNotifier,
-) -> dict[str, int]:
-    """Log this tick's unreadable orders and return their consecutive counts.
+) -> dict[str, Exception]:
+    """Log this tick's unreadable orders and return why each affected market sits out.
 
-    Each tick logs one warning per affected market. A market whose orders stay
-    unreadable for READ_FAILURE_ALERT_TICKS ticks in a row is reported once as
-    an error (and through Telegram when enabled), since it will not quote until
-    those fills can be read.
+    Such a market is not quoted this tick rather than quoted on missing fills;
+    the not-quoting alert reports it if that lasts.
     """
-    counts = {order_id: previous.get(order_id, 0) + 1 for order_id in failed}
     by_market: dict[str, list[str]] = {}
     for order_id in failed:
         market = next(iter(_markets_of({order_id}, unsettled, live)), "?")
         by_market.setdefault(market, []).append(order_id)
+    out: dict[str, Exception] = {}
     for market, order_ids in sorted(by_market.items()):
         error = failed[order_ids[0]]
         log.warning(
             "could not read fills for %s order(s) %s; not quoting it this tick: %s",
             market, ",".join(order_ids), error,
         )
-        if max(counts[order_id] for order_id in order_ids) == READ_FAILURE_ALERT_TICKS:
-            log.error(
-                "%s fills unreadable for %d ticks in a row; it is not quoting",
-                market, READ_FAILURE_ALERT_TICKS,
-            )
-            notifier.notify_error(f"{market} not quoting", error)
-    return counts
+        out[market] = RuntimeError(f"its fills could not be read ({_first_line(error)})")
+    return out
 
 
 def _filled_quantities(fills: dict[str, list[dict]]) -> dict[str, Decimal]:

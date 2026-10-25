@@ -81,8 +81,11 @@ Pricing:
   alerted once per episode. Only when Wise fails too is the pair skipped.
 - A failing (Wise down too) or sub-minimum pair is skipped in isolation; the
   other pairs still quote. A tick is fully skipped only when no pair produces a
-  quote. A pair skipped on every tick for 15 minutes is alerted once
-  (`DarkPairAlerts`, persisted in `dark_pairs`), and once more when it quotes.
+  quote. Not quoting is tracked in one place (`QuotingAlerts`, persisted in
+  `quoting`): a pair that places nothing for max(3 polls, 15 minutes) while
+  others quote is alerted once with its reason (source down, fills unreadable,
+  Sera refusing it or calling it inactive, no funds), and once more when it
+  quotes; Wise unreachable that long is one more such record.
 
 Positions and return orders:
 
@@ -108,8 +111,8 @@ Positions and return orders:
   book.
 - An order whose fills cannot be read (an error, or a row rotor cannot parse)
   is never settled that tick, and its market is not quoted that tick; other
-  markets are. After 12 ticks in a row it is reported as an error (and through
-  Telegram when enabled).
+  markets are. If that lasts, `QuotingAlerts` reports the market with the
+  read error.
 - The breakeven is the order's limit price, which fills meet or beat.
 - A return bid is never above the position's fill price and an ask never below
   it; bids round down and asks round up, so grid rounding cannot cross it.
@@ -124,9 +127,11 @@ Positions and return orders:
 Live order lifecycle:
 
 - Startup retries only temporary failures (network errors, Sera 5xx/429, a
-  degraded `/health`), at most 3 attempts per clock hour counted in
-  `<state>.boot.json`, then waits for the next hour; other failures stop at
-  once. The Telegram notifier exists before any startup step, so failures alert.
+  degraded `/health`), every 60 s; a `--once` fire exits 1 and leaves the retry
+  to the next fire. Other failures stop at once. `StartupOutage` keeps the
+  outage in `<state>.boot.json`, so it alerts when it begins, again every 6
+  hours, and once on the start that ends it, across restarts and fires. The
+  Telegram notifier exists before any startup step, so failures alert.
 - Dry-run never signs, places, or cancels.
 - Live mode unlocks the wallet before any signing path.
 - Rotor reattaches only open orders it placed (`_known_order_ids`: tracked
@@ -163,10 +168,13 @@ Live order lifecycle:
   live run records them (`identity` table) and any run with others refuses to
   start, so positions never move between networks or wallets. Dry-run never
   opens the state file.
-- The stall watchdog (`StallWatchdog`) alerts when no fresh quote set has gone
-  out for max(3 polls, 15 minutes). Its clock is in the state file, so `--once`
-  fires share it; a fire checks only after placing nothing, so a successful
-  fire never alerts on the gap before it.
+- `QuotingAlerts` also alerts when no order has gone out at all for max(3
+  polls, 15 minutes), listing each pair's reason, and repeats every such
+  window; the next placement reports that quoting resumed. That alert covers
+  the dark pairs, so they get no separate per-pair alert. A continuous run
+  starts this clock at boot; `--once` fires carry it over in the state file,
+  and a fire checks it before exiting, so a fire that places never alerts on
+  the gap before it.
 - `--cancel-on-exit` is opt-in and cancels only tracked placements, waiting out
   Sera's 5-minute cancel cooldown once (a second stop signal skips it); a stop
   seen before Phase 7 places nothing new; leftovers are alerted and the loop
@@ -235,7 +243,8 @@ VL behavior:
   quote puts the previous metadata back (`CLIENT_METADATA`).
 - A market Sera rejects as not active (error code `PAIR_INACTIVE`, or a VL
   batch message naming the pair) is dropped from that batch, which is re-sent
-  without it, and is not quoted again until the next successful refresh.
+  without it, and is not quoted again until the next successful refresh; it is
+  alerted through `QuotingAlerts` like any pair that stops quoting.
 - A group below the batch minimum uses standalone placement.
 - Local budget checks count spend the way Sera locks it: a VL batch counts as
   its largest leg (siblings share one budget and only one can fill at a time),

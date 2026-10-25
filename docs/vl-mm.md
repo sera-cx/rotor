@@ -68,7 +68,7 @@ that price or better (on Sera a maker receives exactly its limit), so the
 breakeven is never optimistic. A fill that lands between a tick's fill read and
 its cancel is seen one tick later. If an order's fills cannot be read in a tick,
 that order is not settled and its market sits the tick out while the others
-quote; rotor reports it as an error if that lasts 12 ticks.
+quote; if that lasts, the not-quoting alert below reports it.
 
 Requests to Sera are paced to its documented per-wallet limits (10 reads, 5
 order placements and 2 cancels per second), and rate-limited or briefly failing
@@ -225,13 +225,15 @@ Pairs are isolated within a tick: if a pair has no mid at all (its source and
 Wise both fail), or its quote fails market minimums, only that pair is skipped —
 the other configured pairs still quote. A tick is fully skipped only when no pair
 produces a quote. With `--telegram`, a pair that has placed no order for 15
-minutes in a row is alerted once with the reason (its price source failing, its
-fills unreadable, Sera refusing its orders or the VL batch they share, or no
-funds for any of its orders), and again once when it quotes again. A pair
-counts as quoting only if one of its orders went out. Wise being unreachable for 15
-minutes, so normal orders sit at the mid ± `fallback_weekend_bps`, is alerted
-once the same way, with a notice when it answers again. These episodes are kept
-in the state file, so `--once` fires share them. Placement is isolated the same way: an order or VL batch that
+minutes in a row (3 cadences if that is longer) is alerted once with the reason
+(its price source failing, its fills unreadable, Sera refusing its orders or the
+VL batch they share, Sera calling the pair inactive, or no funds for any of its
+orders), and again once when it quotes again. A pair counts as quoting only if
+one of its orders went out. Wise being unreachable that long, so normal orders
+sit at the mid ± `fallback_weekend_bps`, is alerted once the same way, with a
+notice when it answers again. When no pair is quoting, one stall alert (see
+[Live Run](#live-run)) lists every pair's reason instead. These records are kept in
+the state file, so `--once` fires share them. Placement is isolated the same way: an order or VL batch that
 Sera rejects (for example an ask whose base token the wallet does not hold) is
 logged and skipped, and the tick's other orders still go out.
 
@@ -251,13 +253,12 @@ prints only logs. It does not sign, place, or cancel orders.
 
 Startup loads the config, bootstraps Sera, and builds the pairs. A temporary
 failure (a network error, a Sera server error or rate limit, or Sera reporting
-it is not ready) is retried after 30 and then 60 seconds. At most 3 startup
-attempts run per clock hour; after the third failure rotor waits for the next
-hour (a `--once` fire just exits). The count is kept in `<state>.boot.json`, so
-restarts and scheduled fires share it. Any other failure (a bad config, a wrong
-contract or token, no quotable pair, a locked state file) stops rotor at once.
-With `--telegram`, the hour's first and third failure and the start that
-follows them each send an alert.
+it is not ready) is retried every 60 seconds until Sera answers; a `--once`
+fire exits instead and the next fire tries again. Any other failure (a bad
+config, a wrong contract or token, no quotable pair, a locked state file) stops
+rotor at once. With `--telegram`, an outage alerts when it begins, again every 6
+hours while it lasts, and once more when rotor starts. It is kept in
+`<state>.boot.json`, so restarts and scheduled fires share it.
 
 ## Sera Changes While Running
 
@@ -274,8 +275,8 @@ Between refreshes:
 - When Sera rejects an order or a VL batch leg because its pair is not active,
   rotor re-sends the rest of the batch without that leg in the same cycle
   (standalone if fewer legs than Sera's batch minimum remain), then stops
-  quoting that pair until the next refresh. With `--telegram` it alerts once
-  per pair.
+  quoting that pair until the next refresh. With `--telegram` the not-quoting
+  alert reports it once it has sat out 15 minutes.
 - A rejection that suggests rotor's metadata is out of date (HTTP 422, or an
   amount below Sera's minimum) brings the next refresh forward to 10 minutes
   after the last one.
@@ -309,11 +310,11 @@ server returns, and it refuses to start if `GET /config` names a contract other
 than Sera's for mainnet or Sepolia, or if `GET /markets` gives a mainnet token
 an address or decimals other than the ones rotor pins. With
 `--telegram`, an alert fires if quoting stalls (no successful placement for 3
-cadences, at least 15 minutes) and repeats at most once per that window, so a
-silent stall is not masked by the hourly heartbeat; the first placement after it
-reports that quoting resumed. The stall clock is kept in the state file, so
-`--once` fires share it: a fire that places nothing alerts once the stall has
-lasted that long across fires.
+cadences, at least 15 minutes), listing why each pair is not quoting, and
+repeats at most once per that window, so a silent stall is not masked by the
+hourly heartbeat; the first placement after it reports that quoting resumed.
+The stall clock is kept in the state file, so `--once` fires share it: a fire
+that places nothing alerts once the stall has lasted that long across fires.
 
 On startup, Rotor reattaches the open orders on its configured markets that it
 placed (those in its state file or settlement ledger). Run one rotor per wallet:

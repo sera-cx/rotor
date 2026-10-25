@@ -780,17 +780,21 @@ def test_run_skips_only_the_market_whose_fills_could_not_be_read(monkeypatch):
 
 
 def test_run_alerts_once_when_an_orders_fills_stay_unreadable(monkeypatch):
+    # Ticks every 305 s; XSGD's fills are unreadable from tick 2, so tick 5 is
+    # the first a full window (915 s) into it.
     client = _FakeClient()
     client.unreadable_market = "XSGD/USDC"
     client.unreadable_ticks = range(2, 100)
     notifier = _RecordingNotifier()
     _wire_runner(monkeypatch, client=client, notifier=notifier)
-    _stop_after_sleeps(monkeypatch, vr.READ_FAILURE_ALERT_TICKS + 3)
+    _fake_clock(monkeypatch, steps=[305.0] * 7)
 
     result = _run(telegram=True)
 
     assert result == 0
-    assert len(notifier.containing("XSGD/USDC not quoting")) == 1
+    assert [text for text, _ in notifier.containing("Not quoting these pairs")] == [
+        "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
+        "XSGD/USDC for 15m: its fills could not be read (RATE_LIMITED: slow down (HTTP 429))"]
     # EURC kept quoting on every tick throughout.
     assert all("EURC/USDC" in tick for tick in _markets_quoted_per_tick(client))
 
@@ -904,37 +908,54 @@ def test_run_retries_a_temporary_startup_failure_and_reports_recovery(monkeypatc
 
     assert result == 0
     assert _boots(client) == 3
-    # One alert for the hour's first failure (not the second), one on recovery.
-    assert len(notifier.containing("rotor could not start (attempt 1 of 3 this hour)")) == 1
-    assert notifier.containing("attempt 2 of 3") == []
-    assert len(notifier.containing("rotor started after 2 failed attempt(s)")) == 1
+    # One alert when the outage begins (not one per attempt), one on recovery.
+    assert len(notifier.containing("rotor could not start; retrying every 60s")) == 1
+    assert len(notifier.containing("could not start")) == 1
+    assert len(notifier.containing("rotor started after failing to start for 0m")) == 1
     assert len(client.batch_places) == 1
     assert not (tmp_path / "state.sqlite.boot.json").exists()
 
 
-def test_run_waits_for_the_next_hour_after_three_failed_startups(monkeypatch, tmp_path):
-    clock = {"now": T0 + 600.0}
+def test_run_retries_every_minute_and_reminds_while_sera_stays_down(monkeypatch, tmp_path):
+    # Sera is down for 7 hours; rotor retries every 60 s and quotes once it answers.
+    clock = {"now": T0}
     client = _FakeClient()
-    client.bootstrap_errors = [SERA_DOWN] * 10
+    client.bootstrap_errors = [SERA_DOWN] * 420
     notifier = _RecordingNotifier()
-    stop = _StopFlag(stop_on_wait_over=120)
-    _wire_runner(monkeypatch, client=client, source=_SequencedSource({}), notifier=notifier)
+    stop = _StopFlag()
+    record_wait = stop.wait
+
+    def wait(timeout: float) -> bool:
+        clock["now"] += timeout
+        return record_wait(timeout)
+
+    def stop_after_one_tick(_started, _poll, _stop=None) -> None:
+        stop.requested = True
+
+    stop.wait = wait
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
+    monkeypatch.setattr(vr, "sleep_remaining", stop_after_one_tick)
     monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
 
     result = vr.run(config_path="vl.toml", telegram=True, state_path=tmp_path / "state.sqlite")
 
-    assert result == 1
-    assert _boots(client) == 3
-    # 30 s and 60 s between attempts, then until the top of the next hour.
-    assert stop.waits == [30.0, 60.0, 3000.0]
-    errors = [text for text, _ in notifier.messages if "rotor could not start" in text]
-    assert len(errors) == 2
-    assert "attempt 3 of 3 this hour; next attempt at" in errors[1]
+    assert result == 0
+    assert _boots(client) == 421
+    assert stop.waits[:420] == [60.0] * 420
+    # The outage is alerted when it begins and again six hours in.
+    assert [text.split(": None")[0] for text, _ in notifier.containing("start")] == [
+        "error: rotor could not start; retrying every 60s",
+        "error: rotor still cannot start after 6h 0m; retrying every 60s",
+        "✅ rotor started after failing to start for 7h 0m",
+        "VL mm started on Sepolia testnet as 0x1111111111111111111111111111111111111111 "
+        "pairs=2 budgets=USDC",
+    ]
+    assert len(client.batch_places) == 1
 
 
-def test_fire_once_runs_share_the_hourly_startup_budget(monkeypatch, tmp_path):
-    clock = _frozen_clock(monkeypatch, T0 + 600.0)
+def test_fire_once_runs_share_one_startup_outage(monkeypatch, tmp_path):
+    clock = _frozen_clock(monkeypatch, T0)
     client = _FakeClient()
     client.bootstrap_errors = [SERA_DOWN] * 10
     notifier = _RecordingNotifier()
@@ -944,16 +965,21 @@ def test_fire_once_runs_share_the_hourly_startup_budget(monkeypatch, tmp_path):
         return vr.run(config_path="vl.toml", once=True, telegram=True,
                       state_path=tmp_path / "state.sqlite")
 
+    # Every fire tries Sera, and leaves retrying to the next fire; only the
+    # first alerts.
     assert [fire() for _ in range(4)] == [1, 1, 1, 1]
-    # The fourth fire in the hour does not contact Sera; only the first and the
-    # third (the hour's last attempt) alert.
-    assert _boots(client) == 3
-    assert len([t for t, _ in notifier.messages if "rotor could not start" in t]) == 2
+    assert _boots(client) == 4
+    assert len(notifier.containing("rotor could not start")) == 1
+    assert notifier.containing("retrying") == []
 
-    clock["now"] += 3600.0
+    clock["now"] += vr.BOOT_REMINDER_SECONDS
+    assert fire() == 1
+    assert len(notifier.containing("rotor still cannot start after 6h 0m")) == 1
+
     client.bootstrap_errors = []
     assert fire() == 0
-    assert _boots(client) == 4
+    assert _boots(client) == 6
+    assert len(notifier.containing("rotor started after failing to start for 6h 0m")) == 1
 
 
 def test_run_does_not_retry_a_startup_failure_retrying_cannot_fix(monkeypatch, tmp_path):
@@ -973,18 +999,19 @@ def test_run_does_not_retry_a_startup_failure_retrying_cannot_fix(monkeypatch, t
 
 def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkeypatch):
     # XSGD/USDC is deactivated after tick 1 but stays listed. Tick 2's USDC bid
-    # batch is re-sent without it, ticks 2-3 leave it out with one alert, and
-    # the hourly metadata refresh (tick 4) tries it again once Sera reactivates it.
+    # batch is re-sent without it, ticks 2-12 leave it out (alerted once it has
+    # sat out a window, at tick 5), and the hourly metadata refresh (tick 13)
+    # tries it again once Sera reactivates it.
     client = _FakeClient()
     notifier = _RecordingNotifier()
     _wire_runner(monkeypatch, client=client, notifier=notifier)
-    clock = _fake_clock(monkeypatch, steps=[305.0, 305.0, 3600.0, 1.0])
+    clock = _fake_clock(monkeypatch, steps=[305.0] * 12 + [1.0])
     real_sleep = vr.sleep_remaining
 
     def deactivate_after_first_tick(started, poll, stop=None):
         if clock["now"] == T0:
             client.inactive_markets = {"XSGD/USDC"}
-        if clock["now"] == T0 + 610.0:
+        if clock["now"] == T0 + 1220.0:
             client.inactive_markets = set()
         real_sleep(started, poll, stop)
 
@@ -995,14 +1022,18 @@ def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkey
     assert result == 0
     assert _markets_quoted_per_tick(client) == [
         {"XSGD/USDC", "EURC/USDC"},
-        {"EURC/USDC"},
-        {"EURC/USDC"},
+        *[{"EURC/USDC"}] * 11,
         {"XSGD/USDC", "EURC/USDC"},
     ]
     # Sera rejected XSGD/USDC only on tick 2 (the bid batch, then the ask);
-    # tick 3 did not send it.
+    # ticks 3-12 did not send it.
     assert client.inactive_rejections == ["XSGD/USDC", "XSGD/USDC"]
-    assert len(notifier.containing("Sera says XSGD/USDC is not active")) == 1
+    assert [text for text, _ in notifier.containing("XSGD/USDC")] == [
+        "⚠️ Not quoting these pairs; the other pairs are quoting:\n"
+        "XSGD/USDC for 15m: None: Pair XSGD/USDC is not an active trading pair. "
+        "See GET /markets for available pairs. (HTTP 400)",
+        "✅ Quoting again:\nXSGD/USDC after 55m",
+    ]
     # Boot plus the hourly refresh.
     assert _boots(client) == 2
 
