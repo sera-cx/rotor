@@ -151,6 +151,7 @@ class _StopFlag:
 class _FakeClient:
     vl_batch_min = 2
     vl_batch_max = 50
+    executor_id = 0
     owner_address = "0x" + "11" * 20
     eip712_domain = {
         "chainId": 11155111,
@@ -1228,6 +1229,30 @@ def test_run_keeps_quoting_through_failed_metadata_refreshes_and_alerts_once(mon
     assert all(markets == {"XSGD/USDC", "EURC/USDC"} for markets in _markets_quoted_per_tick(client))
     assert len(notifier.containing("could not refresh Sera market metadata")) == 1
     assert len(notifier.containing("metadata refreshed again")) == 1
+
+
+def test_a_refresh_that_finds_no_configured_market_keeps_the_last_metadata(monkeypatch):
+    # Sera serves an empty market list for a moment (its boot order) just as
+    # the hourly refresh runs: rotor keeps quoting on the metadata it had.
+    client = _FakeClient()
+    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
+    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    clock = _fake_clock(monkeypatch, steps=[3600.0, 1.0])
+    markets = client.markets_by_symbol
+    real_bootstrap = client.bootstrap
+
+    def empty_after_an_hour():
+        real_bootstrap()
+        if clock["now"] > T0:
+            client.markets_by_symbol = {}
+
+    client.bootstrap = empty_after_an_hour
+
+    vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
+
+    assert client.markets_by_symbol is markets
+    assert len(_markets_quoted_per_tick(client)) == 2
+    assert all(m == {"XSGD/USDC", "EURC/USDC"} for m in _markets_quoted_per_tick(client))
 
 
 def test_debug_logging_never_logs_telegram_request_urls(caplog, tmp_path):

@@ -108,6 +108,9 @@ BOOT_RETRY_WAITS = (30.0, 60.0)
 # and no sooner than EARLY_REFRESH_SECONDS after the last read when a rejection
 # suggests it went stale. Markets Sera rejects as inactive sit out until then.
 METADATA_REFRESH_SECONDS = 3600.0
+# What client.bootstrap() replaces; put back if a refresh leaves no pair to quote.
+CLIENT_METADATA = (
+    "eip712_domain", "vl_batch_min", "vl_batch_max", "executor_id", "markets_by_symbol")
 EARLY_REFRESH_SECONDS = 600.0
 # How Sera names an inactive pair when it rejects a VL batch.
 _INACTIVE_PAIR = re.compile(r"Pair (\S+) is not an active trading pair")
@@ -1493,16 +1496,25 @@ def _refresh_runtimes(
     on any failure this raises and the caller keeps the current pairs. Pairs
     that drop out (unlisted, unmapped) are logged and alerted once here.
     """
+    saved = {name: getattr(client, name) for name in CLIENT_METADATA}
     client.bootstrap()
     skipped: dict[str, str] = {}
-    fresh = _build_runtimes(
-        config,
-        client,
-        max_reference_age_s=max_reference_age_s,
-        carry_stale=carry_stale,
-        log=log,
-        skipped=skipped,
-    )
+    try:
+        fresh = _build_runtimes(
+            config,
+            client,
+            max_reference_age_s=max_reference_age_s,
+            carry_stale=carry_stale,
+            log=log,
+            skipped=skipped,
+        )
+    except Exception:
+        # Bootstrap already applied metadata with no pair to quote (Sera
+        # briefly serving an empty market list, say); keep the current pairs
+        # quoting on the metadata they were built from.
+        for name, value in saved.items():
+            setattr(client, name, value)
+        raise
     dropped = {rt.config.market for rt in runtimes} & set(skipped)
     if dropped and notifier is not None:
         notifier.send_raw(
