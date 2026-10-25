@@ -53,8 +53,6 @@ class DailyGitUpdater:
         *,
         repo_path: str | Path | None = None,
         interval_seconds: float = DEFAULT_UPDATE_INTERVAL_SECONDS,
-        remote: str | None = None,
-        branch: str | None = None,
         puller: Puller | None = None,
         running_commit: str | None = None,
         start_check: StartCheck | None = None,
@@ -67,8 +65,6 @@ class DailyGitUpdater:
         """
         self.repo_path = Path(repo_path) if repo_path is not None else default_repo_root()
         self.interval_seconds = max(1.0, float(interval_seconds))
-        self.remote = remote
-        self.branch = branch
         self._puller = pull_latest if puller is None else puller
         self.running_commit = (
             running_commit if running_commit is not None else current_commit(self.repo_path))
@@ -87,11 +83,7 @@ class DailyGitUpdater:
             return None
         self._next_check_at = current + self.interval_seconds
         try:
-            result = self._puller(
-                repo_path=self.repo_path,
-                remote=self.remote,
-                branch=self.branch,
-            )
+            result = self._puller(repo_path=self.repo_path)
         except Exception as exc:  # pragma: no cover - defensive guard.
             result = GitUpdateResult(status="failed", message=str(exc))
         if result.status == "failed" and result.output:
@@ -154,8 +146,6 @@ def default_repo_root() -> Path:
 def pull_latest(
     *,
     repo_path: str | Path | None = None,
-    remote: str | None = None,
-    branch: str | None = None,
     timeout_seconds: float = 120.0,
     git_runner: GitRunner | None = None,
 ) -> GitUpdateResult:
@@ -169,10 +159,6 @@ def pull_latest(
             message=f"{repo} is not a git worktree",
             output=_combined_output(inside),
         )
-
-    top_level = run_git(repo, ["rev-parse", "--show-toplevel"], timeout_seconds)
-    if top_level.returncode == 0 and top_level.stdout.strip():
-        repo = Path(top_level.stdout.strip())
 
     # Only changed tracked files block a pull. Untracked files (the config,
     # state, and .env that live in the checkout) cannot conflict with a
@@ -198,10 +184,10 @@ def pull_latest(
             message="could not determine current git branch",
             output=_combined_output(current_branch),
         )
-    if current_branch.stdout.strip() == "HEAD" and branch is None:
+    if current_branch.stdout.strip() == "HEAD":
         return GitUpdateResult(
             status="skipped",
-            message="checkout is detached; configure a branch before auto-update",
+            message="checkout is detached; check out a branch to auto-update",
         )
 
     before_result = run_git(repo, ["rev-parse", "HEAD"], timeout_seconds)
@@ -213,14 +199,7 @@ def pull_latest(
         )
     before = before_result.stdout.strip()
 
-    pull_args = ["pull", "--ff-only"]
-    if remote and branch:
-        pull_args.extend([remote, branch])
-    elif remote:
-        pull_args.append(remote)
-    elif branch:
-        pull_args.extend(["origin", branch])
-    pulled = run_git(repo, pull_args, timeout_seconds)
+    pulled = run_git(repo, ["pull", "--ff-only"], timeout_seconds)
     if pulled.returncode != 0:
         return GitUpdateResult(
             status="failed",

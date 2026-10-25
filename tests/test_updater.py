@@ -32,7 +32,6 @@ def test_pull_latest_skips_dirty_worktree(tmp_path):
     calls: list[list[str]] = []
     responses = iter([
         GitCommandResult(returncode=0, stdout="true\n"),
-        GitCommandResult(returncode=0, stdout=f"{tmp_path}\n"),
         GitCommandResult(returncode=0, stdout=" M rotor/mm/vl_runner.py\n"),
     ])
 
@@ -53,7 +52,6 @@ def test_pull_latest_reports_fast_forward_update(tmp_path):
     calls: list[list[str]] = []
     responses = iter([
         GitCommandResult(returncode=0, stdout="true\n"),
-        GitCommandResult(returncode=0, stdout=f"{tmp_path}\n"),
         GitCommandResult(returncode=0, stdout=""),
         GitCommandResult(returncode=0, stdout="main\n"),
         GitCommandResult(returncode=0, stdout=f"{before}\n"),
@@ -65,25 +63,19 @@ def test_pull_latest_reports_fast_forward_update(tmp_path):
         calls.append(args)
         return next(responses)
 
-    result = pull_latest(
-        repo_path=tmp_path,
-        remote="origin",
-        branch="main",
-        git_runner=fake_git,
-    )
+    result = pull_latest(repo_path=tmp_path, git_runner=fake_git)
 
     assert result.status == "updated"
     assert result.updated is True
     assert result.before == before
     assert result.after == after
-    assert ["pull", "--ff-only", "origin", "main"] in calls
+    assert ["pull", "--ff-only"] in calls
 
 
 def test_pull_latest_reports_unchanged_when_head_does_not_move(tmp_path):
     head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     responses = iter([
         GitCommandResult(returncode=0, stdout="true\n"),
-        GitCommandResult(returncode=0, stdout=f"{tmp_path}\n"),
         GitCommandResult(returncode=0, stdout=""),
         GitCommandResult(returncode=0, stdout="main\n"),
         GitCommandResult(returncode=0, stdout=f"{head}\n"),
@@ -112,8 +104,6 @@ def test_daily_git_updater_runs_only_when_due(tmp_path):
     updater = DailyGitUpdater(
         repo_path=tmp_path,
         interval_seconds=10,
-        remote="origin",
-        branch="main",
         puller=fake_puller,
     )
     log = logging.getLogger("tests.updater")
@@ -123,8 +113,6 @@ def test_daily_git_updater_runs_only_when_due(tmp_path):
     assert updater.run_if_due(log, now=111.0).status == "unchanged"
     assert len(calls) == 2
     assert calls[0]["repo_path"] == tmp_path
-    assert calls[0]["remote"] == "origin"
-    assert calls[0]["branch"] == "main"
 
 
 def test_daily_git_updater_contains_puller_exceptions(tmp_path):
