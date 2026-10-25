@@ -74,7 +74,7 @@ class VLConfig:
     fixed_bps: Decimal
     # Closest a return order may quote to the latest source mid.
     return_bps: Decimal
-    # Hours a return order takes to walk from the normal quote to the fill price.
+    # Hours a return order takes to walk from 2 x fixed_bps away to the fill price.
     return_window_hours: Decimal = Decimal("48")
 
     @property

@@ -2,13 +2,13 @@
 
 Small Sera Virtual Liquidity market maker.
 
-Rotor runs one autonomous command: `rotor mm vl`. On each cadence tick it fetches
-the latest source mid for each configured market, builds fixed-bps bid/ask quotes,
-cancels the previous tracked quote set when safe, and places the fresh set through
-Sera VL where possible. Inventory a fill moves becomes a position that rotor quotes
-back on the opposite side: the return order walks from the normal quote to the
-fill price over 48 hours (a reverse Dutch auction), then holds at the fill price
-until it fills. See [docs/vl-mm.md](docs/vl-mm.md#returning-fills).
+Rotor runs one autonomous command: `rotor mm vl`. On each cadence tick it quotes
+a bid and an ask on each configured market at Wise's after-fee price for that
+order's size, cancels the previous tracked quote set when safe, and places the
+fresh set through Sera VL where possible. Inventory a fill moves becomes a
+position that rotor quotes back on the opposite side: the return order starts
+`2 x fixed_bps` from the fill price and walks to it over 48 hours (a reverse
+Dutch auction), then holds at the fill price until it fills. See [docs/vl-mm.md](docs/vl-mm.md#returning-fills).
 
 ## Install
 

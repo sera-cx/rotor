@@ -166,8 +166,8 @@ Rules:
   Sunday 21:00 UTC), on a carried mid, or while Wise is unreachable. Both can be
   set globally or per pair, and `fallback_weekend_bps` must be at least
   `fallback_bps`. The other side keeps Wise's price if Wise can give it.
-- The mid sets how close a return order may come (`return_bps`) and how far its
-  auction starts; normal quotes do not use it.
+- The mid sets how close a return order may come (`return_bps`), and anchors a
+  side Wise cannot price; normal quotes at Wise's price do not use it.
 - `fixed_bps` (global or per pair) sets where a return order starts after a
   fill: `2 x fixed_bps` from the fill price. It does not move normal quotes.
 - `return_bps` is the closest a return order quotes to mid. Every spread must
