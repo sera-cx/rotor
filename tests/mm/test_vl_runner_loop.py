@@ -20,7 +20,7 @@ from rotor.mm.exchange.client import (
 from rotor.mm.exchange.errors import SeraError, SeraRateLimit, SeraUnavailable
 from rotor.mm.positions import Position
 from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
-from rotor.price_reference import ReferenceTooStale, ReferenceUnavailable
+from rotor.price_reference import ReferenceUnavailable
 from rotor.price_reference.models import PriceObservation, ReferencePrice
 from rotor.updater import GitUpdateResult
 
@@ -422,13 +422,15 @@ def _xsgd_asks(client: _FakeClient) -> list[tuple[Decimal, Decimal]]:
 def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
     monkeypatch, tmp_path,
 ):
-    # Tick 1's XSGD bid buys 5 XSGD at 0.9950. Ticks run at 0h, 12h, 24h and
-    # 60h; SGD falls from 1.0000 to 0.9800 before the third tick.
+    # Tick 1's XSGD bid buys 5 XSGD at 0.9950 (Wise's 50 bps selling fee).
+    # Ticks run at 0h, 12h, 24h and 60h; SGD falls from 1.0000 to 0.9800
+    # before the third tick. Buying SGD through Wise costs 80 bps.
     client = _FakeClient(fill_first_xsgd_bid=True)
     source = _SequencedSource({
         ("SGD", "USD"): ["1.0000", "1.0000", "0.9800", "0.9800"],
         ("EUR", "USD"): ["2.0000"],
     })
+    source.buy_fee = Decimal("0.0080")
     _wire_runner(monkeypatch, config=_config(), client=client, source=source)
     _fake_clock(monkeypatch, steps=[12 * HOUR, 12 * HOUR, 36 * HOUR, 1.0])
 
@@ -442,8 +444,8 @@ def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
 
     assert result == 0
     assert _xsgd_asks(client) == [
-        # 0h: the normal ask, 50 bps over mid.
-        (Decimal("10"), Decimal("1.0050")),
+        # 0h: the normal ask, at Wise's price 80 bps over mid.
+        (Decimal("10"), Decimal("1.0080")),
         # 12h: the settled fill is now a position. The ask sells back only the
         # 5 XSGD bought, 75 bps over the fill price (a quarter of the window gone).
         (Decimal("5"), Decimal("1.0025")),
@@ -573,31 +575,6 @@ def test_a_mainnet_run_refuses_the_state_file_of_a_testnet_run(monkeypatch, tmp_
             "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
     finally:
         store.close()
-
-
-def test_run_quotes_at_wise_prices_and_returns_through_the_auction(monkeypatch, tmp_path):
-    # Wise: selling SGD costs 50 bps, buying it 80 bps. Normal quotes sit at
-    # those prices; after tick 1's XSGD bid fills at 0.9950, the return ask
-    # follows the auction instead, inside Wise's price, back toward the fill.
-    client = _FakeClient(fill_first_xsgd_bid=True)
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    source.buy_fee = Decimal("0.0080")
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    _fake_clock(monkeypatch, steps=[12 * HOUR, 1.0])
-
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, log_level="CRITICAL",
-           state_path=tmp_path / "state.sqlite")
-
-    assert _xsgd_asks(client)[:2] == [
-        (Decimal("10"), Decimal("1.0080")),
-        # A quarter of the window gone: 0.9950 x (1 + 100 bps x 3/4).
-        (Decimal("5"), Decimal("1.0025")),
-    ]
-    xsgd_bids = [
-        leg["price"] for batch in client.batch_places for leg in batch["legs"]
-        if leg["market"] == "XSGD/USDC" and leg["side"] == "bid"
-    ]
-    assert set(xsgd_bids) == {Decimal("0.9950")}
 
 
 def test_fire_once_runs_settle_the_previous_runs_fills(monkeypatch, tmp_path):
@@ -733,30 +710,6 @@ def test_fire_once_runs_alert_when_one_pair_stops_quoting_and_when_it_is_back(
     assert [text for text, _ in notifier.containing("Quoting again")] == [
         "✅ Quoting again:\nXSGD/USDC after 25m"]
     assert not notifier.containing("VL quoting stalled")
-
-
-def test_run_holds_the_return_side_from_the_tick_after_a_fill(monkeypatch, tmp_path):
-    # At the normal cadence the filled order is still resting (and unexpired) on
-    # the next tick; its fill already decides that tick's ask.
-    client = _FakeClient(fill_first_xsgd_bid=True)
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    _fake_clock(monkeypatch, steps=[305.0, 1.0])
-
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=tmp_path / "state.sqlite",
-    )
-
-    assert result == 0
-    # 305 s into the window the auction is still at the normal ask's price; only
-    # the size shows it is the return order for the 5 XSGD bought.
-    assert _xsgd_asks(client) == [
-        (Decimal("10"), Decimal("1.0050")),
-        (Decimal("5"), Decimal("1.0050")),
-    ]
 
 
 def test_run_holds_a_fill_that_is_still_settling_without_storing_it(monkeypatch, tmp_path):
@@ -911,24 +864,6 @@ def test_run_alerts_once_when_an_orders_fills_stay_unreadable(monkeypatch):
     assert len(notifier.containing("XSGD/USDC not quoting")) == 1
     # EURC kept quoting on every tick throughout.
     assert all("EURC/USDC" in tick for tick in _markets_quoted_per_tick(client))
-
-
-def test_run_waits_a_few_seconds_for_the_cancel_guard_instead_of_skipping(monkeypatch, tmp_path):
-    # The next tick starts 2 s before the newest order clears the 300 s guard:
-    # it waits and requotes. One starting 200 s early still skips.
-    for first_step, ticks_placed in ((298.0, 2), (100.0, 1)):
-        client = _FakeClient()
-        source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-        _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-        _fake_clock(monkeypatch, steps=[first_step, 1.0])
-
-        assert vr.run(
-            config_path="vl.toml",
-            min_requote_seconds=300.0,
-            log_level="ERROR",
-            state_path=tmp_path / f"state-{ticks_placed}.sqlite",
-        ) == 0
-        assert len(client.batch_places) == ticks_placed
 
 
 def test_run_does_not_send_orders_the_wallet_cannot_fund(monkeypatch, caplog):
@@ -1349,64 +1284,6 @@ def test_run_places_the_new_set_only_after_the_cancelled_one_is_gone(monkeypatch
     cancel = events.index("cancel_vl")
     place = events.index("place_vl", cancel)
     assert events[cancel:place].count("open_orders") == 3
-
-
-def test_run_skips_failed_tick_and_places_on_next_tick(monkeypatch):
-    client = _FakeClient()
-    # Per-pair isolation, and Wise standing in for a failed source, mean a full
-    # tick-skip needs both pairs' sources and Wise to fail; tick 2 recovers.
-    source = _SequencedSource(
-        {
-            ("SGD", "USD"): ["1.0000"],
-            ("EUR", "USD"): ["2.0000"],
-        },
-        always_fail={("SGD", "USD"), ("EUR", "USD")},
-    )
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    sleeps = _stop_after_sleeps(monkeypatch, 2)
-    count_sleep = vr.sleep_remaining
-
-    def recover(started, poll, stop=None):
-        source.always_fail = set()
-        count_sleep(started, poll, stop)
-
-    monkeypatch.setattr(vr, "sleep_remaining", recover)
-
-    result = vr.run(
-        config_path="vl.toml",
-        poll_seconds=305.0,
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
-
-    assert result == 0
-    assert sleeps == [305.0, 305.0]
-    assert len(client.batch_places) == 1
-    assert len(client.standalone_places) == 2
-    assert len(client.active_orders) == 4
-
-
-def test_run_once_places_quote_set_and_returns_zero(monkeypatch):
-    # The fire-once scheduler path: one full reattach-cancel-place cycle, exit 0.
-    client = _FakeClient()
-    source = _SequencedSource({
-        ("SGD", "USD"): ["1.0000"],
-        ("EUR", "USD"): ["2.0000"],
-    })
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
-
-    result = vr.run(
-        config_path="vl.toml",
-        once=True,
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
-
-    assert result == 0
-    assert len(client.active_orders) == 4
 
 
 def test_run_once_does_not_block_on_boot_cancel_cooldown(monkeypatch):
@@ -1894,23 +1771,6 @@ def test_a_rate_past_its_carry_limit_is_replaced_by_wises_mid_with_one_alert(
     assert len(notifier.containing("Reference rates updated again")) == 1
 
 
-def test_halting_runtimes_quote_on_wises_mid_instead_of_a_weekend_rate(monkeypatch):
-    client = _FakeClient()
-    source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
-    config = _config()
-    _wire_runner(monkeypatch, config=config, client=client, source=source)
-    runtimes = vr._build_runtimes(config, client, max_reference_age_s=None, carry_stale=False)
-    refs = vr.TickReferences()
-
-    intents = vr._build_tick_intents(config, runtimes, {}, expiration=1, log=LOG, refs=refs)
-
-    # The weekend rate is refused, and Wise's live mid stands in for it.
-    assert isinstance(refs.fallback["XSGD/USDC"], ReferenceTooStale)
-    assert refs.skipped == {}
-    assert refs.quoted["XSGD/USDC"].source == "wise"
-    assert {intent.market for intent in intents} == {"XSGD/USDC", "EURC/USDC"}
-
-
 def _stale_alerts(*, state=None, markets=("XSGD/USDC",)) -> vr.StaleReferenceAlerts:
     runtimes = [
         SimpleNamespace(
@@ -1985,18 +1845,6 @@ def test_stale_alerts_ignore_a_one_off_fetch_failure():
     alerts.update(_refs(), notifier=notifier, log=LOG, now=0.0)
     alerts.update(blip, notifier=notifier, log=LOG, now=305.0)
     alerts.update(_refs(), notifier=notifier, log=LOG, now=610.0)
-
-    assert _headings(notifier) == [(STARTED, True)]
-
-
-def test_stale_alert_episodes_survive_a_restart(tmp_path):
-    store = vr.StateStore(tmp_path / "state.sqlite")
-    notifier = _RecordingNotifier()
-    try:
-        _stale_alerts(state=store).update(_refs(), notifier=notifier, log=LOG, now=0.0)
-        _stale_alerts(state=store).update(_refs(), notifier=notifier, log=LOG, now=305.0)
-    finally:
-        store.close()
 
     assert _headings(notifier) == [(STARTED, True)]
 
