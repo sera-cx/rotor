@@ -258,27 +258,11 @@ class SeraClient:
         All-or-nothing: the client's state changes only once every response has
         been fetched and checked, so a failed refresh keeps the last good state.
         """
-        # `/config` provides signing-domain data and public limits.
+        # `/config` provides signing-domain data and public limits. Sera sends
+        # eip712_domain whenever it knows its chain and contract, so a missing
+        # one means it cannot verify signatures either.
         cfg = self._request("GET", "/config", authed=False)
-        # Prefer the full server-provided domain, but tolerate older configs
-        # that expose only chain_id and sera_address.
-        server_domain = cfg.get("eip712_domain")
-        domain = server_domain or {
-            "name": "Sera",
-            "version": "1",
-            "chainId": cfg.get("chain_id"),
-            "verifyingContract": cfg.get("sera_address"),
-        }
-        if not server_domain:
-            # If the real on-chain domain name/version differs from these
-            # hardcoded literals, every signature mis-verifies (orders silently
-            # never place). Surface that we are guessing the domain separator.
-            self._log.warning(
-                "GET /config omitted eip712_domain; assuming name=Sera version=1 "
-                "(chainId=%s verifyingContract=%s) — verify against the on-chain domain",
-                domain.get("chainId"),
-                domain.get("verifyingContract"),
-            )
+        domain = cfg.get("eip712_domain") or {}
         # Both fields are mandatory for EIP-712 signature verification.
         if not domain.get("chainId") or not domain.get("verifyingContract"):
             raise RuntimeError(f"GET /config returned incomplete domain: {cfg!r}")
@@ -688,15 +672,8 @@ class SeraClient:
     def _signed(self, order: SignableOrder) -> SignedOrder:
         """Attach rotor's signature over the order's own Order message."""
         wire = dict(order.wire)
-        wire["signature"] = self._sign_order(order)
+        wire["signature"] = self._sign(eip712.ORDER_TYPES, order.struct)
         return SignedOrder(order_id=order.order_id, uuid_int=order.uuid_int, wire=wire)
-
-    def _sign_order(self, order: SignableOrder) -> str:
-        """Sign a locally built order as Sera's Order type."""
-        return self._sign(
-            eip712.ORDER_TYPES,
-            _typed_message_for_signing(eip712.ORDER_TYPES, order.struct),
-        )
 
     def _pace(self, group: str) -> None:
         """Wait until a request in `group` stays within Sera's per-wallet limit."""
@@ -837,41 +814,6 @@ def _parse_healthy_executor_id(health: Any) -> int:
             raise errors.SeraUnavailable(f"GET /health executor drift: {health!r}")
 
     return executor_id
-
-
-def _typed_message_for_signing(types: dict, message: dict) -> dict:
-    """Coerce JSON decimal strings into ints for integer typed-data fields."""
-    # Copy so callers retain the original server payload for debugging.
-    out = dict(message)
-    field_types = {}
-    for fields in types.values():
-        for field in fields:
-            # Flatten all type schemas into a field-name -> EIP type map.
-            field_types[field.get("name")] = field.get("type", "")
-    for key, typ in field_types.items():
-        if key not in out:
-            continue
-        # Leave array/tuple typed fields for eth-account's own ABI coercion.
-        if "[" in typ:
-            continue
-        # eth-account expects Python ints for uint/int fields, while HTTP JSON
-        # may carry those values as decimal or hex strings.
-        if typ.startswith(("uint", "int")):
-            out[key] = _coerce_int(out[key])
-    return out
-
-
-def _coerce_int(value: Any) -> int:
-    """Coerce a typed-data integer field value to int, tolerating hex strings."""
-    if isinstance(value, bool):
-        # bool is an int subclass; preserve it rather than mangling to 0/1.
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if text[:2].lower() == "0x":
-            return int(text, 16)
-        return int(text, 10)
-    return int(value)
 
 
 def _parse_market(m: dict) -> MarketInfo:

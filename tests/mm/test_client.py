@@ -386,28 +386,6 @@ def test_one_malformed_market_row_is_skipped_not_fatal(caplog):
     assert "skipping malformed GET /markets row 'XSGD/USDC'" in caplog.text
 
 
-def test_bootstrap_uses_domain_fallback_when_config_omits_eip712_domain():
-    routes = _build_mock_routes({
-        "GET /config": {
-            "chain_id": 11155111,
-            "sera_address": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
-            "limits": {"vl_batch": {"min": 3, "max": 5}},
-        },
-    })
-    client = _make_client(routes)
-
-    client.bootstrap()
-
-    assert client.eip712_domain == {
-        "name": "Sera",
-        "version": "1",
-        "chainId": 11155111,
-        "verifyingContract": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
-    }
-    assert client.vl_batch_min == 3
-    assert client.vl_batch_max == 5
-
-
 def test_bootstrap_rejects_incomplete_domain():
     routes = _build_mock_routes({
         "GET /config": {
@@ -449,13 +427,9 @@ def test_bootstrap_rejects_unsafe_health_state(health, match):
 
 
 def test_bootstrap_reads_vl_batch_limits_from_config():
-    routes = _build_mock_routes({
-        "GET /config": {
-            "chain_id": 11155111,
-            "sera_address": "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e",
-            "limits": {"vl_batch": {"min": 4, "max": 9}},
-        },
-    })
+    config = _config_route(11155111, "0x83475a1bd98a8dc2dcd507a747e4dc85da241d6e")
+    config["GET /config"]["limits"] = {"vl_batch": {"min": 4, "max": 9}}
+    routes = _build_mock_routes(config)
     client = _make_client(routes)
     client.bootstrap()
 
