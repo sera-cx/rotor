@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -24,8 +23,6 @@ class PriceObservation:
     rate: Decimal
     # Observation timestamp as POSIX seconds for freshness checks.
     ts: float
-    # Raw provider payload is retained for debugging but hidden from repr noise.
-    raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)

@@ -16,14 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-# `rotor <subcommand>` after `poetry install`
-# Subcommand: mm vl
 rotor = "rotor.cli.main:main"
-
-[tool.poetry]
-packages = [
-    { include = "rotor" },
-]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=9.0.3,<10.0.0"
@@ -39,7 +32,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
-ignore = ["E501", "E741"]  # E501: line too long (we override per-file); E741: ambiguous var name
+ignore = ["E501", "E741"]  # E501: line length is left to review (limit above); E741: ambiguous var name
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

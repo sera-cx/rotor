@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-from rotor import __version__
-
 
 def cmd_mm_vl(args) -> int:
     """Run the TOML-driven multi-pair VL market-maker loop."""
@@ -78,13 +76,11 @@ def _unlock_wallet() -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level Rotor argparse command tree."""
-    # Top-level parser owns version handling and command-group dispatch.
+    # Top-level parser owns command-group dispatch.
     parser = argparse.ArgumentParser(
         prog="rotor",
         description="Basic Sera market-making tools",
     )
-    parser.add_argument("--version", action="version",
-                        version=f"rotor {__version__}")
     top = parser.add_subparsers(dest="group", required=True)
 
     # Market-maker command group.

@@ -10,14 +10,6 @@ from rotor.mm import vl_runner
 from rotor.security import key as wallet_key
 
 
-def test_version_exits_successfully(capsys):
-    with pytest.raises(SystemExit) as ei:
-        cli.main(["--version"])
-
-    assert ei.value.code == 0
-    assert "rotor" in capsys.readouterr().out
-
-
 def test_missing_command_exits_with_parser_error():
     with pytest.raises(SystemExit) as ei:
         cli.main([])

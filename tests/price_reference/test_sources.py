@@ -78,7 +78,6 @@ def test_wise_sell_rate_is_what_converting_the_amount_pays_by_the_cheapest_trans
     assert seen == [("/v3/quotes", {
         "sourceCurrency": "SGD", "targetCurrency": "USD", "sourceAmount": 2000.0})]
     assert obs.rate == Decimal("0.777")
-    assert obs.raw["pay_in"] == "BANK_TRANSFER"
 
 
 def test_wise_buy_rate_is_what_buying_the_amount_costs_by_the_cheapest_transfer():
@@ -216,7 +215,6 @@ def test_ecb_source_crosses_rates_through_eur():
 
     assert obs.rate == Decimal("0.8")
     assert obs.pair == "SGD/USD"
-    assert obs.raw["date"] == "2026-05-31"
 
 
 def test_fed_h10_source_crosses_rates_through_usd():

@@ -179,11 +179,6 @@ class WiseRateSource:
             rate=rate,
             # Freshness is anchored to when Wise set the rate.
             ts=_parse_ts(body.get("rateTimestamp") or body.get("createdTime")),
-            raw={
-                "mid_rate": str(body.get("rate", "")),
-                "pay_in": option.get("payIn"),
-                "pay_out": option.get("payOut"),
-            },
         )
 
     def _reply(self, source: str, target: str, amount_field: str, amount: Decimal) -> dict:
@@ -286,7 +281,6 @@ class EcbRateSource:
             # Stamp the published date, not fetch time, so a stale (e.g. weekend
             # or holiday) feed is detectable by the freshness guard.
             ts=_published_ts(date),
-            raw={"date": date, "rate_base": str(base_rate), "rate_quote": str(quote_rate)},
         )
 
     def _fetch(self) -> tuple[str, dict[str, Decimal]]:
@@ -380,7 +374,6 @@ class FedH10RateSource:
             rate=quote_per_usd / base_per_usd,
             # Use the oldest input observation date so a stale leg is detectable.
             ts=_published_ts(base_raw.get("date"), quote_raw.get("date")),
-            raw={"base": base_raw, "quote": quote_raw},
         )
 
     def _currency_per_usd(self, currency: str) -> tuple[Decimal, dict[str, str]]:
@@ -481,7 +474,6 @@ class BnmRateSource:
             rate=base_myr / quote_myr,
             # BNM nests the publication date under each row's rate object.
             ts=_published_ts(_bnm_row_date(base_raw), _bnm_row_date(quote_raw)),
-            raw={"base": base_raw, "quote": quote_raw},
         )
 
     def _latest_session(self) -> dict[str, dict]:

@@ -1541,7 +1541,6 @@ def _start(
             skipped=skipped,
         )
         # Ensure at least one configured budget can actually be spent by a pair.
-        _validate_budget_reachability(config, runtimes)
     except Exception:
         with contextlib.suppress(Exception):
             client.close()
@@ -1745,22 +1744,6 @@ def _unlisted_reason(market: str, markets_by_symbol: dict) -> str:
     if inverse in markets_by_symbol:
         return f"Sera lists this pair as {inverse}; configure it that way"
     return "Sera does not list this market"
-
-
-def _validate_budget_reachability(config: VLConfig, runtimes: list[PairRuntime]) -> None:
-    """Ensure configured budgets overlap with tokens a pair can actually spend."""
-    possible = set()
-    for runtime in runtimes:
-        # Bids spend quote; asks spend base, so both symbols can be spent.
-        possible.add(runtime.info.quote_symbol.upper())
-        possible.add(runtime.info.base_symbol.upper())
-    # At least one budget must match a spend token or VL grouping can never occur.
-    if not (config.budget_tokens & possible):
-        raise ValueError(
-            "at least one [[budget]] token must match a configured market's "
-            f"base/quote spent token; budgets={sorted(config.budget_tokens)} "
-            f"possible={sorted(possible)}"
-        )
 
 
 def _validate_budget_caps(

@@ -29,9 +29,3 @@ def test_public_modules_import_without_runtime_side_effects():
     for module_name in PUBLIC_MODULES:
         importlib.import_module(module_name)
 
-
-def test_package_version_is_present():
-    rotor = importlib.import_module("rotor")
-
-    assert isinstance(rotor.__version__, str)
-    assert rotor.__version__
