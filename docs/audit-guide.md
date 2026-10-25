@@ -43,7 +43,10 @@ Pricing:
 - All price, size, budget, and rate math uses `Decimal`.
 - Tokens are priced at their currency's reference rate (Sera's 1:1 stablecoin
   assumption); rotor reads no token market price, so a depeg is not detected.
-- The source rate is quote-per-base and is the pair's mid. `ecb`/`fed`/`bnm`
+- The source rate is quote-per-base and is the pair's mid: the first fresh rate
+  among the pair's `price_sources`, in order (`_pair_mid`), then Wise's live mid
+  if every rate is only carried, then the first carried rate, then Wise's mid
+  with an alert if every source failed. `ecb`/`fed`/`bnm`
   are published reference rates; `wise` is Wise's mid-market rate (from the
   buy-direction reply, inverted, when Wise cannot convert from the base).
 - Every normal order is priced at Wise's after-fee rate for its own final

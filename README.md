@@ -60,13 +60,13 @@ qty_base = "2000"
 
 [[pair]]
 market = "JPYC/USDC"
-price_source = "ecb"
+price_source = ["ecb", "bnm", "fed"]
 qty_base = "300000"
 fixed_bps = "40"
 ```
 
 Supported FX sources are `wise`, `ecb`, `fed`, and `bnm`; only `fed` needs a
-key. A pair's source sets its mid, but every pair's normal quotes sit at Wise's
+key. A pair's source, or its list of sources tried in order, sets its mid, but every pair's normal quotes sit at Wise's
 after-fee prices for each order's size: the mid and `fixed_bps` shape the return
 orders, and the mid anchors a side Wise cannot price.
 [docs/vl-mm.md](docs/vl-mm.md#config) describes every setting, and

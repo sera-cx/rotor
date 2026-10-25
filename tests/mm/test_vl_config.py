@@ -58,6 +58,15 @@ def test_parse_vl_config_normalizes_market_names():
     assert cfg.pairs[0].market == "XSGD/USDC"
 
 
+def test_price_source_is_one_name_or_a_list_in_priority_order():
+    cfg = parse_vl_config(_config(pair=[
+        {"market": "XSGD/USDC", "price_source": "ECB", "qty_base": "100"},
+        {"market": "EURC/USDC", "price_source": ["fed", "ecb", "bnm"], "qty_base": "100"},
+    ]))
+
+    assert [pair.price_sources for pair in cfg.pairs] == [("ecb",), ("fed", "ecb", "bnm")]
+
+
 def _pair(**fields):
     return {"market": "XSGD/USDC", "price_source": "wise", "qty_base": "100", **fields}
 
@@ -75,6 +84,10 @@ def _pair(**fields):
                  id="budget-zero"),
     pytest.param({"budget": [{"token": "USDC", "amount": "1"}, {"token": "usdc", "amount": "2"}]},
                  "duplicate budget token USDC", id="duplicate-budget"),
+    pytest.param({"pair": [_pair(price_source=[])]}, "price_source must be a source name or a list",
+                 id="empty-source-list"),
+    pytest.param({"pair": [_pair(price_source=["ecb", "ECB"])]}, "lists 'ecb' twice",
+                 id="duplicate-source"),
     pytest.param({"pair": []}, "at least one \\[\\[pair\\]\\]", id="no-pair"),
     pytest.param({"pair": [_pair(qty_base="0")]}, "qty_base must be > 0", id="qty-zero"),
     pytest.param({"fixed_bps": "not-decimal"}, "fixed_bps must be decimal", id="bad-decimal"),

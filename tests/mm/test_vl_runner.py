@@ -61,12 +61,12 @@ def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
     return vr.PairRuntime(
         config=PairConfig(
             market="XSGD/USDC",
-            price_source="wise",
+            price_sources=("wise",),
             qty_base=Decimal("100"),
             fixed_bps=Decimal("50"),
         ),
         info=info or market(),
-        oracle=None,
+        oracles=[],
         iso_base="SGD",
         iso_quote="USD",
     )
@@ -789,3 +789,62 @@ def test_a_normal_order_crossing_the_pairs_return_order_is_left_out():
     # Without a return order nothing is dropped, even a crossed normal pair.
     normal = [intent("EURC/USDC", "bid", "USDC", price="1.1"), intent("EURC/USDC", "ask", "EURC", price="1.0")]
     assert _without_self_cross(normal, LOG) == normal
+
+
+class _Oracle:
+    """One price source's freshness check: a fresh or carried rate, or a failure."""
+
+    def __init__(self, rate=None, *, stale=False, source="ecb"):
+        self.rate, self.stale, self.source = rate, stale, source
+
+    def get(self, base, quote, *, amount=None):
+        if self.rate is None:
+            raise vr.ReferenceUnavailable(f"{self.source} failed")
+        return ReferencePrice(pair="SGD/USD", rate=Decimal(self.rate), ts=NOW,
+                              source=self.source, stale=self.stale)
+
+
+class _WiseMid:
+    default_max_age_s = 600.0
+
+    def __init__(self, rate="0.78", fail=False):
+        self.rate, self.fail = rate, fail
+
+    def mid_rate(self, base, quote, qty_base):
+        if self.fail:
+            raise RuntimeError("Wise is down")
+        return PriceObservation(source="wise", pair="SGD/USD", rate=Decimal(self.rate), ts=NOW)
+
+
+@pytest.mark.parametrize(("oracles", "wise", "rate", "covered", "fell_back"), [
+    # The first fresh rate in the pair's order wins, even after a failing one.
+    pytest.param([_Oracle(None), _Oracle("0.77", source="bnm")], _WiseMid(), "0.77", False, False,
+                 id="first-down-next-fresh"),
+    pytest.param([_Oracle("0.76", stale=True), _Oracle("0.77", source="bnm")], _WiseMid(), "0.77",
+                 False, False, id="first-carried-next-fresh"),
+    # Every rate only carried (a weekend): Wise's live mid stands in, quietly.
+    pytest.param([_Oracle("0.76", stale=True), _Oracle("0.75", stale=True)], _WiseMid(), "0.78",
+                 True, False, id="all-carried-wise-covers"),
+    # ... unless Wise has no mid either: the first carried rate in order.
+    pytest.param([_Oracle("0.76", stale=True), _Oracle("0.75", stale=True)], _WiseMid(fail=True),
+                 "0.76", False, False, id="all-carried-wise-down"),
+    # Every source down: Wise's mid, and the switch is alerted.
+    pytest.param([_Oracle(None), _Oracle(None, source="bnm")], _WiseMid(), "0.78", False, True,
+                 id="all-down-wise-fallback"),
+])
+def test_a_pairs_mid_follows_its_source_priority(oracles, wise, rate, covered, fell_back):
+    runtime = replace(_runtime(), oracles=oracles, settlement=wise)
+    refs = vr.TickReferences()
+
+    ref = vr._pair_mid(runtime, now=NOW, refs=refs)
+
+    assert ref.rate == Decimal(rate)
+    assert (runtime.config.market in refs.covered) is covered
+    assert (runtime.config.market in refs.fallback) is fell_back
+
+
+def test_a_pair_with_no_mid_anywhere_is_skipped():
+    runtime = replace(_runtime(), oracles=[_Oracle(None)], settlement=_WiseMid(fail=True))
+
+    with pytest.raises(vr.ReferenceUnavailable, match="ecb failed; Wise's mid failed too"):
+        vr._pair_mid(runtime, now=NOW, refs=None)

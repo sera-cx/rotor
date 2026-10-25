@@ -42,7 +42,7 @@ class PairConfig:
 
     # Sera market label, normalized to BASE/QUOTE.
     market: str
-    price_source: str
+    price_sources: tuple[str, ...]
     # Base-token order size before quantization.
     qty_base: Decimal
     # Where a return order starts (2 x fixed_bps from the fill), possibly
@@ -183,16 +183,9 @@ def _parse_pairs(
                 f"{source}: [[pair]] {market} has unknown key(s) {', '.join(extra)}; "
                 "global settings must come before the first [[budget]] or [[pair]]"
             )
-        # Where this market's mid comes from.
-        price_source = str(row.get("price_source", "wise")).strip().lower()
-        if price_source == "mas":
-            # Its public daily dataset stopped in 2015, and MAS's current API
-            # needs a registered key.
-            raise ValueError(
-                f"{source}: price_source 'mas' was removed (MAS publishes no public "
-                "daily rate API); use 'ecb' or 'bnm', which both publish SGD")
-        if price_source not in PRICE_SOURCE_CHOICES:
-            raise ValueError(f"{source}: unsupported price_source {price_source!r}")
+        # Where this market's mid comes from: one source, or several in the
+        # order to try them.
+        price_sources = _price_sources(row.get("price_source", "wise"), where=f"{source}: {market}")
         # Quantity is mandatory per pair because markets have different scales.
         qty_base = _decimal(row, "qty_base", None)
         if qty_base <= 0:
@@ -209,7 +202,7 @@ def _parse_pairs(
         out.append(
             PairConfig(
                 market=market,
-                price_source=price_source,
+                price_sources=price_sources,
                 qty_base=qty_base,
                 fixed_bps=_bps(row, "fixed_bps", default_fixed_bps, source=where),
                 fallback_bps=fallback_bps,
@@ -217,6 +210,28 @@ def _parse_pairs(
             )
         )
     return out
+
+
+def _price_sources(value: Any, *, where: str) -> tuple[str, ...]:
+    """A pair's price_source: one name, or a non-empty list of names in order."""
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, list) or not names:
+        raise ValueError(f"{where}: price_source must be a source name or a list of them")
+    out: list[str] = []
+    for raw in names:
+        name = str(raw).strip().lower()
+        if name == "mas":
+            # Its public daily dataset stopped in 2015, and MAS's current API
+            # needs a registered key.
+            raise ValueError(
+                f"{where}: price_source 'mas' was removed (MAS publishes no public "
+                "daily rate API); use 'ecb' or 'bnm', which both publish SGD")
+        if name not in PRICE_SOURCE_CHOICES:
+            raise ValueError(f"{where}: unsupported price_source {name!r}")
+        if name in out:
+            raise ValueError(f"{where}: price_source lists {name!r} twice")
+        out.append(name)
+    return tuple(out)
 
 
 def _validate_unique_markets(pairs: list[PairConfig], *, source: str) -> None:

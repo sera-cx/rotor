@@ -109,7 +109,7 @@ qty_base = "2000"
 
 [[pair]]
 market = "JPYC/USDC"
-price_source = "ecb"
+price_source = ["ecb", "bnm", "fed"]
 qty_base = "300000"
 fixed_bps = "40"
 ```
@@ -139,13 +139,21 @@ Rules:
   other pairs quote; rotor refuses to start only if Sera lists none of them.
   A running rotor re-checks this hourly (see [Sera Changes While
   Running](#sera-changes-while-running)).
-- `price_source` is `wise` (the default), `ecb`, `fed`, or `bnm` (`mas` was removed: MAS
-  publishes no public daily rate API; ECB and BNM both publish SGD). `fed` (the official
-  FRED API) needs a free `FRED_API_KEY`; the others work without a key.
+- `price_source` is `wise` (the default), `ecb`, `fed`, or `bnm`, or a list of
+  them in the order to try (`["ecb", "bnm", "fed"]`). `mas` was removed: MAS
+  publishes no public daily rate API; ECB and BNM both publish SGD. `fed` (the
+  official FRED API) needs a free `FRED_API_KEY`; the others work without a key.
+  Central-bank coverage of rotor's currencies: ECB has AUD BRL CAD CHF EUR GBP
+  IDR JPY MXN MYR NZD SGD TRY ZAR; BNM has AED AUD CAD CHF EUR GBP IDR JPY MYR
+  NZD SGD; the Fed has AUD BRL CAD CHF EUR GBP JPY MXN MYR NZD SGD ZAR. None
+  publishes ARS, CLP, CNH, COP, NGN or PEN; use `wise` for those.
   `WISE_API_TOKEN` is optional: Wise prices anonymous quotes too, and a token
   only raises its rate limits.
-- A pair's source sets its mid. `ecb`, `fed`, and `bnm` publish daily
-  reference rates; `wise` (for currencies none of them covers) uses Wise's
+- A pair's mid is the first fresh rate among its sources, in the listed order,
+  so one bank being down or not publishing a currency falls through to the
+  next. When every listed rate is only carried (a weekend or holiday), Wise's
+  live mid is used; when every source is down, Wise's mid with one alert.
+  `ecb`, `fed`, and `bnm` publish daily reference rates; `wise` (for currencies none of them covers) uses Wise's
   mid-market rate. When Wise cannot convert from a currency (it sends to CNH,
   COP, NGN, ZAR and AED but not from them), that rate is read from the other
   direction's reply. For ARS and PEN Wise gives a mid but no transfer price in

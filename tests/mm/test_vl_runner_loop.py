@@ -29,7 +29,7 @@ from rotor.updater import GitUpdateResult
 def _pair(market: str, *, qty: str = "10", fixed_bps: str = "50") -> PairConfig:
     return PairConfig(
         market=market,
-        price_source="wise",
+        price_sources=("wise",),
         qty_base=Decimal(qty),
         fixed_bps=Decimal(fixed_bps),
     )
@@ -1592,7 +1592,7 @@ def _stale_alerts(*, state=None, markets=("XSGD/USDC",)) -> vr.StaleReferenceAle
     runtimes = [
         SimpleNamespace(
             config=SimpleNamespace(market=market),
-            oracle=SimpleNamespace(max_carry_age_s=7 * DAY),
+            oracles=[SimpleNamespace(max_carry_age_s=7 * DAY)],
         )
         for market in markets
     ]

@@ -122,7 +122,8 @@ class PairRuntime:
     config: PairConfig
     # Sera market metadata from the bootstrapped client.
     info: object
-    oracle: ReferencePriceOracle
+    # One freshness check per price source, in the order the pair tries them.
+    oracles: list[ReferencePriceOracle]
     # ISO currency symbols used by the reference oracle.
     iso_base: str
     iso_quote: str
@@ -755,7 +756,7 @@ class StaleReferenceAlerts:
     ) -> None:
         # Each pair's carry limit, so a warning can say how long it may last.
         self._carry_limit = {
-            runtime.config.market: runtime.oracle.max_carry_age_s for runtime in runtimes
+            runtime.config.market: runtime.oracles[0].max_carry_age_s for runtime in runtimes
         }
         self._state = state
         self.reminder_seconds = reminder_seconds
@@ -1678,9 +1679,10 @@ def _build_runtimes(
             skipped[pair.market] = str(exc)
             log.warning("not quoting %s: %s", pair.market, exc)
             continue
-        if pair.price_source not in source_cache:
-            source_cache[pair.price_source] = load_price_reference_source(pair.price_source)
-        source = source_cache[pair.price_source]
+        # One freshness check per source, in the order the pair tries them.
+        for name in pair.price_sources:
+            if name not in source_cache:
+                source_cache[name] = load_price_reference_source(name)
         # Every pair, whatever its mid source, quotes at Wise's after-fee prices.
         if "wise" not in source_cache:
             source_cache["wise"] = load_price_reference_source("wise")
@@ -1688,8 +1690,11 @@ def _build_runtimes(
             PairRuntime(
                 config=pair,
                 info=info,
-                oracle=ReferencePriceOracle(
-                    source, max_age_s=max_reference_age_s, carry_stale=carry_stale),
+                oracles=[
+                    ReferencePriceOracle(
+                        source_cache[name], max_age_s=max_reference_age_s, carry_stale=carry_stale)
+                    for name in pair.price_sources
+                ],
                 iso_base=iso_base,
                 iso_quote=iso_quote,
                 settlement=source_cache["wise"],
@@ -1820,27 +1825,7 @@ def _intents_for_runtime(
     funds: dict[str, Decimal] | None,
 ) -> list[OrderIntent]:
     """Build order intents for a single configured pair."""
-    # The mid: the pair's own source while fresh, then Wise's live mid, and a
-    # carried daily rate (weekend, holiday) only while Wise has no mid either.
-    try:
-        ref = runtime.oracle.get(
-            runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
-        )
-    except ReferenceUnavailable as exc:
-        # A source that is down, or past its carry limit, is replaced by Wise's
-        # live mid rather than taking the pair down.
-        ref = _wise_mid(runtime, exc, now=now)
-        if refs is not None:
-            refs.fallback[runtime.config.market] = exc
-    else:
-        if ref.stale:
-            try:
-                ref = _wise_mid(runtime, ReferenceUnavailable("carried rate"), now=now)
-            except ReferenceUnavailable:
-                pass
-            else:
-                if refs is not None:
-                    refs.covered.add(runtime.config.market)
+    ref = _pair_mid(runtime, now=now, refs=refs)
     log.debug(
         "%s mid=%s src=%s qty=%s%s",
         runtime.config.market,
@@ -1892,6 +1877,41 @@ def _without_self_cross(intents: list[OrderIntent], log: logging.Logger) -> list
             continue
         out.append(intent)
     return out
+
+
+def _pair_mid(
+    runtime: PairRuntime, *, now: float, refs: TickReferences | None
+) -> ReferencePrice:
+    """The pair's mid: the first of its sources, in its configured order, with a
+    fresh rate; then Wise's live mid when every rate is only carried (weekend,
+    holiday); then the first carried rate when Wise has no mid either. Every
+    source down or past its carry limit falls back to Wise's mid; with no mid
+    at all, ReferenceUnavailable skips the pair."""
+    market = runtime.config.market
+    carried: ReferencePrice | None = None
+    failures: list[str] = []
+    for oracle in runtime.oracles:
+        try:
+            ref = oracle.get(runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base)
+        except ReferenceUnavailable as exc:
+            failures.append(str(exc))
+            continue
+        if not ref.stale:
+            return ref
+        carried = carried or ref
+    if carried is not None:
+        try:
+            ref = _wise_mid(runtime, ReferenceUnavailable("carried rate"), now=now)
+        except ReferenceUnavailable:
+            return carried
+        if refs is not None:
+            refs.covered.add(market)
+        return ref
+    reason = ReferenceUnavailable("; ".join(failures))
+    ref = _wise_mid(runtime, reason, now=now)
+    if refs is not None:
+        refs.fallback[market] = reason
+    return ref
 
 
 def _normal_intents(runtime: PairRuntime, mid: Decimal, expiration: int) -> list[OrderIntent]:
