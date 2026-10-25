@@ -355,19 +355,7 @@ def test_bootstrap_rejects_incomplete_domain():
     ("health", "match"),
     [
         ({"status": "degraded", "executor_id": 0}, "not healthy"),
-        (
-            {"status": "healthy", "executor_id": 0, "signature_ready": False},
-            "signature verification",
-        ),
-        (
-            {
-                "status": "healthy",
-                "executor_id": 1,
-                "relayer_executor_id": 2,
-                "signature_ready": True,
-            },
-            "executor drift",
-        ),
+        ({"executor_id": 0}, "not healthy"),
         ({"status": "healthy", "signature_ready": True}, "omitted executor_id"),
     ],
 )

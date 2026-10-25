@@ -62,8 +62,6 @@ class MarketInfo:
     # Optional exact price and amount grids.
     price_step: Decimal | None = None
     amount_step: Decimal | None = None
-    # Server-provided rounding label, retained for visibility.
-    rounding_mode: str = ""
     # Sera's bid minimum is quote-token notional.
     min_bid_quote_amount: Decimal = Decimal(0)
     # Sera's ask minimum is base-token amount.
@@ -191,7 +189,8 @@ class SeraClient:
         # Refuse to sign and submit orders over a non-TLS transport (outside of
         # localhost dev/mocks): an http:// or MITM'd endpoint could feed rotor
         # false market metadata, signing domain, or server time.
-        _require_secure_base_url(self.base_url)
+        # The maker signs orders against this URL, so it must be TLS.
+        require_https("SERA_BASE_URL", self.base_url)
         # A single httpx client keeps connection behavior consistent.
         self._http = httpx.Client(timeout=timeout)
         # Next free request slot per rate-limit group (monotonic seconds).
@@ -216,12 +215,6 @@ class SeraClient:
         """Close the underlying HTTP connection pool."""
         # Idempotent and safe to call from a runner's shutdown path.
         self._http.close()
-
-    def __enter__(self) -> SeraClient:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
 
     def bootstrap(self) -> None:
         """Fetch public config, executor id, and market metadata.
@@ -517,7 +510,7 @@ class SeraClient:
         return out
 
     def get_open_orders(
-        self, status: str = "pending", *, page_limit: int = 500, max_pages: int = 20
+        self, *, page_limit: int = 500, max_pages: int = 20
     ) -> list[dict]:
         """List every open order for this wallet, following pagination.
 
@@ -526,13 +519,14 @@ class SeraClient:
         """
         out: list[dict] = []
         for page in range(max_pages):
-            # Authenticated endpoint scoped by owner address and status.
+            # Authenticated endpoint scoped by owner address. "pending" is what
+            # Sera maps to submitted, open and partially filled orders.
             body = self._request(
                 "GET",
                 "/orders",
                 params={
                     "owner_address": self.owner_address,
-                    "status": status,
+                    "status": "pending",
                     "limit": page_limit,
                     "offset": page * page_limit,
                 },
@@ -714,13 +708,12 @@ def _parse_healthy_executor_id(health: Any) -> int:
     if not isinstance(health, dict):
         raise RuntimeError(f"GET /health returned invalid body: {health!r}")
 
+    # Sera reports "degraded" while signature verification is not ready or its
+    # relayer's executor id drifts; not-ready states are temporary, so callers
+    # may retry them.
     status = str(health.get("status") or "").lower()
-    # Not-ready states are temporary on Sera's side; callers may retry them.
-    if status and status != "healthy":
+    if status != "healthy":
         raise errors.SeraUnavailable(f"GET /health is not healthy: {health!r}")
-    if health.get("signature_ready") is False:
-        raise errors.SeraUnavailable(
-            f"GET /health reports signature verification is not ready: {health!r}")
 
     raw_executor = health.get("executor_id")
     if raw_executor is None:
@@ -731,18 +724,6 @@ def _parse_healthy_executor_id(health: Any) -> int:
         raise RuntimeError(f"GET /health returned invalid executor_id: {health!r}") from exc
     if not 0 <= executor_id <= eip712.EXECUTOR_MAX:
         raise RuntimeError(f"GET /health executor_id out of range: {health!r}")
-
-    relayer_executor = health.get("relayer_executor_id")
-    if relayer_executor not in (None, ""):
-        try:
-            relayer_executor_id = int(relayer_executor)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"GET /health returned invalid relayer_executor_id: {health!r}"
-            ) from exc
-        if relayer_executor_id != executor_id:
-            raise errors.SeraUnavailable(f"GET /health executor drift: {health!r}")
-
     return executor_id
 
 
@@ -766,7 +747,6 @@ def _parse_market(m: dict) -> MarketInfo:
             Decimal(str(m["amount_step"]))
             if m.get("amount_step") is not None else None
         ),
-        rounding_mode=str(m.get("rounding_mode", "")),
         min_bid_quote_amount=Decimal(str(m.get("min_bid_quote_amount", "0"))),
         min_ask_amount=Decimal(str(m.get("min_ask_amount", "0"))),
     )
@@ -845,7 +825,3 @@ def _clean_credential(name: str, value: str) -> str:
         raise ValueError(f"{name} contains whitespace or a control character; check its value")
     return value
 
-
-def _require_secure_base_url(base_url: str) -> None:
-    """Reject a non-TLS Sera base URL (the maker signs orders against it)."""
-    require_https("SERA_BASE_URL", base_url)
