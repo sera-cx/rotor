@@ -87,18 +87,19 @@ def test_validate_budget_caps_rejects_ask_quantity_above_cap():
         raise AssertionError("expected budget cap rejection")
 
 
-def test_group_intents_uses_standalone_for_unbudgeted_multi_leg_group():
+def test_group_intents_batches_an_unbudgeted_multi_leg_group():
+    # Two asks spending XSGD (unbudgeted), each sized to the whole XSGD vault
+    # balance: standalone, Sera would refuse the second; one batch freezes once.
     groups = vr.group_intents(
         [
             _intent(spent="XSGD"),
             _intent(market="EURC/USDC", spent="XSGD"),
         ],
-        budget_tokens={"USDC"},
         vl_min_size=2,
     )
 
     assert groups == [
-        ("XSGD", groups[0][1], False),
+        ("XSGD", groups[0][1], True),
     ]
 
 
@@ -641,7 +642,7 @@ def test_cancel_placements_keeps_retryable_failures():
 def test_group_intents_splits_oversized_same_token_group():
     intents = [_intent(market=f"M{i}/USDC", spent="USDC") for i in range(5)]
 
-    groups = vr.group_intents(intents, {"USDC"}, 2, 2)
+    groups = vr.group_intents(intents, 2, 2)
 
     # 5 legs, batch max 2 -> [2, 2, 1]; the trailing singleton places standalone.
     assert [(len(rows), use_vl) for _, rows, use_vl in groups] == [

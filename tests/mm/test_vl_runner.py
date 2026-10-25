@@ -54,12 +54,12 @@ def _intent(
     )
 
 
-def test_group_intents_uses_vl_only_for_budgeted_multi_leg_groups():
+def test_group_intents_uses_vl_for_multi_leg_groups():
     groups = group_intents([
         _intent("XSGD/USDC", "bid", "USDC"),
         _intent("EURC/USDC", "bid", "USDC"),
         _intent("XSGD/USDC", "ask", "XSGD"),
-    ], {"USDC"}, 2)
+    ], 2)
 
     assert groups[0][0] == "USDC"
     assert groups[0][2] is True

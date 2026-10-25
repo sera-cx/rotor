@@ -1281,11 +1281,9 @@ def run(
                 sleep_remaining(tick_started, poll_seconds, stop)
                 continue
 
-            # Phase 3: group legs by spent token; a group goes through VL only
-            # when its token is budgeted and it has >= vl_batch_min legs,
-            # otherwise each leg is placed standalone.
-            groups = group_intents(
-                intents, config.budget_tokens, client.vl_batch_min, client.vl_batch_max)
+            # Phase 3: group legs by spent token; a group with >= vl_batch_min
+            # legs goes through VL, otherwise each leg is placed standalone.
+            groups = group_intents(intents, client.vl_batch_min, client.vl_batch_max)
 
             # Phase 4: reject the whole tick if any budgeted token could spend
             # more than its configured budget, counted the way Sera locks it (a
@@ -1657,15 +1655,18 @@ def _state_path() -> str:
 
 def group_intents(
     intents: list[OrderIntent],
-    budget_tokens: set[str],
     vl_min_size: int,
     vl_max_size: int = 10**9,
 ) -> list[tuple[str, list[OrderIntent], bool]]:
     """Group intents by spent token and mark whether each group must use VL.
 
-    A same-spent-token group larger than Sera's batch maximum is split into
-    chunks of at most `vl_max_size` legs so an oversized group cannot make
-    `place_vl_batch` reject (and tear down) every tick.
+    Every same-spent-token group with at least `vl_min_size` legs goes as a VL
+    batch, budgeted or not: each order is sized to what the token may spend
+    (its budget or the vault balance), and Sera freezes only a batch's largest
+    leg, whereas standalone orders would each lock their full amount and Sera
+    would refuse all but the first. A group larger than Sera's batch maximum is
+    split into chunks of at most `vl_max_size` legs so an oversized group cannot
+    make `place_vl_batch` reject (and tear down) every tick.
     """
     # Spent token is the budget dimension Sera VL uses for shared collateral.
     by_spent: dict[str, list[OrderIntent]] = {}
@@ -1673,12 +1674,11 @@ def group_intents(
         by_spent.setdefault(intent.spent_token, []).append(intent)
     groups: list[tuple[str, list[OrderIntent], bool]] = []
     for spent_token, rows in sorted(by_spent.items()):
-        budgeted = spent_token in budget_tokens
-        if not budgeted or len(rows) < vl_min_size:
-            # Singleton or unbudgeted groups place standalone.
+        if len(rows) < vl_min_size:
+            # A group too small for a batch places standalone.
             groups.append((spent_token, rows, False))
             continue
-        # Budgeted, VL-eligible group: chunk so no batch exceeds Sera's maximum.
+        # VL-eligible group: chunk so no batch exceeds Sera's maximum.
         for start in range(0, len(rows), vl_max_size):
             chunk = rows[start:start + vl_max_size]
             # A trailing chunk below the batch minimum places standalone.

@@ -218,18 +218,21 @@ Sera signing and API:
 VL behavior:
 
 - Intents are grouped by spent token.
-- VL is used only for budgeted groups meeting Sera's batch minimum.
+- Every group meeting Sera's batch minimum goes as a VL batch, budgeted or
+  not: its legs are each sized to what the token may spend, and Sera freezes
+  only the largest leg, where standalone orders would each lock in full.
 - A configured market Sera does not list at boot is skipped with a warning and
   (with `--telegram`) an important alert; boot fails only if Sera lists none.
 - A running loop re-runs `client.bootstrap()` hourly (10 minutes after a
   failure, or after a 422 / below-minimum rejection) and rebuilds its pairs.
   Bootstrap replaces the client's domain, limits, executor id, and markets only
   after every read and check succeeds, so a failed refresh leaves the last good
-  metadata in place.
+  metadata in place; a refresh that succeeds but leaves no configured pair to
+  quote puts the previous metadata back (`CLIENT_METADATA`).
 - A market Sera rejects as not active (error code `PAIR_INACTIVE`, or a VL
   batch message naming the pair) is dropped from that batch, which is re-sent
   without it, and is not quoted again until the next successful refresh.
-- Singleton or unbudgeted groups use standalone placement.
+- A group below the batch minimum uses standalone placement.
 - Local budget checks count spend the way Sera locks it: a VL batch counts as
   its largest leg (siblings share one budget and only one can fill at a time),
   each standalone order counts in full, and batches and standalone orders on one
