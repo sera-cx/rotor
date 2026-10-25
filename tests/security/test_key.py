@@ -39,24 +39,6 @@ class TestUnlock:
         with pytest.raises(wallet_key.WalletNotInitialized):
             wallet_key.unlock()
 
-    def test_unlock_malformed_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SERA_PRIVATE_KEY", "not-a-key")
-        with pytest.raises(wallet_key.InvalidPrivateKey):
-            wallet_key.unlock()
-
-    def test_unlock_rejects_zero_scalar_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Correct shape but a cryptographically invalid (zero) scalar that
-        # eth-account would otherwise accept and derive a known address from.
-        monkeypatch.setenv("SERA_PRIVATE_KEY", "0x" + "00" * 32)
-        with pytest.raises(wallet_key.InvalidPrivateKey):
-            wallet_key.unlock()
-
-    def test_unlock_rejects_key_at_or_above_curve_order(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SERA_PRIVATE_KEY", "0x" + f"{wallet_key.SECP256K1_N:064x}")
-        with pytest.raises(wallet_key.InvalidPrivateKey):
-            wallet_key.unlock()
 
 
 class TestTypedDataSigning:
@@ -96,17 +78,16 @@ class TestTypedDataSigning:
 
 
 @pytest.mark.parametrize("bad", [
+    "not-a-key",
     "0x" + "zz" * 32,          # right length, not hex: int() quotes it
-    "0x" + "00" * 32,          # the zero scalar
+    # The zero scalar: eth-account would accept it and derive a known address.
+    "0x" + "00" * 32,
+    f"0x{wallet_key.SECP256K1_N:064x}",  # exactly the curve order
     "0x" + "ff" * 32,          # past the curve order
 ])
 def test_an_invalid_key_never_appears_in_the_error_or_its_traceback(monkeypatch, bad):
     import traceback
 
-    from rotor import config as config_module
-
-    wallet_key.lock()
-    monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
     monkeypatch.setenv("SERA_PRIVATE_KEY", bad)
 
     with pytest.raises(wallet_key.InvalidPrivateKey) as raised:
