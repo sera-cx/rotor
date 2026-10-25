@@ -8,10 +8,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
+from mm_builders import market, vl_config
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange.client import (
-    MarketInfo,
     OrderRecord,
     SignedOrder,
     SignedVLBatch,
@@ -19,7 +19,7 @@ from rotor.mm.exchange.client import (
 )
 from rotor.mm.exchange.errors import SeraError, SeraRateLimit, SeraUnavailable
 from rotor.mm.positions import Position
-from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
+from rotor.mm.vl_config import PairConfig, VLConfig
 from rotor.price_reference import ReferenceUnavailable
 from rotor.price_reference.models import PriceObservation, ReferencePrice
 from rotor.updater import GitUpdateResult
@@ -35,30 +35,8 @@ def _pair(market: str, *, qty: str = "10", fixed_bps: str = "50") -> PairConfig:
 
 
 def _config(*, pairs: list[PairConfig] | None = None) -> VLConfig:
-    return VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal("100000"))],
-        pairs=pairs or [_pair("XSGD/USDC"), _pair("EURC/USDC")],
-        fixed_bps=Decimal("50"),
-        return_bps=Decimal("1"),
-    )
-
-
-def _market(symbol: str, base: str, quote: str) -> MarketInfo:
-    return MarketInfo(
-        symbol=symbol,
-        base_symbol=base,
-        quote_symbol=quote,
-        base_address=f"0x{base.lower()}",
-        quote_address=f"0x{quote.lower()}",
-        base_decimals=6,
-        quote_decimals=6,
-        tick_precision=4,
-        quantity_precision=2,
-        price_step=Decimal("0.0001"),
-        amount_step=Decimal("0.01"),
-        min_bid_quote_amount=Decimal("0"),
-        min_ask_amount=Decimal("0"),
-    )
+    return vl_config(
+        budget="100000", return_bps="1", pairs=pairs or [_pair("XSGD/USDC"), _pair("EURC/USDC")])
 
 
 class _SequencedSource:
@@ -127,10 +105,12 @@ class _SequencedSource:
 
 
 class _StopFlag:
-    def __init__(self) -> None:
+    def __init__(self, *, stop_on_wait_over: float | None = None) -> None:
         self.requested = False
         # Every wait the runner asked for, in seconds (returns at once here).
         self.waits: list[float] = []
+        # Asked to wait longer than this, the flag stops the run instead.
+        self.stop_on_wait_over = stop_on_wait_over
 
     def install(self) -> None:
         return None
@@ -140,6 +120,8 @@ class _StopFlag:
 
     def wait(self, timeout: float) -> bool:
         self.waits.append(timeout)
+        if self.stop_on_wait_over is not None and timeout > self.stop_on_wait_over:
+            self.requested = True
         return self.requested
 
     forced = False
@@ -168,8 +150,8 @@ class _FakeClient:
         reject_asks: bool = False,
     ) -> None:
         self.markets_by_symbol = {
-            "XSGD/USDC": _market("XSGD/USDC", "XSGD", "USDC"),
-            "EURC/USDC": _market("EURC/USDC", "EURC", "USDC"),
+            "XSGD/USDC": market("XSGD/USDC"),
+            "EURC/USDC": market("EURC/USDC"),
         }
         self.open_orders = list(open_orders or [])
         self.fill_first_xsgd_bid = fill_first_xsgd_bid
@@ -361,7 +343,19 @@ class _FakeClient:
         return True
 
 
-def _wire_runner(monkeypatch, *, config: VLConfig, client: _FakeClient, source) -> None:
+def _wire_runner(
+    monkeypatch,
+    *,
+    client: _FakeClient,
+    config: VLConfig | None = None,
+    source: _SequencedSource | None = None,
+    notifier: _RecordingNotifier | None = None,
+) -> _SequencedSource:
+    """Give run() this client, config (default `_config()`), source (default
+    SGD/USD 1.0000 and EUR/USD 2.0000) and, if given, Telegram notifier."""
+    config = _config() if config is None else config
+    if source is None:
+        source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
     monkeypatch.setattr(vr, "load_vl_config", lambda _path: config)
     monkeypatch.setattr(vr, "build_client", lambda **_kwargs: client)
     monkeypatch.setattr(vr, "load_price_reference_source", lambda _name: source)
@@ -370,6 +364,37 @@ def _wire_runner(monkeypatch, *, config: VLConfig, client: _FakeClient, source) 
         "EURC": "EUR",
         "USDC": "USD",
     })
+    if notifier is not None:
+        monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    return source
+
+
+def _run(**overrides) -> int:
+    """run() with the arguments most tests share; any of them can be overridden.
+
+    The config path is never read (the config is patched in). A test that is
+    about a run's state file, cadence or cancel guard passes those itself.
+    """
+    return vr.run(**{
+        "config_path": "vl.toml", "min_requote_seconds": 0.0, "state_path": ":memory:",
+        **overrides,
+    })
+
+
+def _positions(state_path) -> dict[str, Position]:
+    store = vr.StateStore(state_path)
+    try:
+        return store.load_positions()
+    finally:
+        store.close()
+
+
+def _frozen_clock(monkeypatch, now: float) -> dict[str, float]:
+    """Freeze the clock at `now` for --once fires; the test moves clock["now"]."""
+    clock = {"now": now}
+    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    return clock
 
 
 def _stop_after_sleeps(monkeypatch, count: int) -> list[float]:
@@ -412,6 +437,14 @@ def _fake_clock(monkeypatch, *, steps: list[float]) -> dict[str, float]:
     return clock
 
 
+def _legs(client: _FakeClient, market: str, side: str | None = None) -> list[dict]:
+    """The VL batch legs placed for `market` (on `side`, if given), in order."""
+    return [
+        leg for batch in client.batch_places for leg in batch["legs"]
+        if leg["market"] == market and side in (None, leg["side"])
+    ]
+
+
 def _xsgd_asks(client: _FakeClient) -> list[tuple[Decimal, Decimal]]:
     return [
         (row["qty"], row["price"]) for row in client.standalone_places
@@ -431,16 +464,10 @@ def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
         ("EUR", "USD"): ["2.0000"],
     })
     source.buy_fee = Decimal("0.0080")
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client, source=source)
     _fake_clock(monkeypatch, steps=[12 * HOUR, 12 * HOUR, 36 * HOUR, 1.0])
 
-    result = vr.run(
-        config_path="vl.toml",
-        poll_seconds=305.0,
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = _run(state_path=tmp_path / "state.sqlite")
 
     assert result == 0
     assert _xsgd_asks(client) == [
@@ -455,20 +482,12 @@ def test_run_returns_a_fill_through_the_auction_then_holds_at_the_fill_price(
         (Decimal("5"), Decimal("0.9950")),
     ]
     # The bid side keeps quoting normally around the latest mid throughout.
-    xsgd_bids = [
-        leg["price"] for batch in client.batch_places for leg in batch["legs"]
-        if leg["market"] == "XSGD/USDC" and leg["side"] == "bid"
-    ]
+    xsgd_bids = [leg["price"] for leg in _legs(client, "XSGD/USDC", "bid")]
     assert xsgd_bids == [
         Decimal("0.9950"), Decimal("0.9950"), Decimal("0.9751"), Decimal("0.9751")]
 
-    store = vr.StateStore(tmp_path / "state.sqlite")
-    try:
-        assert store.load_positions() == {
-            "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)
-        }
-    finally:
-        store.close()
+    assert _positions(tmp_path / "state.sqlite") == {
+        "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
 
 
 def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_path):
@@ -482,16 +501,10 @@ def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_pat
         ("SGD", "USD"): ["1.0000", "1.0000", "0.9800"],
         ("EUR", "USD"): ["2.0000"],
     })
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client, source=source)
     _fake_clock(monkeypatch, steps=[12 * HOUR, 12 * HOUR, 1.0])
 
-    result = vr.run(
-        config_path="vl.toml",
-        poll_seconds=305.0,
-        min_requote_seconds=0.0,
-        log_level="CRITICAL",
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = _run(state_path=tmp_path / "state.sqlite")
 
     assert result == 0
     assert ("lost_vl", "batch-1") in client.events
@@ -501,13 +514,8 @@ def test_run_counts_a_fill_on_a_batch_whose_answer_was_lost(monkeypatch, tmp_pat
         # The market fell to 0.98; the ask still does not sell below the fill.
         (Decimal("5"), Decimal("1.0000")),
     ]
-    store = vr.StateStore(tmp_path / "state.sqlite")
-    try:
-        assert store.load_positions() == {
-            "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)
-        }
-    finally:
-        store.close()
+    assert _positions(tmp_path / "state.sqlite") == {
+        "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
 
 
 def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(
@@ -518,17 +526,10 @@ def test_run_drops_a_batch_that_never_reached_sera_and_keeps_quoting(
     # ledger rows settle at zero fills once the orders would have expired.
     client = _FakeClient()
     client.unsent_errors = [httpx.ConnectError("connection refused")]
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[305.0, 600.0, 1.0])
 
-    result = vr.run(
-        config_path="vl.toml",
-        poll_seconds=305.0,
-        min_requote_seconds=0.0,
-        log_level="CRITICAL",
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = _run(state_path=tmp_path / "state.sqlite")
 
     assert result == 0
     assert ("cancel_vl", "batch-1") in client.events
@@ -550,52 +551,35 @@ def test_a_mainnet_run_refuses_the_state_file_of_a_testnet_run(monkeypatch, tmp_
     # position back on mainnet, so it refuses the file before placing anything.
     state_path = tmp_path / "state.sqlite"
     testnet = _FakeClient(fill_first_xsgd_bid=True)
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=testnet, source=source)
+    _wire_runner(monkeypatch, client=testnet)
     _fake_clock(monkeypatch, steps=[HOUR, 1.0])
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, log_level="CRITICAL",
-           state_path=state_path)
+    _run(state_path=state_path)
 
     mainnet = _FakeClient()
     mainnet.eip712_domain = {
         "chainId": 1, "verifyingContract": "0xB5C50C5D5f038404F85970b7f5B7259C4AC0E198"}
     notifier = _RecordingNotifier()
-    _wire_runner(monkeypatch, config=_config(), client=mainnet, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=mainnet, notifier=notifier)
 
-    result = vr.run(config_path="vl.toml", min_requote_seconds=0.0, once=True,
-                    telegram=True, log_level="CRITICAL", state_path=state_path)
+    result = _run(once=True, telegram=True, state_path=state_path)
 
     assert result == 1
     assert mainnet.batch_places == [] and mainnet.standalone_places == []
     assert len(notifier.containing("on chain 11155111")) == 1
-    store = vr.StateStore(state_path)
-    try:
-        assert store.load_positions() == {
-            "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
-    finally:
-        store.close()
+    assert _positions(state_path) == {
+        "XSGD/USDC": Position(Decimal("5"), Decimal("0.9950"), T0)}
 
 
 def test_fire_once_runs_settle_the_previous_runs_fills(monkeypatch, tmp_path):
     # Each fire-once run is a new process: fills on the last run's orders must
     # still reach a position through the state file.
     client = _FakeClient(fill_first_xsgd_bid=True)
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    clock = {"now": T0}
-    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    _wire_runner(monkeypatch, client=client)
+    clock = _frozen_clock(monkeypatch, T0)
     state_path = tmp_path / "state.sqlite"
 
     def fire() -> int:
-        return vr.run(
-            config_path="vl.toml",
-            once=True,
-            min_requote_seconds=0.0,
-            log_level="ERROR",
-            state_path=state_path,
-        )
+        return _run(once=True, state_path=state_path)
 
     assert fire() == 0
     clock["now"] += HOUR
@@ -617,17 +601,11 @@ def test_fire_once_runs_share_the_stall_alert_and_report_when_quoting_resumes(
     client = _FakeClient()
     client.balances = {}
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
-    clock = {"now": T0}
-    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
+    clock = _frozen_clock(monkeypatch, T0)
 
     def fire() -> int:
-        result = vr.run(config_path="vl.toml", once=True, min_requote_seconds=0.0,
-                        telegram=True, log_level="CRITICAL",
-                        state_path=tmp_path / "state.sqlite")
+        result = _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
         clock["now"] += 305.0
         return result
 
@@ -648,9 +626,7 @@ def test_run_alerts_on_a_stall_and_reports_when_quoting_resumes(monkeypatch):
     client = _FakeClient()
     client.balances = {}
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     clock = _fake_clock(monkeypatch, steps=[305.0] * 6)
     real_sleep = vr.sleep_remaining
 
@@ -661,8 +637,7 @@ def test_run_alerts_on_a_stall_and_reports_when_quoting_resumes(monkeypatch):
 
     monkeypatch.setattr(vr, "sleep_remaining", fund_before_tick_6)
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True,
-           state_path=":memory:")
+    _run(telegram=True)
 
     assert len(notifier.containing("VL quoting stalled")) == 1
     assert len(notifier.containing("quoting resumed after 25m")) == 1
@@ -680,16 +655,11 @@ def test_fire_once_runs_alert_when_one_pair_stops_quoting_and_when_it_is_back(
         {("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]},
         always_fail={("SGD", "USD")},
     )
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
-    clock = {"now": T0}
-    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
+    clock = _frozen_clock(monkeypatch, T0)
 
     def fire() -> int:
-        result = vr.run(config_path="vl.toml", once=True, min_requote_seconds=0.0,
-                        telegram=True, log_level="CRITICAL",
-                        state_path=tmp_path / "state.sqlite")
+        result = _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
         clock["now"] += 305.0
         return result
 
@@ -714,16 +684,10 @@ def test_fire_once_runs_alert_when_one_pair_stops_quoting_and_when_it_is_back(
 
 def test_run_holds_a_fill_that_is_still_settling_without_storing_it(monkeypatch, tmp_path):
     client = _FakeClient(fill_first_xsgd_bid=True, fill_status="confirming")
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[12 * HOUR, 1.0])
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = _run(state_path=tmp_path / "state.sqlite")
 
     assert result == 0
     # The fill holds the ask as soon as it is visible...
@@ -745,22 +709,11 @@ def test_run_places_a_vl_batch_whose_legs_each_use_the_whole_budget(monkeypatch)
     # on VL sharing it: the XSGD bid spends 9.95 USDC and the EURC bid 19.90,
     # together more than the 20 USDC budget, but Sera locks only the largest.
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    config = VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal("20"))],
-        pairs=[_pair("XSGD/USDC"), _pair("EURC/USDC")],
-        fixed_bps=Decimal("50"),
-        return_bps=Decimal("2"),
-    )
-    _wire_runner(monkeypatch, config=config, client=client, source=source)
+    config = vl_config(budget="20", pairs=[_pair("XSGD/USDC"), _pair("EURC/USDC")])
+    _wire_runner(monkeypatch, config=config, client=client)
     _stop_after_sleeps(monkeypatch, 1)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
+    result = _run()
 
     assert result == 0
     assert [
@@ -777,27 +730,14 @@ def test_run_keeps_quoting_when_a_price_rise_pushes_a_bid_over_budget(monkeypatc
         ("SGD", "USD"): ["1.0000", "1.0100"],
         ("EUR", "USD"): ["1.0000"],
     })
-    config = VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal("10"))],
-        pairs=[_pair("XSGD/USDC"), _pair("EURC/USDC", qty="5")],
-        fixed_bps=Decimal("50"),
-        return_bps=Decimal("2"),
-    )
+    config = vl_config(budget="10", pairs=[_pair("XSGD/USDC"), _pair("EURC/USDC", qty="5")])
     _wire_runner(monkeypatch, config=config, client=client, source=source)
     _stop_after_sleeps(monkeypatch, 2)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
+    result = _run()
 
     assert result == 0
-    xsgd_bids = [
-        (leg["qty"], leg["price"]) for batch in client.batch_places for leg in batch["legs"]
-        if leg["market"] == "XSGD/USDC"
-    ]
+    xsgd_bids = [(leg["qty"], leg["price"]) for leg in _legs(client, "XSGD/USDC")]
     # Tick 2: 10 / 1.0049 = 9.9512..., rounded down to the 0.01 step.
     assert xsgd_bids == [
         (Decimal("10"), Decimal("0.9950")),
@@ -822,16 +762,10 @@ def test_run_skips_only_the_market_whose_fills_could_not_be_read(monkeypatch):
     client = _FakeClient()
     client.unreadable_market = "XSGD/USDC"
     client.unreadable_ticks = range(2, 3)
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _stop_after_sleeps(monkeypatch, 3)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
+    result = _run()
 
     assert result == 0
     # Tick 2 cannot read XSGD's fills, so only XSGD sits that tick out.
@@ -847,18 +781,10 @@ def test_run_alerts_once_when_an_orders_fills_stay_unreadable(monkeypatch):
     client.unreadable_market = "XSGD/USDC"
     client.unreadable_ticks = range(2, 100)
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _stop_after_sleeps(monkeypatch, vr.READ_FAILURE_ALERT_TICKS + 3)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        telegram=True,
-        state_path=":memory:",
-    )
+    result = _run(telegram=True)
 
     assert result == 0
     assert len(notifier.containing("XSGD/USDC not quoting")) == 1
@@ -872,15 +798,10 @@ def test_run_does_not_send_orders_the_wallet_cannot_fund(monkeypatch, caplog):
     # reject and nothing is logged at WARNING or above.
     client = _FakeClient(reject_asks=True)
     client.balances = {"USDC": Decimal("100000")}
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _stop_after_sleeps(monkeypatch, 2)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        state_path=":memory:",
-    )
+    result = _run()
 
     assert result == 0
     assert len(client.batch_places) == 2
@@ -895,16 +816,10 @@ def test_run_keeps_quoting_bids_when_every_ask_is_rejected(monkeypatch):
     # Earn funds only USDC, so Sera rejects every ask (they spend XSGD/EURC the
     # wallet does not hold). The USDC bid batch must still go out every tick.
     client = _FakeClient(reject_asks=True)
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _stop_after_sleeps(monkeypatch, 2)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
+    result = _run()
 
     assert result == 0
     assert len(client.batch_places) == 2
@@ -922,16 +837,10 @@ def test_run_skips_a_market_sera_does_not_list_and_alerts(monkeypatch, caplog):
     notifier = _RecordingNotifier()
     source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
     config = _config(pairs=[_pair("XSGD/USDC"), _pair("JPYC/USDC"), _pair("USDC/EURC")])
-    _wire_runner(monkeypatch, config=config, client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, config=config, client=client, source=source, notifier=notifier)
     _stop_after_sleeps(monkeypatch, 1)
 
-    result = vr.run(
-        config_path="vl.toml",
-        min_requote_seconds=0.0,
-        telegram=True,
-        state_path=":memory:",
-    )
+    result = _run(telegram=True)
 
     assert result == 0
     assert {row["market"] for row in client.standalone_places} == {"XSGD/USDC"}
@@ -948,7 +857,7 @@ def test_run_skips_a_market_sera_does_not_list_and_alerts(monkeypatch, caplog):
 def test_run_skips_a_pair_whose_token_has_no_currency_mapping(monkeypatch, caplog):
     client = _FakeClient()
     source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client, source=source)
     # The operator's mapping leaves EURC out (the built-in map is replaced here).
     monkeypatch.setattr(vr, "market_to_iso_pair", lambda market, mapping: (
         ("SGD", "USD") if market == "XSGD/USDC"
@@ -956,7 +865,7 @@ def test_run_skips_a_pair_whose_token_has_no_currency_mapping(monkeypatch, caplo
     ))
     _stop_after_sleeps(monkeypatch, 1)
 
-    assert vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:") == 0
+    assert _run() == 0
     assert {row["market"] for row in client.standalone_places} == {"XSGD/USDC"}
     assert "not quoting EURC/USDC: no ISO mapping for token 'EURC'" in caplog.text
 
@@ -964,7 +873,8 @@ def test_run_skips_a_pair_whose_token_has_no_currency_mapping(monkeypatch, caplo
 def test_run_refuses_to_start_when_sera_lists_none_of_the_markets(monkeypatch, caplog):
     client = _FakeClient()
     source = _SequencedSource({("SGD", "USD"): ["1.0000"]})
-    _wire_runner(monkeypatch, config=_config(pairs=[_pair("JPYC/USDC")]), client=client, source=source)
+    _wire_runner(
+        monkeypatch, client=client, config=_config(pairs=[_pair("JPYC/USDC")]), source=source)
     _stop_after_sleeps(monkeypatch, 1)
 
     assert vr.run(config_path="vl.toml", state_path=":memory:") == 1
@@ -975,20 +885,6 @@ def test_run_refuses_to_start_when_sera_lists_none_of_the_markets(monkeypatch, c
 SERA_DOWN = SeraError(None, "Service temporarily unavailable; please retry", 503)
 
 
-class _RecordingStop(_StopFlag):
-    """Stop flag that records waits and stops the run when asked to wait long."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.waits: list[float] = []
-
-    def wait(self, timeout: float) -> bool:
-        self.waits.append(timeout)
-        if timeout > 120:
-            self.requested = True
-        return self.requested
-
-
 def _boots(client: _FakeClient) -> int:
     return len([event for event in client.events if event[0] == "bootstrap"])
 
@@ -997,14 +893,11 @@ def test_run_retries_a_temporary_startup_failure_and_reports_recovery(monkeypatc
     client = _FakeClient()
     client.bootstrap_errors = [SERA_DOWN, SeraUnavailable("GET /health is not healthy")]
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _stop_after_sleeps(monkeypatch, 1)
     state_path = tmp_path / "state.sqlite"
 
-    result = vr.run(
-        config_path="vl.toml", min_requote_seconds=0.0, telegram=True, state_path=state_path)
+    result = _run(telegram=True, state_path=state_path)
 
     assert result == 0
     assert _boots(client) == 3
@@ -1021,9 +914,8 @@ def test_run_waits_for_the_next_hour_after_three_failed_startups(monkeypatch, tm
     client = _FakeClient()
     client.bootstrap_errors = [SERA_DOWN] * 10
     notifier = _RecordingNotifier()
-    stop = _RecordingStop()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=_SequencedSource({}))
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    stop = _StopFlag(stop_on_wait_over=120)
+    _wire_runner(monkeypatch, client=client, source=_SequencedSource({}), notifier=notifier)
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
     monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
 
@@ -1039,15 +931,11 @@ def test_run_waits_for_the_next_hour_after_three_failed_startups(monkeypatch, tm
 
 
 def test_fire_once_runs_share_the_hourly_startup_budget(monkeypatch, tmp_path):
-    clock = {"now": T0 + 600.0}
+    clock = _frozen_clock(monkeypatch, T0 + 600.0)
     client = _FakeClient()
     client.bootstrap_errors = [SERA_DOWN] * 10
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
-    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
 
     def fire() -> int:
         return vr.run(config_path="vl.toml", once=True, telegram=True,
@@ -1068,9 +956,8 @@ def test_fire_once_runs_share_the_hourly_startup_budget(monkeypatch, tmp_path):
 def test_run_does_not_retry_a_startup_failure_retrying_cannot_fix(monkeypatch, tmp_path):
     client = _FakeClient()
     notifier = _RecordingNotifier()
-    stop = _RecordingStop()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=_SequencedSource({}))
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    stop = _StopFlag(stop_on_wait_over=120)
+    _wire_runner(monkeypatch, client=client, source=_SequencedSource({}), notifier=notifier)
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
     monkeypatch.setattr(vr, "load_vl_config", lambda _path: (_ for _ in ()).throw(
         ValueError("vl.toml: return_bps must be > 0")))
@@ -1087,9 +974,7 @@ def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkey
     # the hourly metadata refresh (tick 4) tries it again once Sera reactivates it.
     client = _FakeClient()
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     clock = _fake_clock(monkeypatch, steps=[305.0, 305.0, 3600.0, 1.0])
     real_sleep = vr.sleep_remaining
 
@@ -1102,8 +987,7 @@ def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkey
 
     monkeypatch.setattr(vr, "sleep_remaining", deactivate_after_first_tick)
 
-    result = vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True,
-                    state_path=":memory:")
+    result = _run(telegram=True)
 
     assert result == 0
     assert _markets_quoted_per_tick(client) == [
@@ -1122,8 +1006,7 @@ def test_run_drops_a_market_sera_deactivates_and_retries_it_after_refresh(monkey
 
 def test_run_refreshes_metadata_early_after_a_rejection_that_suggests_it_is_stale(monkeypatch):
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[305.0, 305.0, 1.0])
 
     def batch_limit_changed(order):
@@ -1131,7 +1014,7 @@ def test_run_refreshes_metadata_early_after_a_rejection_that_suggests_it_is_stal
 
     monkeypatch.setattr(client, "send_order", batch_limit_changed)
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
+    _run()
 
     # Rejected on tick 1, so the refresh comes 600 s after boot (tick 3), not hourly.
     assert _boots(client) == 2
@@ -1142,9 +1025,7 @@ def test_run_keeps_quoting_through_failed_metadata_refreshes_and_alerts_once(mon
     # (tick 3) fail; the next retry (tick 4) succeeds.
     client = _FakeClient()
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     clock = _fake_clock(monkeypatch, steps=[3600.0, 600.0, 600.0, 1.0])
     real_sleep = vr.sleep_remaining
 
@@ -1155,8 +1036,7 @@ def test_run_keeps_quoting_through_failed_metadata_refreshes_and_alerts_once(mon
 
     monkeypatch.setattr(vr, "sleep_remaining", refresh_fails_twice)
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True,
-           state_path=":memory:")
+    _run(telegram=True)
 
     assert _boots(client) == 4
     assert len(_markets_quoted_per_tick(client)) == 4
@@ -1171,12 +1051,10 @@ def test_a_pair_sera_refuses_every_tick_is_alerted_while_others_quote(monkeypatc
     client = _FakeClient()
     client.refuse_markets = {"EURC/USDC"}
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _fake_clock(monkeypatch, steps=[305.0, 305.0, 305.0, 1.0])
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, telegram=True, state_path=":memory:")
+    _run(telegram=True)
 
     dark = notifier.containing("Not quoting these pairs")
     assert len(dark) == 1
@@ -1190,18 +1068,13 @@ def test_once_fires_alert_a_pair_whose_fills_stay_unreadable(monkeypatch, tmp_pa
     # escalates; the persisted not-quoting episode does.
     client = _FakeClient()
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
-    monkeypatch.setattr(vr, "StopFlag", _StopFlag)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     client.unreadable_market = "EURC/USDC"
     client.unreadable_ticks = set(range(100))
-    clock = {"now": T0}
-    monkeypatch.setattr(vr.time, "time", lambda: clock["now"])
+    clock = _frozen_clock(monkeypatch, T0)
 
     for _ in range(5):
-        vr.run(config_path="vl.toml", once=True, min_requote_seconds=0.0, telegram=True,
-               state_path=tmp_path / "state.sqlite")
+        _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
         clock["now"] += 305.0
 
     dark = notifier.containing("Not quoting these pairs")
@@ -1213,8 +1086,7 @@ def test_a_refresh_that_finds_no_configured_market_keeps_the_last_metadata(monke
     # Sera serves an empty market list for a moment (its boot order) just as
     # the hourly refresh runs: rotor keeps quoting on the metadata it had.
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     clock = _fake_clock(monkeypatch, steps=[3600.0, 1.0])
     markets = client.markets_by_symbol
     real_bootstrap = client.bootstrap
@@ -1226,7 +1098,7 @@ def test_a_refresh_that_finds_no_configured_market_keeps_the_last_metadata(monke
 
     client.bootstrap = empty_after_an_hour
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
+    _run()
 
     assert client.markets_by_symbol is markets
     assert len(_markets_quoted_per_tick(client)) == 2
@@ -1256,8 +1128,7 @@ def test_run_places_the_new_set_only_after_the_cancelled_one_is_gone(monkeypatch
     # Sera keeps listing tick 1's batch as open for two reads after rotor
     # cancels it; tick 2 places only once it is gone.
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[305.0, 1.0])
     lingering = {"reads": 0}
     real_cancel = client.cancel_vl_batch
@@ -1278,7 +1149,7 @@ def test_run_places_the_new_set_only_after_the_cancelled_one_is_gone(monkeypatch
     monkeypatch.setattr(client, "cancel_vl_batch", cancel_but_linger)
     monkeypatch.setattr(client, "get_open_orders", open_orders)
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, state_path=":memory:")
+    _run()
 
     events = [event[0] for event in client.events]
     cancel = events.index("cancel_vl")
@@ -1310,13 +1181,7 @@ def test_run_once_does_not_block_on_boot_cancel_cooldown(monkeypatch):
     sleeps: list[float] = []
     monkeypatch.setattr(vr.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    result = vr.run(
-        config_path="vl.toml",
-        once=True,
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
+    result = _run(once=True)
 
     # Boot cancel hit cooldown, so this fire could not requote and reports 1 —
     # but it returned promptly without the 300s boot-cooldown wait.
@@ -1332,16 +1197,10 @@ def test_run_isolates_failing_pair_and_quotes_healthy_pair(monkeypatch):
         {("EUR", "USD"): ["2.0000"]},
         always_fail={("SGD", "USD")},
     )
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client, source=source)
     _stop_after_sleeps(monkeypatch, 1)
 
-    result = vr.run(
-        config_path="vl.toml",
-        poll_seconds=305.0,
-        min_requote_seconds=0.0,
-        log_level="ERROR",
-        state_path=":memory:",
-    )
+    result = _run()
 
     assert result == 0
     # Only EURC produced intents (bid spends USDC, ask spends EURC) — both
@@ -1355,10 +1214,8 @@ def test_run_keeps_quoting_and_alerts_when_an_update_cannot_be_used(monkeypatch)
     # The pulled version fails its start check: no restart, the old version
     # keeps quoting, and the operator gets an important alert saying why.
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
     notifier = _RecordingNotifier()
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _fake_clock(monkeypatch, steps=[305.0, 1.0])
 
     class CannotStart:
@@ -1374,8 +1231,7 @@ def test_run_keeps_quoting_and_alerts_when_an_update_cannot_be_used(monkeypatch)
     monkeypatch.setattr(vr, "DailyGitUpdater", CannotStart)
     monkeypatch.setattr(vr, "restart_current_process", lambda: restarts.append(True))
 
-    vr.run(config_path="vl.toml", auto_update=True, telegram=True,
-           min_requote_seconds=0.0, state_path=":memory:")
+    _run(auto_update=True, telegram=True)
 
     assert restarts == []
     assert len(_markets_quoted_per_tick(client)) == 2
@@ -1387,8 +1243,7 @@ def test_a_stop_mid_tick_with_cancel_on_exit_places_nothing_new(monkeypatch):
     # Tick 1 places a set. A stop arrives during tick 2: its cancel-first clears
     # tick 1's set and rotor exits without placing another.
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     clock = _fake_clock(monkeypatch, steps=[400.0, 400.0])
     stop = vr.StopFlag()
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
@@ -1403,8 +1258,7 @@ def test_a_stop_mid_tick_with_cancel_on_exit_places_nothing_new(monkeypatch):
                        "EURC": Decimal("100000")}
     monkeypatch.setattr(client, "get_vault_balances", stop_during_tick_2)
 
-    result = vr.run(config_path="vl.toml", cancel_on_exit=True, min_requote_seconds=0.0,
-                    state_path=":memory:")
+    result = _run(cancel_on_exit=True)
 
     assert result == 0
     assert len(_markets_quoted_per_tick(client)) == 2
@@ -1415,13 +1269,10 @@ def test_a_stop_mid_tick_with_cancel_on_exit_places_nothing_new(monkeypatch):
 def test_run_exits_1_when_cancel_on_exit_leaves_orders_live(monkeypatch):
     client = _FakeClient(cancel_ok=False)
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _fake_clock(monkeypatch, steps=[1.0])
 
-    result = vr.run(config_path="vl.toml", cancel_on_exit=True, telegram=True,
-                    min_requote_seconds=0.0, state_path=":memory:")
+    result = _run(cancel_on_exit=True, telegram=True)
 
     assert result == 1
     assert notifier.containing("could not be cancelled before exit")
@@ -1454,9 +1305,7 @@ def test_run_refuses_to_start_next_to_orders_it_did_not_place(monkeypatch, tmp_p
     # nor touches that trader's order, and says why.
     client = _FakeClient(open_orders=[_OLD_ORDER])
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     # Should rotor start anyway, stop after one tick rather than run on.
     _fake_clock(monkeypatch, steps=[1.0])
 
@@ -1473,9 +1322,7 @@ def test_run_leaves_a_foreign_order_alone_mid_run_and_alerts_once(monkeypatch):
     # someone else's order appears. Rotor does not adopt (and so cancel) it.
     client = _FakeClient(reject_asks=True)
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     client.unsent_errors = [SeraError("INSUFFICIENT_EQUITY", "no USDC", 400)] * 3
     clock = _fake_clock(monkeypatch, steps=[305.0, 305.0, 1.0])
     real_sleep = vr.sleep_remaining
@@ -1486,8 +1333,7 @@ def test_run_leaves_a_foreign_order_alone_mid_run_and_alerts_once(monkeypatch):
 
     monkeypatch.setattr(vr, "sleep_remaining", someone_else_places)
 
-    vr.run(config_path="vl.toml", telegram=True, min_requote_seconds=0.0,
-           state_path=":memory:")
+    _run(telegram=True)
 
     assert ("cancel_order", "old-order", 42) not in client.events
     assert len(notifier.containing("that it did not place")) == 1
@@ -1517,13 +1363,8 @@ def test_run_auto_update_cleans_up_live_orders_and_restarts(monkeypatch, tmp_pat
     monkeypatch.setattr(vr, "DailyGitUpdater", UpdatedOnce)
     monkeypatch.setattr(vr, "restart_current_process", lambda: restarts.append(True))
 
-    result = vr.run(
-        config_path="vl.toml",
-        auto_update=True,
-        cancel_on_exit=True,
-        log_level="ERROR",
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = vr.run(config_path="vl.toml", auto_update=True, cancel_on_exit=True,
+                    log_level="ERROR", state_path=tmp_path / "state.sqlite")
 
     assert result == 0
     assert restarts == [True]
@@ -1603,16 +1444,10 @@ def test_on_a_weekend_pairs_quote_on_wises_live_mid_without_an_alert(monkeypatch
     client = _FakeClient()
     source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
     _stop_after_sleeps(monkeypatch, 3)
 
-    result = vr.run(
-        config_path="unused.toml",
-        min_requote_seconds=0.0,
-        telegram=True,
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = _run(telegram=True, state_path=tmp_path / "state.sqlite")
 
     # Friday's daily rate is set aside while Wise answers: nothing to announce.
     assert result == 0
@@ -1626,16 +1461,10 @@ def test_run_keeps_quoting_on_a_weekend_rate_and_warns_once(monkeypatch, tmp_pat
     # Wise has no mid either, so the carried Friday rate is the mid.
     source = _NoWiseMid(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
     _stop_after_sleeps(monkeypatch, 3)
 
-    result = vr.run(
-        config_path="unused.toml",
-        min_requote_seconds=0.0,
-        telegram=True,
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = _run(telegram=True, state_path=tmp_path / "state.sqlite")
 
     assert result == 0
     # Quotes keep going out on the carried Friday rate, tick after tick.
@@ -1655,17 +1484,11 @@ def test_run_with_halt_on_stale_reference_quotes_on_wises_mid_not_weekend_rates(
     client = _FakeClient()
     source = _AgedSource(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
     monkeypatch.setattr(vr, "StopFlag", _StopFlag)
 
-    result = vr.run(
-        config_path="unused.toml",
-        once=True,
-        telegram=True,
-        halt_on_stale_reference=True,
-        state_path=tmp_path / "state.sqlite",
-    )
+    result = vr.run(config_path="unused.toml", once=True, telegram=True,
+                    halt_on_stale_reference=True, state_path=tmp_path / "state.sqlite")
 
     # No quote rests on a weekend rate: the stale mids are replaced by Wise's
     # live mid (quotes are at Wise's prices either way), with one alert.
@@ -1685,7 +1508,7 @@ class _WiseDown(_SequencedSource):
 def test_with_wise_down_normal_orders_sit_at_the_outage_spread_around_the_mid(monkeypatch):
     client = _FakeClient()
     source = _WiseDown({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client, source=source)
     monkeypatch.setattr(vr, "StopFlag", _StopFlag)
 
     assert vr.run(config_path="unused.toml", once=True, min_requote_seconds=0.0) == 0
@@ -1701,18 +1524,11 @@ def test_fire_once_runs_announce_a_weekend_only_once(monkeypatch, tmp_path):
     client = _FakeClient()
     source = _NoWiseMid(WEEKEND_RATES, age_s=WEEKEND_AGE)
     notifier = _RecordingNotifier()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
     monkeypatch.setattr(vr, "StopFlag", _StopFlag)
 
     for _ in range(3):
-        vr.run(
-            config_path="unused.toml",
-            once=True,
-            min_requote_seconds=0.0,
-            telegram=True,
-            state_path=tmp_path / "state.sqlite",
-        )
+        _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
 
     assert len(notifier.containing("not updating")) == 1
 
@@ -1753,13 +1569,11 @@ def test_a_rate_past_its_carry_limit_is_replaced_by_wises_mid_with_one_alert(
     client = _FakeClient()
     source = _AgedSource(WEEKEND_RATES, age_s=9 * DAY)
     notifier = _RecordingNotifier()
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, source=source, notifier=notifier)
     monkeypatch.setattr(vr, "StopFlag", _StopFlag)
 
     def fire() -> int:
-        return vr.run(config_path="unused.toml", once=True, telegram=True,
-                      min_requote_seconds=0.0, state_path=tmp_path / "state.sqlite")
+        return _run(once=True, telegram=True, state_path=tmp_path / "state.sqlite")
 
     assert [fire(), fire()] == [0, 0]
     assert len(notifier.containing("use Wise's mid-market rate instead")) == 1
@@ -1858,8 +1672,7 @@ def test_stale_alerts_still_log_without_telegram(caplog):
 
 def test_run_refuses_an_order_ttl_sera_would_sweep_at_once(monkeypatch, caplog):
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
 
     assert vr.run(config_path="vl.toml", order_ttl_seconds=60, state_path=":memory:") == 1
     assert "--order-ttl 60s is too short" in caplog.text
@@ -1868,8 +1681,7 @@ def test_run_refuses_an_order_ttl_sera_would_sweep_at_once(monkeypatch, caplog):
 
 def test_a_dry_run_shows_its_intended_orders_at_the_default_log_level(monkeypatch, caplog):
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     monkeypatch.setattr(vr, "StopFlag", _StopFlag)
 
     with caplog.at_level(logging.WARNING):
@@ -1882,20 +1694,17 @@ def test_a_dry_run_shows_its_intended_orders_at_the_default_log_level(monkeypatc
 def test_startup_says_which_network_and_wallet_it_trades_on(monkeypatch):
     client = _FakeClient()
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _fake_clock(monkeypatch, steps=[1.0])
 
-    vr.run(config_path="vl.toml", telegram=True, min_requote_seconds=0.0, state_path=":memory:")
+    _run(telegram=True)
 
     assert notifier.containing(f"VL mm started on Sepolia testnet as {client.owner_address}")
 
 
 def test_a_stop_during_an_update_check_exits_instead_of_restarting(monkeypatch):
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     stop = _StopFlag()
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
 
@@ -1922,9 +1731,7 @@ def test_an_unexpected_error_that_ends_the_loop_is_alerted(monkeypatch):
 
     client = _FakeClient()
     notifier = _RecordingNotifier()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
-    monkeypatch.setattr(vr, "TelegramNotifier", lambda **_kwargs: notifier)
+    _wire_runner(monkeypatch, client=client, notifier=notifier)
     _fake_clock(monkeypatch, steps=[305.0, 1.0])
 
     def disk_full(self, orders):
@@ -1933,8 +1740,7 @@ def test_an_unexpected_error_that_ends_the_loop_is_alerted(monkeypatch):
     monkeypatch.setattr(vr.StateStore, "add_unsettled", disk_full)
 
     with pytest.raises(sqlite3.OperationalError):
-        vr.run(config_path="vl.toml", telegram=True, min_requote_seconds=0.0,
-               state_path=":memory:")
+        _run(telegram=True)
 
     alerts = notifier.containing("rotor stopped on an unexpected error")
     assert alerts and all(important for _text, important in alerts)
@@ -1946,11 +1752,10 @@ def test_the_cancel_guard_skips_a_tick_too_soon_after_placing(monkeypatch):
     # With a 300 s guard, a tick 100 s after placing would wait 200 s, more
     # than the 60 s rotor will wait, so it skips: no cancel, no new set.
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[100.0, 1.0])
 
-    vr.run(config_path="vl.toml", min_requote_seconds=300.0, state_path=":memory:")
+    _run(min_requote_seconds=300.0)
 
     assert [markets != set() for markets in _markets_quoted_per_tick(client)] == [True, False]
     assert not any(event[0].startswith("cancel") for event in client.events)
@@ -1958,12 +1763,11 @@ def test_the_cancel_guard_skips_a_tick_too_soon_after_placing(monkeypatch):
 
 def test_the_cancel_guard_waits_out_a_short_remainder_then_requotes(monkeypatch):
     client = _FakeClient()
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[250.0, 1.0])
     stop_flag = vr.StopFlag()  # the one fake _fake_clock installed
 
-    vr.run(config_path="vl.toml", min_requote_seconds=300.0, state_path=":memory:")
+    _run(min_requote_seconds=300.0)
 
     # 300 - 250 = 50 s left, under the 60 s limit: wait it out, then requote.
     assert 50.0 in stop_flag.waits
@@ -1977,18 +1781,12 @@ def test_settlement_follows_seras_clock_not_the_local_one(monkeypatch, tmp_path)
     # fill still holds the return side.
     client = _FakeClient(fill_first_xsgd_bid=True)
     client.server_offset = -10_000.0
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     _fake_clock(monkeypatch, steps=[305.0, 1.0])
 
-    vr.run(config_path="vl.toml", min_requote_seconds=0.0, log_level="CRITICAL",
-           state_path=tmp_path / "state.sqlite")
+    _run(state_path=tmp_path / "state.sqlite")
 
-    store = vr.StateStore(tmp_path / "state.sqlite")
-    try:
-        assert store.load_positions() == {}
-    finally:
-        store.close()
+    assert _positions(tmp_path / "state.sqlite") == {}
     assert _xsgd_asks(client)[1][0] == Decimal("5")
 
 
@@ -1997,8 +1795,7 @@ def test_fire_once_never_waits_out_the_boot_cancel_cooldown(monkeypatch, tmp_pat
     # --once fire cancels once and exits, never blocking for 5 minutes.
     client = _FakeClient(open_orders=[_OLD_ORDER], cancel_ok=False)
     _remember(tmp_path / "state.sqlite", "old-order")
-    source = _SequencedSource({("SGD", "USD"): ["1.0000"], ("EUR", "USD"): ["2.0000"]})
-    _wire_runner(monkeypatch, config=_config(), client=client, source=source)
+    _wire_runner(monkeypatch, client=client)
     stop = _StopFlag()
     monkeypatch.setattr(vr, "StopFlag", lambda: stop)
 

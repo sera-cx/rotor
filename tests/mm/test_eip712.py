@@ -9,7 +9,7 @@ import pytest
 from rotor.mm.exchange import eip712
 
 
-# Bit-layout slice helpers — inlined from what used to be `unpack_uuid`.
+# Bit-layout slices of a packed uuid_int.
 def _executor(packed: int) -> int: return (packed >> 252) & 0xF
 def _order_id_bits(packed: int) -> int: return (packed >> 124) & ((1 << 128) - 1)
 def _group_id(packed: int) -> int: return (packed >> 12) & ((1 << 112) - 1)
@@ -52,25 +52,16 @@ def test_compose_uuid_executor_id_lands_in_top_4_bits():
         assert (packed >> 252) & 0xF == ex
 
 
-def test_compose_uuid_rejects_out_of_range():
-    oid = "00000000-0000-4000-8000-000000000001"
+@pytest.mark.parametrize(("order_id", "kwargs"), [
+    pytest.param("00000000-0000-4000-8000-000000000001", {"executor_id": 16}, id="executor-16"),
+    pytest.param("00000000-0000-4000-8000-000000000001", {"executor_id": -1}, id="executor-neg"),
+    pytest.param("00000000-0000-4000-8000-000000000001", {"leg_id": 4096}, id="leg-4096"),
+    pytest.param("00000000-0000-4000-8000-000000000001", {"leg_id": -1}, id="leg-neg"),
+    pytest.param("not-a-uuid", {}, id="not-a-uuid"),
+])
+def test_compose_uuid_rejects_out_of_range_fields_and_bad_uuids(order_id, kwargs):
     with pytest.raises(ValueError):
-        eip712.compose_uuid(oid, executor_id=16)        # > 4-bit
-    with pytest.raises(ValueError):
-        eip712.compose_uuid(oid, executor_id=-1)
-
-
-def test_compose_uuid_rejects_out_of_range_leg_id():
-    oid = "00000000-0000-4000-8000-000000000001"
-    with pytest.raises(ValueError):
-        eip712.compose_uuid(oid, leg_id=4096)
-    with pytest.raises(ValueError):
-        eip712.compose_uuid(oid, leg_id=-1)
-
-
-def test_compose_uuid_rejects_invalid_uuid_string():
-    with pytest.raises(ValueError):
-        eip712.compose_uuid("not-a-uuid")
+        eip712.compose_uuid(order_id, **kwargs)
 
 
 def test_eip712_type_definitions_match_sera_spec():

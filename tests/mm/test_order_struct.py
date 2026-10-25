@@ -30,6 +30,23 @@ _VECTORS = json.loads(
 )
 
 
+def _struct(**overrides) -> dict:
+    """build_order_struct on a fixed owner, token pair and uuid; `overrides` win."""
+    args = dict(
+        owner_address="0x1111111111111111111111111111111111111111",
+        side="ask",
+        amount=Decimal("1"),
+        price=Decimal("1"),
+        base_address="0xAAA0000000000000000000000000000000000001",
+        quote_address="0xBBB0000000000000000000000000000000000002",
+        base_decimals=6,
+        quote_decimals=6,
+        uuid_int=1,
+        expiration=1800000000,
+    )
+    return eip712.build_order_struct(**{**args, **overrides})
+
+
 def _ids(vectors: list[dict]) -> list[str]:
     """Readable pytest ids: market + side + amount@price."""
     return [f"{v['symbol']}-{v['side']}-{v['amount']}@{v['price']}" for v in vectors]
@@ -37,7 +54,6 @@ def _ids(vectors: list[dict]) -> list[str]:
 
 @pytest.mark.parametrize("vector", _VECTORS, ids=_ids(_VECTORS))
 def test_local_struct_matches_server_preview(vector: dict) -> None:
-    """The locally built struct equals the server's own preview output."""
     struct = eip712.build_order_struct(
         owner_address=vector["owner_address"],
         side=vector["side"],
@@ -59,23 +75,12 @@ def test_local_struct_matches_server_preview(vector: dict) -> None:
 
 def test_bid_and_ask_swap_token_roles() -> None:
     """A bid spends quote to receive base; an ask does the reverse."""
-    common = dict(
-        owner_address="0x1111111111111111111111111111111111111111",
-        amount=Decimal("1000"),
-        price=Decimal("1.25"),
-        base_address="0xAAA0000000000000000000000000000000000001",
-        quote_address="0xBBB0000000000000000000000000000000000002",
-        base_decimals=18,
-        quote_decimals=6,
-        uuid_int=7,
-        expiration=1800000000,
-    )
-    bid = eip712.build_order_struct(side="bid", **common)
-    ask = eip712.build_order_struct(side="ask", **common)
+    common = dict(amount=Decimal("1000"), price=Decimal("1.25"), base_decimals=18)
+    bid = _struct(side="bid", **common)
+    ask = _struct(side="ask", **common)
 
-    # Token roles mirror each other across the two sides.
-    assert bid["fromToken"] == ask["toToken"] == common["quote_address"].lower()
-    assert bid["toToken"] == ask["fromToken"] == common["base_address"].lower()
+    assert bid["fromToken"] == ask["toToken"] == "0xbbb0000000000000000000000000000000000002"
+    assert bid["toToken"] == ask["fromToken"] == "0xaaa0000000000000000000000000000000000001"
     # 1000 base at 1.25 => 1250 quote, each scaled by its own token decimals.
     assert bid["fromAmount"] == ask["toAmount"] == 1250 * 10**6
     assert bid["toAmount"] == ask["fromAmount"] == 1000 * 10**18
@@ -83,20 +88,9 @@ def test_bid_and_ask_swap_token_roles() -> None:
 
 def test_quote_amount_is_floored_not_rounded() -> None:
     """Sub-unit remainders truncate toward zero, matching the server."""
-    struct = eip712.build_order_struct(
-        owner_address="0x1111111111111111111111111111111111111111",
-        side="ask",
-        # 3 * 0.3333335 = 1.0000005 quote; at 6 decimals the trailing 5 must
-        # be dropped, not rounded up to 1000001.
-        amount=Decimal("3"),
-        price=Decimal("0.3333335"),
-        base_address="0xAAA0000000000000000000000000000000000001",
-        quote_address="0xBBB0000000000000000000000000000000000002",
-        base_decimals=6,
-        quote_decimals=6,
-        uuid_int=1,
-        expiration=1800000000,
-    )
+    # 3 * 0.3333335 = 1.0000005 quote; at 6 decimals the trailing 5 must be
+    # dropped, not rounded up to 1000001.
+    struct = _struct(amount=Decimal("3"), price=Decimal("0.3333335"))
     assert struct["toAmount"] == 1000000
 
 
@@ -109,18 +103,7 @@ def test_uses_server_decimal_precision() -> None:
     """
     assert eip712.SERVER_DECIMAL_PREC == 50
     price = Decimal("1.00000000000000000000000000001")  # 30 significant digits
-    struct = eip712.build_order_struct(
-        owner_address="0x1111111111111111111111111111111111111111",
-        side="ask",
-        amount=Decimal("1000000000000"),
-        price=price,
-        base_address="0xAAA0000000000000000000000000000000000001",
-        quote_address="0xBBB0000000000000000000000000000000000002",
-        base_decimals=6,
-        quote_decimals=18,
-        uuid_int=1,
-        expiration=1800000000,
-    )
+    struct = _struct(amount=Decimal("1000000000000"), price=price, quote_decimals=18)
     # Computed at 50 digits the 1e-29 tail survives into the 18-decimal
     # scaling; at Python's default 28 digits it would be rounded away and the
     # amount would collapse to exactly 1e30.
@@ -136,50 +119,27 @@ def test_uses_server_decimal_precision() -> None:
 
 
 def test_rejects_unknown_side() -> None:
-    """Only bid/ask are valid; anything else is a programming error."""
     with pytest.raises(ValueError, match="Invalid side"):
-        eip712.build_order_struct(
-            owner_address="0x1111111111111111111111111111111111111111",
-            side="buy",
-            amount=Decimal("1"),
-            price=Decimal("1"),
-            base_address="0xAAA0000000000000000000000000000000000001",
-            quote_address="0xBBB0000000000000000000000000000000000002",
-            base_decimals=6,
-            quote_decimals=6,
-            uuid_int=1,
-            expiration=1800000000,
-        )
-
-
-def test_raw_amount_rejects_oversized_amounts() -> None:
-    """Absurd amounts raise a clear ValueError, never a raw InvalidOperation.
-
-    At 10**60 base units the scaled value needs ~79 significant digits, more
-    than the 50-digit context can quantize. The server hits the same wall —
-    its own uint256 ceiling check sits after the quantize and is
-    unreachable here — so the request would fail server-side regardless.
-    Rotor refuses locally instead of signing and sending it.
-    """
-    with pytest.raises(ValueError, match="too large to represent"):
-        eip712.raw_amount(Decimal(10) ** 60, 18)
+        _struct(side="buy")
 
 
 @pytest.mark.parametrize("exponent", [51, 60, 78, 90])
 def test_raw_amount_rejects_every_oversized_scale(exponent: int) -> None:
-    """Oversized amounts are always refused, never silently wrapped.
+    """Oversized amounts raise a clear ValueError, never a raw InvalidOperation.
 
-    Note the uint256 ceiling (~1.16e77, 78 digits) sits above the 50-digit
-    context, so a value large enough to overflow uint256 can never be
+    The scaled value needs more significant digits than the 50-digit context
+    can quantize. The server hits the same wall, so the request would fail
+    server-side regardless; rotor refuses locally instead of signing and
+    sending it. The uint256 ceiling (~1.16e77, 78 digits) sits above the
+    50-digit context, so a value large enough to overflow uint256 can never be
     quantized in the first place. The explicit `exceeds uint256` guard is
     therefore unreachable in both Rotor and the server; it is kept only as
     defence in depth should the precision ever be raised.
     """
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="too large to represent"):
         eip712.raw_amount(Decimal(10) ** exponent, 18)
 
 
 def test_raw_amount_rejects_negative() -> None:
-    """Negative amounts can never appear in a signed order."""
     with pytest.raises(ValueError, match="non-negative"):
         eip712.raw_amount(Decimal("-1"), 6)

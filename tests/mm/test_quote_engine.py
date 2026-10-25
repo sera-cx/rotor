@@ -7,24 +7,7 @@ from decimal import Decimal
 import pytest
 
 from rotor.mm import quote_engine as qe
-from rotor.mm.exchange.client import MarketInfo
 from rotor.security import key as wallet_key
-
-
-def _market() -> MarketInfo:
-    return MarketInfo(
-        symbol="XSGD/USDC",
-        base_symbol="XSGD",
-        quote_symbol="USDC",
-        base_address="0xbase",
-        quote_address="0xquote",
-        base_decimals=6,
-        quote_decimals=6,
-        tick_precision=4,
-        quantity_precision=2,
-        price_step=Decimal("0.0001"),
-        amount_step=Decimal("0.01"),
-    )
 
 
 def test_build_client_dry_run_uses_zero_address_when_wallet_locked(monkeypatch):

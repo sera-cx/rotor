@@ -14,86 +14,6 @@ from rotor.updater import (
 )
 
 
-def test_pull_latest_skips_non_git_worktree(tmp_path):
-    calls: list[list[str]] = []
-
-    def fake_git(_repo: Path, args: list[str], _timeout: float) -> GitCommandResult:
-        calls.append(args)
-        return GitCommandResult(returncode=1, stderr="not a git repository")
-
-    result = pull_latest(repo_path=tmp_path, git_runner=fake_git)
-
-    assert result.status == "skipped"
-    assert "not a git worktree" in result.message
-    assert calls == [["rev-parse", "--is-inside-work-tree"]]
-
-
-def test_pull_latest_skips_dirty_worktree(tmp_path):
-    calls: list[list[str]] = []
-    responses = iter([
-        GitCommandResult(returncode=0, stdout="true\n"),
-        GitCommandResult(returncode=0, stdout=" M rotor/mm/vl_runner.py\n"),
-    ])
-
-    def fake_git(_repo: Path, args: list[str], _timeout: float) -> GitCommandResult:
-        calls.append(args)
-        return next(responses)
-
-    result = pull_latest(repo_path=tmp_path, git_runner=fake_git)
-
-    assert result.status == "skipped"
-    assert "local changes" in result.message
-    assert ["pull", "--ff-only"] not in calls
-
-
-def test_pull_latest_reports_fast_forward_update(tmp_path):
-    before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    calls: list[list[str]] = []
-    responses = iter([
-        GitCommandResult(returncode=0, stdout="true\n"),
-        GitCommandResult(returncode=0, stdout=""),
-        GitCommandResult(returncode=0, stdout="main\n"),
-        GitCommandResult(returncode=0, stdout=f"{before}\n"),
-        GitCommandResult(returncode=0, stdout="Fast-forward\n"),
-        GitCommandResult(returncode=0, stdout=f"{after}\n"),
-    ])
-
-    def fake_git(_repo: Path, args: list[str], _timeout: float) -> GitCommandResult:
-        calls.append(args)
-        return next(responses)
-
-    result = pull_latest(repo_path=tmp_path, git_runner=fake_git)
-
-    assert result.status == "updated"
-    assert result.updated is True
-    assert result.before == before
-    assert result.after == after
-    assert ["pull", "--ff-only"] in calls
-
-
-def test_pull_latest_reports_unchanged_when_head_does_not_move(tmp_path):
-    head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    responses = iter([
-        GitCommandResult(returncode=0, stdout="true\n"),
-        GitCommandResult(returncode=0, stdout=""),
-        GitCommandResult(returncode=0, stdout="main\n"),
-        GitCommandResult(returncode=0, stdout=f"{head}\n"),
-        GitCommandResult(returncode=0, stdout="Already up to date.\n"),
-        GitCommandResult(returncode=0, stdout=f"{head}\n"),
-    ])
-
-    def fake_git(_repo: Path, _args: list[str], _timeout: float) -> GitCommandResult:
-        return next(responses)
-
-    result = pull_latest(repo_path=tmp_path, git_runner=fake_git)
-
-    assert result.status == "unchanged"
-    assert result.updated is False
-    assert result.before == head
-    assert result.after == head
-
-
 def test_daily_git_updater_runs_only_when_due(tmp_path):
     calls: list[dict] = []
 
@@ -197,6 +117,27 @@ def test_a_changed_tracked_file_still_blocks_an_update(tmp_path):
 
     assert result.status == "skipped"
     assert "local changes" in result.message
+
+
+def test_a_directory_outside_any_checkout_is_skipped(tmp_path, monkeypatch):
+    # Keep git from climbing to a checkout that happens to hold the temp dir.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+
+    result = pull_latest(repo_path=tmp_path)
+
+    assert result.status == "skipped"
+    assert "not a git worktree" in result.message
+
+
+def test_a_pull_with_nothing_new_is_unchanged(tmp_path):
+    upstream, deploy = _deployment(tmp_path)
+    pull_latest(repo_path=deploy)
+
+    result = pull_latest(repo_path=deploy)
+
+    assert result.status == "unchanged"
+    assert result.updated is False
+    assert result.before == result.after == _git(upstream, "rev-parse", "HEAD")
 
 
 def _pulled_to(head: str):

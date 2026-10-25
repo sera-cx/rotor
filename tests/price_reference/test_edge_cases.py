@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from price_helpers import ecb_source, wise_source
 
 from rotor.price_reference.aggregator import (
     ReferencePriceOracle,
@@ -55,7 +56,7 @@ def test_load_price_reference_source_accepts_supported_sources(name):
     assert load_price_reference_source(name).name in {name, "fed"}
 
 
-def test_wise_source_rejects_response_without_enabled_options(monkeypatch):
+def test_wise_source_rejects_response_without_enabled_options():
     def handler(_request: httpx.Request) -> httpx.Response:
         # All options disabled (no funding method available to the account).
         return httpx.Response(200, json={"rate": 0.78, "paymentOptions": [
@@ -65,66 +66,33 @@ def test_wise_source_rejects_response_without_enabled_options(monkeypatch):
              "disabled": False},
         ]})
 
-    monkeypatch.setenv("WISE_API_TOKEN", "t")
-    src = WiseRateSource(
-        base_url="https://api.wise.test",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    src = wise_source(handler)
 
     with pytest.raises(ValueError, match="no enabled transfer method"):
         src.sell_rate("SGD", "USD", Decimal("1000"))
 
 
-def test_wise_source_rejects_non_positive_target(monkeypatch):
+def test_wise_source_rejects_non_positive_target():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"rate": 0.78, "paymentOptions": [
             {"payIn": "BANK_TRANSFER", "sourceAmount": 1000, "targetAmount": "0",
              "disabled": False},
         ]})
 
-    monkeypatch.setenv("WISE_API_TOKEN", "t")
-    src = WiseRateSource(
-        base_url="https://api.wise.test",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    src = wise_source(handler)
 
     with pytest.raises(ValueError, match="rate must be positive"):
         src.sell_rate("SGD", "USD", Decimal("1000"))
 
 
-def test_wise_source_propagates_http_errors(monkeypatch):
+def test_wise_source_propagates_http_errors():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"detail": "down"})
 
-    monkeypatch.setenv("WISE_API_TOKEN", "t")
-    src = WiseRateSource(
-        base_url="https://api.wise.test",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    src = wise_source(handler)
 
     with pytest.raises(httpx.HTTPStatusError):
         src.quote("SGD", "USD")
-
-
-def test_ecb_source_handles_eur_base_and_quote_pairs():
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
-    <Envelope>
-      <Cube>
-        <Cube time="2026-05-31">
-          <Cube currency="USD" rate="1.20"/>
-          <Cube currency="SGD" rate="1.50"/>
-        </Cube>
-      </Cube>
-    </Envelope>
-    """
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=xml)
-
-    src = EcbRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
-
-    assert src.quote("EUR", "USD").rate == Decimal("1.20")
-    assert src.quote("SGD", "EUR").rate == Decimal("0.6666666666666666666666666667")
 
 
 def test_ecb_source_rejects_xml_without_daily_rates():
@@ -148,31 +116,21 @@ def test_reference_oracle_wraps_source_failures_with_pair_and_type():
         ReferencePriceOracle(BrokenSource()).get("SGD", "USD")
 
 
-def test_sources_carry_distinct_default_staleness_windows():
-    # Intraday (Wise) rejects after minutes; daily official references tolerate
-    # much longer because they legitimately publish once per business day.
+def test_default_freshness_and_carry_windows():
+    # Intraday Wise is stale after minutes and never carried: a stale Wise quote
+    # means the feed is broken. Daily official references publish once per
+    # business day, so they stay fresh for 48h and are carried for a week.
     assert WiseRateSource().default_max_age_s == 600.0
+    assert WiseRateSource().default_max_carry_age_s is None
     assert EcbRateSource().default_max_age_s == 48 * 3600
+    assert EcbRateSource().default_max_carry_age_s == 7 * 24 * 3600
+    assert BnmRateSource().default_max_carry_age_s == 7 * 24 * 3600
 
 
 def test_ecb_observation_timestamp_reflects_published_date():
     # An old ECB feed must be flagged stale by the freshness guard, which only
     # works if `ts` is the published date rather than fetch time.
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
-    <Envelope>
-      <Cube>
-        <Cube time="2024-01-02">
-          <Cube currency="USD" rate="1.20"/>
-          <Cube currency="SGD" rate="1.50"/>
-        </Cube>
-      </Cube>
-    </Envelope>
-    """
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=xml)
-
-    src = EcbRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    src = ecb_source("2024-01-02")
     obs = src.quote("SGD", "USD")
 
     # ts is the 2024 publication date, far older than any sane freshness window.
@@ -204,12 +162,6 @@ def test_reference_oracle_allows_quote_at_exact_max_age(monkeypatch):
     ref = ReferencePriceOracle(StaticSource(), max_age_s=10).get("SGD", "USD")
 
     assert ref.rate == Decimal("0.75")
-
-
-def test_daily_sources_carry_for_a_week_and_wise_never_carries():
-    assert WiseRateSource().default_max_carry_age_s is None
-    assert EcbRateSource().default_max_carry_age_s == 7 * 24 * 3600
-    assert BnmRateSource().default_max_carry_age_s == 7 * 24 * 3600
 
 
 def test_per_source_carry_override_from_config(monkeypatch):

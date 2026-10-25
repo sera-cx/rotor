@@ -8,11 +8,11 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from mm_builders import intent, vl_config
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange import errors
 from rotor.mm.exchange.client import (
-    MarketInfo,
     OrderRecord,
     SignedOrder,
     SignedVLBatch,
@@ -21,69 +21,18 @@ from rotor.mm.exchange.client import (
 )
 from rotor.mm.positions import Position
 from rotor.mm.quote_engine import LiveOrder
-from rotor.mm.vl_config import BudgetConfig, VLConfig
-
-
-def _intent(
-    market: str = "XSGD/USDC",
-    side: str = "bid",
-    spent: str = "USDC",
-    *,
-    price: str = "1",
-    qty: str = "100",
-) -> vr.OrderIntent:
-    return vr.OrderIntent(
-        market=market,
-        side=side,
-        qty_base=Decimal(qty),
-        price=Decimal(price),
-        expiration=999,
-        spent_token=spent,
-        benchmark_rate=Decimal("1"),
-    )
-
-
-def _config(*, budget: str = "100") -> VLConfig:
-    return VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal(budget))],
-        pairs=[],
-        fixed_bps=Decimal("8"),
-        return_bps=Decimal("1"),
-    )
-
-
-def _market() -> MarketInfo:
-    return MarketInfo(
-        symbol="XSGD/USDC",
-        base_symbol="XSGD",
-        quote_symbol="USDC",
-        base_address="0xbase",
-        quote_address="0xquote",
-        base_decimals=6,
-        quote_decimals=6,
-        tick_precision=4,
-        quantity_precision=2,
-        price_step=Decimal("0.0001"),
-        amount_step=Decimal("0.01"),
-        min_bid_quote_amount=Decimal("1"),
-        min_ask_amount=Decimal("1"),
-    )
 
 
 def test_validate_budget_caps_allows_exact_bid_cap():
     vr._validate_budget_caps(
-        [("USDC", [_intent(price="1", qty="100")], False)], _config(budget="100"))
+        [("USDC", [intent(price="1", qty="100")], False)], vl_config(budget="100"))
 
 
 def test_validate_budget_caps_rejects_ask_quantity_above_cap():
-    intent = _intent(side="ask", spent="USDC", price="1", qty="100.01")
+    ask = intent(side="ask", spent="USDC", price="1", qty="100.01")
 
-    try:
-        vr._validate_budget_caps([("USDC", [intent], False)], _config(budget="100"))
-    except ValueError as exc:
-        assert "above configured budget" in str(exc)
-    else:  # pragma: no cover - defensive assertion branch.
-        raise AssertionError("expected budget cap rejection")
+    with pytest.raises(ValueError, match="above configured budget"):
+        vr._validate_budget_caps([("USDC", [ask], False)], vl_config(budget="100"))
 
 
 def test_group_intents_batches_an_unbudgeted_multi_leg_group():
@@ -91,8 +40,8 @@ def test_group_intents_batches_an_unbudgeted_multi_leg_group():
     # balance: standalone, Sera would refuse the second; one batch freezes once.
     groups = vr.group_intents(
         [
-            _intent(spent="XSGD"),
-            _intent(market="EURC/USDC", spent="XSGD"),
+            intent(spent="XSGD"),
+            intent(market="EURC/USDC", spent="XSGD"),
         ],
         vl_min_size=2,
     )
@@ -121,7 +70,7 @@ def test_place_groups_uses_vl_batch_and_tracks_intents():
                 cancelled=[],
             )
 
-    intents = [_intent(), _intent(market="EURC/USDC")]
+    intents = [intent(), intent(market="EURC/USDC")]
     placements = vr._place_groups(
         Client(),
         [("USDC", intents, True)],
@@ -159,7 +108,7 @@ def test_place_groups_skips_a_rejected_order_and_places_the_rest(caplog):
 
     placements = vr._place_groups(
         Client(),
-        [("USDC", [_intent(), _intent(market="EURC/USDC"), _intent(market="JPYC/USDC")], False)],
+        [("USDC", [intent(), intent(market="EURC/USDC"), intent(market="JPYC/USDC")], False)],
         logging.getLogger("test"),
     )
 
@@ -170,22 +119,47 @@ def test_place_groups_skips_a_rejected_order_and_places_the_rest(caplog):
     assert "could not place EURC/USDC bid spent=USDC: INSUFFICIENT_EQUITY" in caplog.text
 
 
-def test_cancel_placements_keeps_cooldown_vl_batch():
+def _not_found(message: str) -> errors.SeraError:
+    """Sera's reply to cancelling an order or batch it never booked."""
+    return errors.from_response(400, {"detail": {"status": "error", "message": message}})
+
+
+@pytest.mark.parametrize(("kind", "reply", "kept"), [
+    pytest.param("vl", False, True, id="cooldown-kept"),
+    pytest.param("standalone", errors.SeraError("ORDER_NOT_FOUND", "no such order", 404),
+                 False, id="404-dropped"),
+    # As for a placement whose answer was lost and that Sera never booked.
+    pytest.param("standalone", _not_found("Order not found for cancellation:0xowner,o-1"),
+                 False, id="400-order-dropped"),
+    pytest.param("vl", _not_found("VL batch not found: batch-1"), False, id="400-batch-dropped"),
+    # A 5xx might mean the order is still live, so it stays tracked for retry.
+    pytest.param("standalone", errors.SeraError("SERVER_ERROR", "boom", 500),
+                 True, id="5xx-kept"),
+])
+def test_cancel_placements_keeps_only_what_may_still_be_live(kind, reply, kept):
     placement = vr.LivePlacement(
-        kind="vl",
-        spent_token="USDC",
-        orders=[LiveOrder("vl", "leg-1", 1, 0.0)],
-        placed_at=0.0,
-        vl_batch_id="batch-1",
-    )
+        kind=kind, spent_token="USDC", orders=[LiveOrder("bid", "o-1", 1, 0.0)], placed_at=0.0,
+        vl_batch_id="batch-1" if kind == "vl" else None)
+    calls = []
 
     class Client:
+        def cancel_order(self, order_id, uuid_int):
+            calls.append("cancel_order")
+            return self._answer()
+
         def cancel_vl_batch(self, vl_batch_id):
-            return False
+            calls.append("cancel_vl_batch")
+            return self._answer()
+
+        def _answer(self):
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
 
     remaining = vr._cancel_placements(Client(), [placement], logging.getLogger("test"))
 
-    assert remaining == [placement]
+    assert remaining == ([placement] if kept else [])
+    assert calls == ["cancel_vl_batch" if kind == "vl" else "cancel_order"]
 
 
 def test_cancel_boot_placements_waits_once_then_retries(monkeypatch):
@@ -221,14 +195,7 @@ def test_state_store_dedupes_and_prunes_unresolved_state(tmp_path):
         kind="standalone",
         spent_token="USDC",
         orders=[
-            LiveOrder(
-                "bid",
-                "order-1",
-                2**252,
-                10.0,
-                "XSGD/USDC",
-                Decimal("25"),
-            )
+            LiveOrder("bid", "order-1", 2**252, 10.0, "XSGD/USDC", Decimal("25"))
         ],
         placed_at=10.0,
     )
@@ -451,22 +418,8 @@ def test_prune_fully_filled_placements_drops_only_known_full_fills():
         kind="standalone",
         spent_token="USDC",
         orders=[
-            LiveOrder(
-                "bid",
-                "full",
-                1,
-                10.0,
-                "XSGD/USDC",
-                Decimal("10"),
-            ),
-            LiveOrder(
-                "ask",
-                "partial",
-                2,
-                10.0,
-                "XSGD/USDC",
-                Decimal("10"),
-            ),
+            LiveOrder("bid", "full", 1, 10.0, "XSGD/USDC", Decimal("10")),
+            LiveOrder("ask", "partial", 2, 10.0, "XSGD/USDC", Decimal("10")),
             LiveOrder("ask", "unknown-size", 3, 10.0, "XSGD/USDC"),
         ],
         placed_at=10.0,
@@ -541,9 +494,9 @@ def test_load_live_placements_groups_vl_batches_and_filters_markets():
 
 def test_placement_from_vl_result_applies_amendments_and_drops_cancelled():
     intents = [
-        _intent(market="XSGD/USDC", qty="100"),
-        _intent(market="EURC/USDC", qty="100"),
-        _intent(market="MYRC/USDC", qty="100"),
+        intent(market="XSGD/USDC", qty="100"),
+        intent(market="EURC/USDC", qty="100"),
+        intent(market="MYRC/USDC", qty="100"),
     ]
     result = VLBatchResult(
         vl_batch_id="b1",
@@ -562,71 +515,8 @@ def test_placement_from_vl_result_applies_amendments_and_drops_cancelled():
     assert sizes["o1"] == Decimal("60")
 
 
-def test_cancel_placements_drops_orders_sera_reports_gone():
-    placement = vr.LivePlacement(
-        kind="standalone",
-        spent_token="USDC",
-        orders=[LiveOrder("bid", "gone-1", 1, 0.0)],
-        placed_at=0.0,
-    )
-
-    class Client:
-        def cancel_order(self, order_id, uuid_int):
-            raise errors.SeraError("ORDER_NOT_FOUND", "no such order", 404)
-
-    remaining = vr._cancel_placements(Client(), [placement], logging.getLogger("test"))
-
-    assert remaining == []
-
-
-def test_cancel_placements_drops_orders_sera_does_not_know():
-    # Sera's actual replies for an order or batch it never booked (a 400 with
-    # the backend's message), as for a placement whose answer was lost.
-    placements = [
-        vr.LivePlacement(
-            kind="standalone",
-            spent_token="USDC",
-            orders=[LiveOrder("bid", "never-booked", 1, 0.0)],
-            placed_at=0.0,
-        ),
-        vr.LivePlacement(
-            kind="vl", spent_token="USDC", orders=[], placed_at=0.0, vl_batch_id="never-sent"),
-    ]
-
-    class Client:
-        def cancel_order(self, order_id, uuid_int):
-            raise errors.from_response(400, {"detail": {
-                "status": "error",
-                "message": f"Order not found for cancellation:0xowner,{order_id}",
-            }})
-
-        def cancel_vl_batch(self, vl_batch_id):
-            raise errors.from_response(400, {"detail": {
-                "status": "error", "message": f"VL batch not found: {vl_batch_id}"}})
-
-    assert vr._cancel_placements(Client(), placements, logging.getLogger("test")) == []
-
-
-def test_cancel_placements_keeps_retryable_failures():
-    placement = vr.LivePlacement(
-        kind="standalone",
-        spent_token="USDC",
-        orders=[LiveOrder("bid", "maybe-live", 1, 0.0)],
-        placed_at=0.0,
-    )
-
-    class Client:
-        def cancel_order(self, order_id, uuid_int):
-            raise errors.SeraError("SERVER_ERROR", "boom", 500)
-
-    remaining = vr._cancel_placements(Client(), [placement], logging.getLogger("test"))
-
-    # A 5xx might mean the order is still live, so it stays tracked for retry.
-    assert remaining == [placement]
-
-
 def test_group_intents_splits_oversized_same_token_group():
-    intents = [_intent(market=f"M{i}/USDC", spent="USDC") for i in range(5)]
+    intents = [intent(market=f"M{i}/USDC", spent="USDC") for i in range(5)]
 
     groups = vr.group_intents(intents, 2, 2)
 
@@ -640,12 +530,12 @@ def test_group_intents_splits_oversized_same_token_group():
 
 def test_validate_budget_caps_adds_up_standalone_orders_on_one_token():
     group = ("USDC", [
-        _intent(price="1", qty="60"),
-        _intent(market="EURC/USDC", price="1", qty="60"),
+        intent(price="1", qty="60"),
+        intent(market="EURC/USDC", price="1", qty="60"),
     ], False)
 
     with pytest.raises(ValueError, match="could spend 120, above configured budget 100"):
-        vr._validate_budget_caps([group], _config(budget="100"))
+        vr._validate_budget_caps([group], vl_config(budget="100"))
 
 
 def test_validate_budget_caps_counts_a_vl_batch_as_its_largest_leg():
@@ -653,23 +543,23 @@ def test_validate_budget_caps_counts_a_vl_batch_as_its_largest_leg():
     # and only one can fill at a time. Eight legs that each use the whole budget
     # fit, as the Earn setup sizes them.
     markets = ["XSGD", "EURC", "JPYC", "TGBP", "AXCNH", "AUDD", "CADC", "VCHF"]
-    whole_budget = [_intent(market=f"{base}/USDC", price="1", qty="100") for base in markets]
-    vr._validate_budget_caps([("USDC", whole_budget, True)], _config(budget="100"))
+    whole_budget = [intent(market=f"{base}/USDC", price="1", qty="100") for base in markets]
+    vr._validate_budget_caps([("USDC", whole_budget, True)], vl_config(budget="100"))
 
-    one_leg_over = [_intent(price="1", qty="60"), _intent(market="EURC/USDC", price="1", qty="101")]
+    one_leg_over = [intent(price="1", qty="60"), intent(market="EURC/USDC", price="1", qty="101")]
     with pytest.raises(ValueError, match="could spend 101"):
-        vr._validate_budget_caps([("USDC", one_leg_over, True)], _config(budget="100"))
+        vr._validate_budget_caps([("USDC", one_leg_over, True)], vl_config(budget="100"))
 
 
 def test_validate_budget_caps_adds_up_separate_batches_and_standalone_orders():
     # Each batch locks its own largest leg, and a standalone order locks in full.
-    batch_a = ("USDC", [_intent(price="1", qty="40"), _intent(market="EURC/USDC", price="1", qty="30")], True)
-    batch_b = ("USDC", [_intent(market="JPYC/USDC", price="1", qty="40"), _intent(market="AUDD/USDC", price="1", qty="20")], True)
-    solo = ("USDC", [_intent(market="CADC/USDC", price="1", qty="21")], False)
+    batch_a = ("USDC", [intent(price="1", qty="40"), intent(market="EURC/USDC", price="1", qty="30")], True)
+    batch_b = ("USDC", [intent(market="JPYC/USDC", price="1", qty="40"), intent(market="AUDD/USDC", price="1", qty="20")], True)
+    solo = ("USDC", [intent(market="CADC/USDC", price="1", qty="21")], False)
 
-    vr._validate_budget_caps([batch_a, batch_b], _config(budget="100"))
+    vr._validate_budget_caps([batch_a, batch_b], vl_config(budget="100"))
     with pytest.raises(ValueError, match="could spend 101"):
-        vr._validate_budget_caps([batch_a, batch_b, solo], _config(budget="100"))
+        vr._validate_budget_caps([batch_a, batch_b, solo], vl_config(budget="100"))
 
 
 def test_state_store_single_instance_lock(tmp_path):

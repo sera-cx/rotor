@@ -17,67 +17,35 @@ def test_missing_command_exits_with_parser_error():
     assert ei.value.code == 2
 
 
-def test_vl_dry_run_passes_args_to_runner(monkeypatch):
+# What `rotor mm vl --config vl.toml --dry-run --once` passes the runner.
+_DEFAULTS = {
+    "config_path": "vl.toml",
+    "poll_seconds": 305.0,
+    "dry_run": True,
+    "once": True,
+    "telegram": False,
+    "auto_update": False,
+    "update_interval_seconds": 86400.0,
+    "log_level": "WARNING",
+    "halt_on_stale_reference": False,
+}
+
+
+@pytest.mark.parametrize(("flags", "changed"), [
+    pytest.param([], {}, id="defaults"),
+    pytest.param(
+        ["--telegram", "--auto-update", "--auto-update-interval-seconds", "60"],
+        {"telegram": True, "auto_update": True, "update_interval_seconds": 60.0},
+        id="telegram-and-auto-update"),
+    pytest.param(["--halt-on-stale-reference"], {"halt_on_stale_reference": True},
+                 id="halt-on-stale-reference"),
+])
+def test_vl_flags_pass_to_the_runner(monkeypatch, flags, changed):
     captured = {}
+    monkeypatch.setattr(vl_runner, "run", lambda **kwargs: captured.update(kwargs) or 0)
 
-    def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(vl_runner, "run", fake_run)
-
-    assert cli.main(["mm", "vl", "--config", "vl.toml", "--dry-run", "--once"]) == 0
-    assert captured["config_path"] == "vl.toml"
-    assert captured["poll_seconds"] == 305.0
-    assert captured["dry_run"] is True
-    assert captured["once"] is True
-    assert captured["auto_update"] is False
-    assert captured["update_interval_seconds"] == 86400.0
-    assert captured["log_level"] == "WARNING"
-    assert captured["halt_on_stale_reference"] is False
-
-
-def test_vl_auto_update_flags_pass_to_runner(monkeypatch):
-    captured = {}
-
-    def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(vl_runner, "run", fake_run)
-
-    assert cli.main([
-        "mm",
-        "vl",
-        "--config",
-        "vl.toml",
-        "--dry-run",
-        "--once",
-        "--telegram",
-        "--auto-update",
-        "--auto-update-interval-seconds",
-        "60",
-    ]) == 0
-
-    assert captured["auto_update"] is True
-    assert captured["update_interval_seconds"] == 60.0
-    assert captured["telegram"] is True
-
-
-
-def test_vl_halt_on_stale_reference_flag_passes_to_runner(monkeypatch):
-    captured = {}
-
-    def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(vl_runner, "run", fake_run)
-
-    assert cli.main([
-        "mm", "vl", "--config", "vl.toml", "--dry-run", "--once", "--halt-on-stale-reference",
-    ]) == 0
-    assert captured["halt_on_stale_reference"] is True
+    assert cli.main(["mm", "vl", "--config", "vl.toml", "--dry-run", "--once", *flags]) == 0
+    assert {key: captured[key] for key in _DEFAULTS} == {**_DEFAULTS, **changed}
 
 
 def test_live_vl_requires_wallet_unlock(monkeypatch, capsys):
@@ -87,20 +55,6 @@ def test_live_vl_requires_wallet_unlock(monkeypatch, capsys):
 
     assert cli.main(["mm", "vl", "--config", "vl.toml"]) == 1
     assert "no SERA_PRIVATE_KEY" in capsys.readouterr().err
-
-
-def test_smoke_command_is_not_available():
-    with pytest.raises(SystemExit) as ei:
-        cli.main(["smoke", "market", "--qty", "1"])
-
-    assert ei.value.code == 2
-
-
-def test_mm_simple_is_not_available():
-    with pytest.raises(SystemExit) as ei:
-        cli.main(["mm", "simple", "--qty", "1"])
-
-    assert ei.value.code == 2
 
 
 _GOOD_CONFIG = """fixed_bps = "50"

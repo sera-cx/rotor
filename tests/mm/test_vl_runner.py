@@ -8,6 +8,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from mm_builders import intent, market, vl_config
 
 from rotor.mm import vl_runner as vr
 from rotor.mm.exchange import errors
@@ -19,9 +20,8 @@ from rotor.mm.exchange.client import (
     VLBatchResult,
 )
 from rotor.mm.positions import Position
-from rotor.mm.vl_config import BudgetConfig, PairConfig, VLConfig
+from rotor.mm.vl_config import PairConfig
 from rotor.mm.vl_runner import (
-    OrderIntent,
     _place_groups,
     _validate_budget_caps,
     _without_self_cross,
@@ -34,31 +34,11 @@ LOG = logging.getLogger("test")
 HOUR = 3600.0
 
 
-def _intent(
-    market: str,
-    side: str,
-    spent: str,
-    *,
-    price: str = "1.00",
-    qty: str = "100",
-    mid: str = "1.01",
-) -> OrderIntent:
-    return OrderIntent(
-        market=market,
-        side=side,
-        qty_base=Decimal(qty),
-        price=Decimal(price),
-        expiration=999,
-        spent_token=spent,
-        benchmark_rate=Decimal(mid),
-    )
-
-
 def test_group_intents_uses_vl_for_multi_leg_groups():
     groups = group_intents([
-        _intent("XSGD/USDC", "bid", "USDC"),
-        _intent("EURC/USDC", "bid", "USDC"),
-        _intent("XSGD/USDC", "ask", "XSGD"),
+        intent("XSGD/USDC", "bid", "USDC"),
+        intent("EURC/USDC", "bid", "USDC"),
+        intent("XSGD/USDC", "ask", "XSGD"),
     ], 2)
 
     assert groups[0][0] == "USDC"
@@ -69,35 +49,12 @@ def test_group_intents_uses_vl_for_multi_leg_groups():
 
 
 def test_validate_budget_caps_rejects_oversized_budgeted_intent():
-    cfg = VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal("50"))],
-        pairs=[],
-        fixed_bps=Decimal("8"),
-        return_bps=Decimal("1"),
-    )
+    cfg = vl_config(budget="50")
 
     with pytest.raises(ValueError, match="above configured budget"):
         _validate_budget_caps([
-            ("USDC", [_intent("XSGD/USDC", "bid", "USDC", price="1.10", qty="100")], False)
+            ("USDC", [intent("XSGD/USDC", "bid", "USDC", price="1.10", qty="100")], False)
         ], cfg)
-
-
-def _market(*, min_bid_quote: str = "0", min_ask: str = "0") -> MarketInfo:
-    return MarketInfo(
-        symbol="XSGD/USDC",
-        base_symbol="XSGD",
-        quote_symbol="USDC",
-        base_address="0xbase",
-        quote_address="0xquote",
-        base_decimals=6,
-        quote_decimals=6,
-        tick_precision=4,
-        quantity_precision=2,
-        price_step=Decimal("0.0001"),
-        amount_step=Decimal("0.01"),
-        min_bid_quote_amount=Decimal(min_bid_quote),
-        min_ask_amount=Decimal(min_ask),
-    )
 
 
 def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
@@ -108,7 +65,7 @@ def _runtime(info: MarketInfo | None = None) -> vr.PairRuntime:
             qty_base=Decimal("100"),
             fixed_bps=Decimal("50"),
         ),
-        info=info or _market(),
+        info=info or market(),
         oracle=None,
         iso_base="SGD",
         iso_quote="USD",
@@ -154,22 +111,11 @@ def _priced(intents, wise, info=None, *, mid="1.0000", stale=False, now=NOW, ref
     return vr._at_wise_prices(intents, runtime, ref, now=now, log=LOG, refs=refs)
 
 
-def _vl_config(*, return_bps: str = "2", budget: str = "1000", window: str = "48") -> VLConfig:
-    return VLConfig(
-        budgets=[BudgetConfig("USDC", Decimal(budget))],
-        pairs=[],
-        fixed_bps=Decimal("50"),
-        return_bps=Decimal(return_bps),
-        return_window_hours=Decimal(window),
-    )
-
-
-def _normal_quote(mid: str = "1.0000") -> list[OrderIntent]:
-    """The normal 50 bps quote around `mid` for 100 XSGD."""
-    m = Decimal(mid)
+def _quote(fixed_bps="25", mid="1.0000", qty="100"):
+    m, f = Decimal(mid), Decimal(fixed_bps) / 10000
     return [
-        _intent("XSGD/USDC", "bid", "USDC", price=str(m * Decimal("0.995")), qty="100", mid=mid),
-        _intent("XSGD/USDC", "ask", "XSGD", price=str(m * Decimal("1.005")), qty="100", mid=mid),
+        intent("XSGD/USDC", "bid", "USDC", price=str(m * (1 - f)), qty=qty, mid=mid),
+        intent("XSGD/USDC", "ask", "XSGD", price=str(m * (1 + f)), qty=qty, mid=mid),
     ]
 
 
@@ -178,7 +124,7 @@ def _with_return(position, intents, *, now, info=None, return_bps="2", window="4
         intents,
         _runtime(info),
         position,
-        _vl_config(return_bps=return_bps, window=window),
+        vl_config(return_bps=return_bps, window=window),
         now=now,
         log=LOG,
     )
@@ -191,7 +137,7 @@ def _with_return(position, intents, *, now, info=None, return_bps="2", window="4
 def test_short_position_swaps_the_bid_for_a_return_bid_and_keeps_the_ask():
     # Sold 40 XSGD at 1.0050 twelve hours ago; mid has not moved.
     position = Position(Decimal("-40"), Decimal("1.0050"), 0.0)
-    intents = _normal_quote()
+    intents = _quote("50")
 
     out = _with_return(position, intents, now=12 * HOUR)
 
@@ -209,18 +155,18 @@ def test_the_return_window_setting_sets_how_fast_the_auction_walks():
     # 1.0100 keeps the return_bps limit out of the way.)
     position = Position(Decimal("-40"), Decimal("1.0050"), 0.0)
 
-    bid, _ask = _with_return(position, _normal_quote("1.0100"), now=12 * HOUR, window="24")
+    bid, _ask = _with_return(position, _quote("50", "1.0100"), now=12 * HOUR, window="24")
     assert bid.price == Decimal("0.9999")
 
     # The default 48 h window is only a quarter through.
-    bid, _ask = _with_return(position, _normal_quote("1.0100"), now=12 * HOUR)
+    bid, _ask = _with_return(position, _quote("50", "1.0100"), now=12 * HOUR)
     assert bid.price == Decimal("0.9974")
 
 
 def test_return_order_holds_at_the_fill_price_while_the_market_stays_away():
     # Bought 40 XSGD at 0.9950 three days ago; the market has fallen to 0.9700.
     position = Position(Decimal("40"), Decimal("0.9950"), 0.0)
-    intents = _normal_quote("0.9700")
+    intents = _quote("50", "0.9700")
 
     _bid, ask = _with_return(position, intents, now=72 * HOUR)
 
@@ -230,7 +176,7 @@ def test_return_order_holds_at_the_fill_price_while_the_market_stays_away():
 def test_return_order_sits_return_bps_from_mid_when_the_market_came_back():
     position = Position(Decimal("-40"), Decimal("1.0050"), 0.0)
 
-    bid, _ask = _with_return(position, _normal_quote("1.0000"), now=48 * HOUR)
+    bid, _ask = _with_return(position, _quote("50", "1.0000"), now=48 * HOUR)
 
     assert bid.price == Decimal("0.9998")
 
@@ -239,7 +185,7 @@ def test_return_order_never_spends_more_than_the_normal_order():
     # A 300 XSGD short, more than one 100 XSGD order: the bid it replaces spent
     # 99.5 USDC, so the return bid buys at most 99.5 / 0.9998 XSGD of it.
     position = Position(Decimal("-300"), Decimal("1.0050"), 0.0)
-    intents = _normal_quote()
+    intents = _quote("50")
 
     bid, _ask = _with_return(position, intents, now=48 * HOUR)
 
@@ -251,7 +197,7 @@ def test_return_order_never_spends_more_than_the_normal_order():
 def test_a_dust_position_keeps_the_full_normal_order_on_its_side():
     # 9.99 XSGD short against a 100 XSGD bid: under a tenth of it, so the bid
     # stays a full normal quote; 10 XSGD is enough to take the side.
-    intents = _normal_quote()
+    intents = _quote("50")
 
     assert _with_return(Position(Decimal("-9.99"), Decimal("1.0050"), 0.0), intents,
                         now=12 * HOUR) == intents
@@ -263,9 +209,9 @@ def test_a_dust_position_keeps_the_full_normal_order_on_its_side():
 
 def test_position_below_the_market_minimum_keeps_the_normal_order():
     position = Position(Decimal("-0.5"), Decimal("1.0050"), 0.0)
-    intents = _normal_quote()
+    intents = _quote("50")
 
-    out = _with_return(position, intents, now=0.0, info=_market(min_bid_quote="1"))
+    out = _with_return(position, intents, now=0.0, info=market(min_bid_quote="1"))
 
     assert out == intents
 
@@ -273,14 +219,6 @@ def test_position_below_the_market_minimum_keeps_the_normal_order():
 # ---------------------------------------------------------------------------
 # Normal orders priced at Wise's after-fee rates
 # ---------------------------------------------------------------------------
-
-def _quote(fixed_bps="25", mid="1.0000", qty="100"):
-    m, f = Decimal(mid), Decimal(fixed_bps) / 10000
-    return [
-        _intent("XSGD/USDC", "bid", "USDC", price=str(m * (1 - f)), qty=qty, mid=mid),
-        _intent("XSGD/USDC", "ask", "XSGD", price=str(m * (1 + f)), qty=qty, mid=mid),
-    ]
-
 
 def test_normal_quotes_sit_at_wises_after_fee_prices_whatever_fixed_bps_is():
     # Wise: selling SGD costs 24 bps, buying it 37 bps.
@@ -355,7 +293,7 @@ def test_the_weekend_spread_covers_fx_weekends_carried_mids_and_wise_outages():
 
 def test_a_bid_below_the_market_minimum_at_wises_price_is_dropped():
     # 100 XSGD at Wise's 0.9900 is 99.00 USDC, under the 99.50 minimum.
-    sides = _priced(_quote("25"), _Wise(sell_fee="0.0100"), info=_market(min_bid_quote="99.5"))
+    sides = _priced(_quote("25"), _Wise(sell_fee="0.0100"), info=market(min_bid_quote="99.5"))
 
     assert [intent.side for intent in sides] == ["ask"]
 
@@ -367,12 +305,12 @@ def test_a_bid_below_the_market_minimum_at_wises_price_is_dropped():
 def test_an_order_the_price_pushed_over_budget_is_trimmed_to_fit():
     # Sized to the whole 1,000 USDC budget at setup; the price has since risen,
     # so 1,100 XSGD at 0.995 would spend 1,094.50 USDC.
-    over = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="1100")
-    under = _intent("EURC/USDC", "bid", "USDC", price="0.995", qty="1000")
-    unbudgeted = _intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="5000")
+    over = intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="1100")
+    under = intent("EURC/USDC", "bid", "USDC", price="0.995", qty="1000")
+    unbudgeted = intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="5000")
 
     out = vr._within_limits(
-        [over, under, unbudgeted], _market(), BUDGETS, None, LOG)
+        [over, under, unbudgeted], market(), BUDGETS, None, LOG)
 
     # 1,000 / 0.995 = 1,005.0251..., rounded down to the 0.01 size step.
     assert out[0].qty_base == Decimal("1005.02")
@@ -382,18 +320,18 @@ def test_an_order_the_price_pushed_over_budget_is_trimmed_to_fit():
 
 def test_an_ask_spending_a_budgeted_token_is_trimmed_to_the_budget():
     # On a USDC-base market the ask is what spends USDC.
-    ask = _intent("USDC/AUDD", "ask", "USDC", price="1.52", qty="1200")
+    ask = intent("USDC/AUDD", "ask", "USDC", price="1.52", qty="1200")
 
-    out = vr._within_limits([ask], _market(), BUDGETS, None, LOG)
+    out = vr._within_limits([ask], market(), BUDGETS, None, LOG)
 
     assert out[0].qty_base == Decimal("1000")
 
 
 def test_an_order_too_small_after_trimming_is_dropped(caplog):
-    bid = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="100")
+    bid = intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="100")
 
     out = vr._within_limits(
-        [bid], _market(min_bid_quote="1"), {"USDC": Decimal("0.5")}, None, LOG)
+        [bid], market(min_bid_quote="1"), {"USDC": Decimal("0.5")}, None, LOG)
 
     assert out == []
     assert "XSGD/USDC bid dropped: trimmed to its USDC budget it is too small" in caplog.text
@@ -417,12 +355,12 @@ def test_spend_limit_is_the_lower_of_budget_and_vault_balance():
 
 def test_orders_are_fitted_to_what_the_wallet_holds(caplog):
     caplog.set_level(logging.DEBUG)
-    bid = _intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="1000")
-    unheld_ask = _intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="1000")
-    held_ask = _intent("EURC/USDC", "ask", "EURC", price="1.005", qty="1000")
+    bid = intent("XSGD/USDC", "bid", "USDC", price="0.995", qty="1000")
+    unheld_ask = intent("XSGD/USDC", "ask", "XSGD", price="1.005", qty="1000")
+    held_ask = intent("EURC/USDC", "ask", "EURC", price="1.005", qty="1000")
     funds = {"USDC": Decimal("600"), "EURC": Decimal("50")}
 
-    out = vr._within_limits([bid, unheld_ask, held_ask], _market(), BUDGETS, funds, LOG)
+    out = vr._within_limits([bid, unheld_ask, held_ask], market(), BUDGETS, funds, LOG)
 
     # 600 / 0.995 = 603.01..., rounded down; the unheld XSGD ask is left out
     # quietly; the EURC ask shrinks to the 50 EURC held.
@@ -471,12 +409,12 @@ def _fill(quantity: str, status: str | None = "settled") -> dict:
     return row
 
 
-def _positions(client, store, server_now):
+def _positions(client, store, server_now, stuck=None):
     """One tick's fill read: settle what is final, return positions for quoting."""
     unsettled = store.load_unsettled()
     fills, _failed, _unknown = vr._read_fills(client, [order.order_id for order in unsettled])
     return vr._positions_for_quoting(
-        store, unsettled, fills, server_now=server_now, log=LOG)
+        store, unsettled, fills, server_now=server_now, log=LOG, stuck=stuck)
 
 
 SOLD_40 = {"XSGD/USDC": Position(Decimal("-40"), Decimal("1.0050"), 500.0)}
@@ -645,10 +583,10 @@ class _PlacingClient:
 def _groups():
     return [
         ("USDC", [
-            _intent("XSGD/USDC", "bid", "USDC", price="0.99"),
-            _intent("EURC/USDC", "bid", "USDC", price="1.98"),
+            intent("XSGD/USDC", "bid", "USDC", price="0.99"),
+            intent("EURC/USDC", "bid", "USDC", price="1.98"),
         ], True),
-        ("XSGD", [_intent("XSGD/USDC", "ask", "XSGD", price="1.01")], False),
+        ("XSGD", [intent("XSGD/USDC", "ask", "XSGD", price="1.01")], False),
     ]
 
 
@@ -724,7 +662,7 @@ def test_an_order_without_an_answer_stays_recorded_and_is_tracked_for_cancel(los
 
 def test_standalone_placement_is_recorded_for_settlement():
     """A singleton (standalone) order is recorded in the ledger like a VL leg."""
-    source = _intent("XSGD/USDC", "bid", "USDC", price="0.99", mid="1.00")
+    source = intent("XSGD/USDC", "bid", "USDC", price="0.99", mid="1.00")
 
     store = vr.StateStore(":memory:")
     placements = _place_groups(
@@ -748,8 +686,8 @@ def test_standalone_placement_is_recorded_for_settlement():
 # ---------------------------------------------------------------------------
 
 def test_inactive_market_is_read_from_either_of_seras_reply_shapes():
-    bid = _intent("XSGD/USDC", "bid", "USDC")
-    other = _intent("EURC/USDC", "bid", "USDC")
+    bid = intent("XSGD/USDC", "bid", "USDC")
+    other = intent("EURC/USDC", "bid", "USDC")
     batch_reply = errors.SeraError(
         None, "Pair XSGD/USDC is not an active trading pair. See GET /markets.", 400)
     order_reply = errors.SeraError("PAIR_INACTIVE", "Invalid request", 400)
@@ -785,7 +723,7 @@ class _InactivePairClient(_PlacingClient):
 
 
 def _bids(*markets: str):
-    return ("USDC", [_intent(m, "bid", "USDC", price="0.99") for m in markets], True)
+    return ("USDC", [intent(m, "bid", "USDC", price="0.99") for m in markets], True)
 
 
 def test_a_batch_is_re_sent_without_its_inactive_market():
@@ -818,16 +756,10 @@ def test_fills_stuck_settling_an_hour_after_expiry_are_reported_once(caplog):
     client = _FillsClient({"o-1": [_fill("40", status="confirming")]})
     stuck: set[str] = set()
 
-    def tick(server_now):
-        unsettled = store.load_unsettled()
-        fills, _failed, _unknown = vr._read_fills(client, ["o-1"])
-        return vr._positions_for_quoting(
-            store, unsettled, fills, server_now=server_now, log=LOG, stuck=stuck)
-
     with caplog.at_level(logging.WARNING):
-        tick(1000 + 3599)          # under an hour past expiry: quiet
-        positions = tick(1000 + 3600)
-        tick(1000 + 7200)          # still stuck: not repeated
+        _positions(client, store, 1000 + 3599, stuck)  # under an hour past expiry: quiet
+        positions = _positions(client, store, 1000 + 3600, stuck)
+        _positions(client, store, 1000 + 7200, stuck)  # still stuck: not repeated
 
     assert caplog.text.count("fills still settling 1h 0m after expiry") == 1
     # The fill still holds the return side while it settles.
@@ -838,20 +770,20 @@ def test_fills_stuck_settling_an_hour_after_expiry_are_reported_once(caplog):
 def test_a_normal_order_crossing_the_pairs_return_order_is_left_out():
     # After a bid fill the return ask is priced from a daily mid, the normal bid
     # from Wise's live rate; a move away from the mid can put the bid above it.
-    returning = replace(_intent("EURC/USDC", "ask", "EURC", price="1.08022"), is_return=True)
-    crossing_bid = _intent("EURC/USDC", "bid", "USDC", price="1.08070")
-    touching_bid = _intent("EURC/USDC", "bid", "USDC", price="1.08022")
-    lower_bid = _intent("EURC/USDC", "bid", "USDC", price="1.08000")
+    returning = replace(intent("EURC/USDC", "ask", "EURC", price="1.08022"), is_return=True)
+    crossing_bid = intent("EURC/USDC", "bid", "USDC", price="1.08070")
+    touching_bid = intent("EURC/USDC", "bid", "USDC", price="1.08022")
+    lower_bid = intent("EURC/USDC", "bid", "USDC", price="1.08000")
 
     assert _without_self_cross([crossing_bid, returning], LOG) == [returning]
     assert _without_self_cross([touching_bid, returning], LOG) == [returning]
     assert _without_self_cross([lower_bid, returning], LOG) == [lower_bid, returning]
 
     # The mirror case: a return bid after an ask fill, and the normal ask.
-    return_bid = replace(_intent("EURC/USDC", "bid", "USDC", price="1.07900"), is_return=True)
-    crossing_ask = _intent("EURC/USDC", "ask", "EURC", price="1.07850")
+    return_bid = replace(intent("EURC/USDC", "bid", "USDC", price="1.07900"), is_return=True)
+    crossing_ask = intent("EURC/USDC", "ask", "EURC", price="1.07850")
     assert _without_self_cross([return_bid, crossing_ask], LOG) == [return_bid]
 
     # Without a return order nothing is dropped, even a crossed normal pair.
-    normal = [_intent("EURC/USDC", "bid", "USDC", price="1.1"), _intent("EURC/USDC", "ask", "EURC", price="1.0")]
+    normal = [intent("EURC/USDC", "bid", "USDC", price="1.1"), intent("EURC/USDC", "ask", "EURC", price="1.0")]
     assert _without_self_cross(normal, LOG) == normal

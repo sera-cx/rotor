@@ -73,6 +73,17 @@ def _stub_signer(domain, types, message):
     return SIG_FIXED
 
 
+def _client(handler, *, key: str = "testkey", secret: str = "testsecret",
+            signer=_stub_signer) -> SeraClient:
+    """A SeraClient whose requests go to `handler`, with retry waits not slept."""
+    client = SeraClient(owner_address=OWNER, signer=signer, api_key=key, api_secret=secret,
+                        base_url="https://api.sera.cx/api/v1")
+    client._http.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    client._sleep = lambda _seconds: None
+    return client
+
+
 def _make_client(
     routes: dict,
     captured: list[dict] | None = None,
@@ -98,18 +109,7 @@ def _make_client(
             return httpx.Response(404, json={"detail": "not found"})
         return httpx.Response(200, json=body)
 
-    c = SeraClient(
-        owner_address=OWNER,
-        signer=signer,
-        api_key="testkey",
-        api_secret="testsecret",
-        base_url="https://api.sera.cx/api/v1",
-    )
-    c._http.close()
-    c._http = httpx.Client(transport=httpx.MockTransport(handler))
-    # Pacing and retry waits are tested separately; don't sleep in tests.
-    c._sleep = lambda _seconds: None
-    return c
+    return _client(handler, signer=signer)
 
 
 @pytest.mark.parametrize(("key", "secret"), [
@@ -124,12 +124,7 @@ def test_api_credentials_are_trimmed_and_sent_clean(key, secret):
         headers.append(request.headers["Authorization"])
         return httpx.Response(200, json={"trades": [], "total": 0})
 
-    client = SeraClient(owner_address=OWNER, signer=_stub_signer, api_key=key,
-                        api_secret=secret, base_url="https://api.sera.cx/api/v1")
-    client._http.close()
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
-
-    client.get_open_orders()
+    _client(handler, key=key, secret=secret).get_open_orders()
 
     assert headers == ["Bearer key123:s3cr3t-secret"]
 
@@ -183,26 +178,28 @@ def test_place_order_4xx_raises_typed_sera_error():
     assert ei.value.status_code == 400
 
 
-def test_cancel_order_429_returns_false():
-    routes = _build_mock_routes({
-        "POST /orders/cancel": (429, {
-            "detail": {"detail": "cooldown", "error_code": "CANCEL_COOLDOWN"},
-        }),
-    })
-    client = _make_client(routes)
+# Sera's cancel-cooldown reply is a plain detail string, with no error code.
+CANCEL_COOLDOWN_BODY = {"detail": "Cancel cooldown not yet elapsed"}
+
+
+@pytest.mark.parametrize(("path", "cancel"), [
+    pytest.param("/orders/cancel", lambda c: c.cancel_order("some-id", 42), id="order"),
+    pytest.param("/orders/vl/cancel", lambda c: c.cancel_vl_batch("primary-id"), id="vl-batch"),
+])
+@pytest.mark.parametrize(("body", "raises"), [
+    pytest.param(CANCEL_COOLDOWN_BODY, None, id="cooldown-returns-false"),
+    pytest.param({"detail": "Rate limit exceeded"}, errors_mod.SeraRateLimit,
+                 id="rate-limit-raises"),
+])
+def test_a_cancel_429_is_a_cooldown_or_a_rate_limit(path, cancel, body, raises):
+    client = _make_client(_build_mock_routes({f"POST {path}": (429, body)}))
     client.bootstrap()
-    assert client.cancel_order("some-id", 42) is False
 
-
-def test_cancel_order_429_rate_limit_propagates():
-    routes = _build_mock_routes({
-        "POST /orders/cancel": (429, {"detail": "Rate limit exceeded"}),
-    })
-    client = _make_client(routes)
-    client.bootstrap()
-
-    with pytest.raises(errors_mod.SeraRateLimit):
-        client.cancel_order("some-id", 42)
+    if raises is None:
+        assert cancel(client) is False
+    else:
+        with pytest.raises(raises):
+            cancel(client)
 
 
 def test_cancel_order_200_returns_true():
@@ -247,29 +244,6 @@ def test_cancel_vl_batch_posts_signed_batch_cancel():
         "vl_batch_id": "primary-id",
         "signature": SIG_FIXED,
     }
-
-
-def test_cancel_vl_batch_429_returns_false():
-    routes = _build_mock_routes({
-        "POST /orders/vl/cancel": (429, {
-            "detail": {"detail": "cooldown", "error_code": "CANCEL_COOLDOWN"},
-        }),
-    })
-    client = _make_client(routes)
-    client.bootstrap()
-
-    assert client.cancel_vl_batch("primary-id") is False
-
-
-def test_cancel_vl_batch_429_rate_limit_propagates():
-    routes = _build_mock_routes({
-        "POST /orders/vl/cancel": (429, {"detail": "Rate limit exceeded"}),
-    })
-    client = _make_client(routes)
-    client.bootstrap()
-
-    with pytest.raises(errors_mod.SeraRateLimit):
-        client.cancel_vl_batch("primary-id")
 
 
 def test_get_open_orders_uses_owner_query_and_bearer_auth():
@@ -455,23 +429,6 @@ def test_reads_without_seras_list_are_errors_not_empty(reply):
         client.get_open_orders()
 
 
-def _good_order(**overrides):
-    order = {
-        "user": OWNER,
-        "expiration": "999",
-        "feeBps": "0",
-        "recipient": "0x0000000000000000000000000000000000000000",
-        "fromToken": USDC["address"],
-        "toToken": MYRC["address"],
-        "fromAmount": "25000000",
-        "toAmount": str(100 * 10**18),
-        "initialDepositAmount": "0",
-        "uuid": "42",
-    }
-    order.update(overrides)
-    return order
-
-
 def test_client_requires_https_base_url():
     with pytest.raises(ValueError, match="https"):
         SeraClient(
@@ -512,28 +469,8 @@ def test_get_order_fills_follows_pagination():
             return httpx.Response(200, json={"items": []})
         return httpx.Response(404, json={"detail": "not found"})
 
-    client = SeraClient(
-        owner_address=OWNER,
-        signer=_stub_signer,
-        api_key="k",
-        api_secret="s",
-        base_url="https://api.sera.cx/api/v1",
-    )
-    client._http.close()
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
-
     # 100 (full page) then 30 (short page → stop): 130 total, both pages read.
-    assert len(client.get_order_fills("o1")) == 130
-    client.close()
-
-
-def _paged_client(handler) -> SeraClient:
-    client = SeraClient(owner_address=OWNER, signer=_stub_signer, api_key="k",
-                        api_secret="s", base_url="https://api.sera.cx/api/v1")
-    client._http.close()
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
-    client._sleep = lambda _seconds: None
-    return client
+    assert len(_client(handler).get_order_fills("o1")) == 130
 
 
 def test_order_amounts_go_on_the_wire_as_plain_decimals():
@@ -570,7 +507,7 @@ def test_get_order_fills_fails_rather_than_undercount_past_its_page_cap():
         return httpx.Response(200, json={"items": [{"quantity": "1"}] * 100})
 
     with pytest.raises(RuntimeError, match="more than 200 fills"):
-        _paged_client(handler).get_order_fills("o1", max_pages=2)
+        _client(handler).get_order_fills("o1", max_pages=2)
 
 
 def test_get_open_orders_reads_every_page_up_to_total():
@@ -582,7 +519,7 @@ def test_get_open_orders_reads_every_page_up_to_total():
         rows = [{"trade_id": f"t{offset + i}"} for i in range(2 if offset < 4 else 1)]
         return httpx.Response(200, json={"trades": rows, "total": 5})
 
-    client = _paged_client(handler)
+    client = _client(handler)
 
     assert [row["trade_id"] for row in client.get_open_orders(page_limit=2)] == [
         "t0", "t1", "t2", "t3", "t4"]
@@ -622,18 +559,8 @@ def test_non_json_error_response_becomes_typed_error():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="upstream down")
 
-    client = SeraClient(
-        owner_address=OWNER,
-        signer=_stub_signer,
-        api_key="testkey",
-        api_secret="testsecret",
-        base_url="https://api.sera.cx/api/v1",
-    )
-    client._http.close()
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
-
     with pytest.raises(errors_mod.SeraError) as ei:
-        client._request("GET", "/anything")
+        _client(handler)._request("GET", "/anything")
     assert ei.value.status_code == 500
     assert ei.value.payload == {"detail": "upstream down"}
 
@@ -652,15 +579,7 @@ def _scripted_client(replies: list[tuple[int, dict, dict]]):
         status, payload, headers = queue.pop(0) if queue else (200, {}, {})
         return httpx.Response(status, json=payload, headers=headers)
 
-    client = SeraClient(
-        owner_address=OWNER,
-        signer=_stub_signer,
-        api_key="testkey",
-        api_secret="testsecret",
-        base_url="https://api.sera.cx/api/v1",
-    )
-    client._http.close()
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = _client(handler)
     clock = [100.0]
     sleeps: list[float] = []
 
@@ -700,8 +619,7 @@ def test_a_rate_limited_request_is_retried_after_retry_after():
 
 
 def test_a_cancel_cooldown_is_not_retried():
-    cooldown = (429, {"detail": {"error_code": errors_mod.CANCEL_COOLDOWN, "detail": "wait"}}, {})
-    client, sent, _ = _scripted_client([cooldown])
+    client, sent, _ = _scripted_client([(429, CANCEL_COOLDOWN_BODY, {})])
 
     with pytest.raises(errors_mod.SeraCancelCooldown):
         client._request("POST", "/orders/cancel", json_body={})

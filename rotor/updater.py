@@ -40,7 +40,6 @@ class GitUpdateResult:
         return self.status == "updated"
 
 
-GitRunner = Callable[[Path, list[str], float], GitCommandResult]
 Puller = Callable[..., GitUpdateResult]
 StartCheck = Callable[[], GitCommandResult]
 
@@ -147,12 +146,10 @@ def pull_latest(
     *,
     repo_path: str | Path | None = None,
     timeout_seconds: float = 120.0,
-    git_runner: GitRunner | None = None,
 ) -> GitUpdateResult:
     """Run `git pull --ff-only` safely and report whether HEAD changed."""
     repo = Path(repo_path) if repo_path is not None else default_repo_root()
-    run_git = _run_git if git_runner is None else git_runner
-    inside = run_git(repo, ["rev-parse", "--is-inside-work-tree"], timeout_seconds)
+    inside = _run_git(repo, ["rev-parse", "--is-inside-work-tree"], timeout_seconds)
     if inside.returncode != 0 or inside.stdout.strip() != "true":
         return GitUpdateResult(
             status="skipped",
@@ -163,7 +160,7 @@ def pull_latest(
     # Only changed tracked files block a pull. Untracked files (the config,
     # state, and .env that live in the checkout) cannot conflict with a
     # fast-forward unless it adds the same path, which fails the pull safely.
-    dirty = run_git(repo, ["status", "--porcelain", "--untracked-files=no"], timeout_seconds)
+    dirty = _run_git(repo, ["status", "--porcelain", "--untracked-files=no"], timeout_seconds)
     if dirty.returncode != 0:
         return GitUpdateResult(
             status="failed",
@@ -177,7 +174,7 @@ def pull_latest(
             output=dirty.stdout,
         )
 
-    current_branch = run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], timeout_seconds)
+    current_branch = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], timeout_seconds)
     if current_branch.returncode != 0:
         return GitUpdateResult(
             status="failed",
@@ -190,7 +187,7 @@ def pull_latest(
             message="checkout is detached; check out a branch to auto-update",
         )
 
-    before_result = run_git(repo, ["rev-parse", "HEAD"], timeout_seconds)
+    before_result = _run_git(repo, ["rev-parse", "HEAD"], timeout_seconds)
     if before_result.returncode != 0:
         return GitUpdateResult(
             status="failed",
@@ -199,7 +196,7 @@ def pull_latest(
         )
     before = before_result.stdout.strip()
 
-    pulled = run_git(repo, ["pull", "--ff-only"], timeout_seconds)
+    pulled = _run_git(repo, ["pull", "--ff-only"], timeout_seconds)
     if pulled.returncode != 0:
         return GitUpdateResult(
             status="failed",
@@ -208,7 +205,7 @@ def pull_latest(
             output=_combined_output(pulled),
         )
 
-    after_result = run_git(repo, ["rev-parse", "HEAD"], timeout_seconds)
+    after_result = _run_git(repo, ["rev-parse", "HEAD"], timeout_seconds)
     if after_result.returncode != 0:
         return GitUpdateResult(
             status="failed",

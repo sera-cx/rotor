@@ -7,13 +7,13 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from price_helpers import ecb_source, wise_source
 
 from rotor.price_reference.sources import (
     BnmRateSource,
     EcbRateSource,
     FedH10RateSource,
     WiseNoRoute,
-    WiseRateSource,
 )
 from rotor.price_reference.symbols import market_to_iso_pair
 
@@ -42,13 +42,6 @@ def _wise_reply(options, *, rate=0.78):
     }
 
 
-def _wise(handler) -> WiseRateSource:
-    return WiseRateSource(
-        base_url="https://api.wise.test",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-
 def _option(pay_in, source, target, *, pay_out="BANK_TRANSFER", disabled=False):
     return {"payIn": pay_in, "payOut": pay_out, "sourceAmount": source,
             "targetAmount": target, "disabled": disabled}
@@ -73,7 +66,7 @@ def test_wise_sell_rate_is_what_converting_the_amount_pays_by_the_cheapest_trans
 
     monkeypatch.delenv("WISE_API_TOKEN", raising=False)
     monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
-    obs = _wise(handler).sell_rate("SGD", "USD", Decimal("2000"))
+    obs = wise_source(handler).sell_rate("SGD", "USD", Decimal("2000"))
 
     assert seen == [("/v3/quotes", {
         "sourceCurrency": "SGD", "targetCurrency": "USD", "sourceAmount": 2000.0})]
@@ -91,7 +84,7 @@ def test_wise_buy_rate_is_what_buying_the_amount_costs_by_the_cheapest_transfer(
             _option("BALANCE", 1562.00, 2000),
         ], rate=1.282))
 
-    obs = _wise(handler).buy_rate("SGD", "USD", Decimal("2000"))
+    obs = wise_source(handler).buy_rate("SGD", "USD", Decimal("2000"))
 
     # Buy 2000 SGD by paying USD: the target side is fixed.
     assert seen == [{"sourceCurrency": "USD", "targetCurrency": "SGD", "targetAmount": 2000.0}]
@@ -102,7 +95,7 @@ def test_wise_as_a_mid_source_quotes_its_mid_market_rate():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
 
-    obs = _wise(handler).quote("SGD", "USD", amount=Decimal("1000"))
+    obs = wise_source(handler).quote("SGD", "USD", amount=Decimal("1000"))
 
     assert obs.rate == Decimal("0.78")
     assert obs.source == "wise"
@@ -117,7 +110,7 @@ def test_wise_mid_comes_from_the_buy_reply_when_wise_cannot_send_from_base():
             return httpx.Response(422, json={"errors": [{"code": "error.route.not.supported"}]})
         return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 141, 1000)], rate=7.1))
 
-    wise = _wise(handler)
+    wise = wise_source(handler)
 
     assert wise.mid_rate("CNH", "USD", Decimal("1000")).rate == 1 / Decimal("7.1")
     with pytest.raises(WiseNoRoute):
@@ -133,9 +126,9 @@ def test_wise_reports_a_route_it_does_not_offer_apart_from_an_outage():
         return httpx.Response(503, json={})
 
     with pytest.raises(WiseNoRoute):
-        _wise(no_route).sell_rate("PEN", "USD", Decimal("1000"))
+        wise_source(no_route).sell_rate("PEN", "USD", Decimal("1000"))
     with pytest.raises(httpx.HTTPStatusError):
-        _wise(down).sell_rate("SGD", "USD", Decimal("1000"))
+        wise_source(down).sell_rate("SGD", "USD", Decimal("1000"))
 
 
 def test_wise_mid_comes_from_the_same_reply_as_the_sell_rate():
@@ -145,7 +138,7 @@ def test_wise_mid_comes_from_the_same_reply_as_the_sell_rate():
         calls.append(json.loads(request.content))
         return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
 
-    wise = _wise(handler)
+    wise = wise_source(handler)
     wise.sell_rate("SGD", "USD", Decimal("1000"))
 
     assert wise.mid_rate("SGD", "USD", Decimal("1000")).rate == Decimal("0.78")
@@ -161,9 +154,9 @@ def test_wise_sends_a_token_only_when_one_is_set(monkeypatch):
 
     monkeypatch.setattr("rotor.config._DOTENV_LOADED", True)
     monkeypatch.delenv("WISE_API_TOKEN", raising=False)
-    _wise(handler).sell_rate("SGD", "USD", Decimal("1000"))
+    wise_source(handler).sell_rate("SGD", "USD", Decimal("1000"))
     monkeypatch.setenv("WISE_API_TOKEN", "token-123")
-    _wise(handler).sell_rate("SGD", "USD", Decimal("1000"))
+    wise_source(handler).sell_rate("SGD", "USD", Decimal("1000"))
 
     assert auth == [None, "Bearer token-123"]
 
@@ -179,7 +172,7 @@ def test_wise_reuses_a_recent_reply_and_falls_back_to_it_when_a_request_fails(mo
             return httpx.Response(429, json={"error": "slow down"})
         return httpx.Response(200, json=_wise_reply([_option("BANK_TRANSFER", 1000, 777)]))
 
-    wise = _wise(handler)
+    wise = wise_source(handler)
     wise.sell_rate("SGD", "USD", Decimal("1000"))
     clock["now"] += 30
     wise.sell_rate("SGD", "USD", Decimal("1000"))
@@ -195,26 +188,13 @@ def test_wise_reuses_a_recent_reply_and_falls_back_to_it_when_a_request_fails(mo
 
 
 def test_ecb_source_crosses_rates_through_eur():
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
-    <gesmes:Envelope xmlns:gesmes="http://www.gesmes.org/xml/2002-08-01"
-      xmlns="http://www.ecb.int/vocabulary/2002-08-01/eurofxref">
-      <Cube>
-        <Cube time="2026-05-31">
-          <Cube currency="USD" rate="1.20"/>
-          <Cube currency="SGD" rate="1.50"/>
-        </Cube>
-      </Cube>
-    </gesmes:Envelope>
-    """
+    src = ecb_source("2026-05-31")
 
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=xml)
-
-    src = EcbRateSource(http=httpx.Client(transport=httpx.MockTransport(handler)))
     obs = src.quote("SGD", "USD")
-
-    assert obs.rate == Decimal("0.8")
-    assert obs.pair == "SGD/USD"
+    assert (obs.pair, obs.rate) == ("SGD/USD", Decimal("0.8"))
+    # EUR itself is seeded at 1, so it works on either side of a pair.
+    assert src.quote("EUR", "USD").rate == Decimal("1.20")
+    assert src.quote("SGD", "EUR").rate == Decimal("0.6666666666666666666666666667")
 
 
 def test_fed_h10_source_crosses_rates_through_usd():

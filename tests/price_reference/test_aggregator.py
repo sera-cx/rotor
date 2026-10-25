@@ -51,18 +51,15 @@ def test_reference_oracle_returns_fresh_wise_quote():
     assert ref.stale is False
 
 
-def test_reference_oracle_rejects_stale_quote():
+def test_a_stale_intraday_quote_is_rejected_and_never_carried():
     oracle = ReferencePriceOracle(StaticSource(age_s=999), max_age_s=10)
-    with pytest.raises(ReferenceUnavailable, match="stale"):
-        oracle.get("SGD", "USD")
-
-
-def test_stale_intraday_quote_is_never_carried():
-    oracle = ReferencePriceOracle(StaticSource(age_s=999), max_age_s=10)
-    with pytest.raises(ReferenceTooStale) as ei:
+    with pytest.raises(ReferenceTooStale, match="stale") as ei:
         oracle.get("SGD", "USD")
 
     assert "carry limit" not in str(ei.value)
+    # Callers catching ReferenceUnavailable (the runner's Wise-mid fallback)
+    # catch a too-stale reference too.
+    assert isinstance(ei.value, ReferenceUnavailable)
 
 
 def test_weekend_daily_rate_is_carried_forward():
@@ -98,7 +95,3 @@ def test_explicit_carry_limit_overrides_the_source():
     oracle = ReferencePriceOracle(DailySource(age_s=3 * DAY), max_carry_age_s=2.5 * DAY)
     with pytest.raises(ReferenceTooStale):
         oracle.get("MYR", "USD")
-
-
-def test_too_stale_is_a_kind_of_reference_unavailable():
-    assert issubclass(ReferenceTooStale, ReferenceUnavailable)
