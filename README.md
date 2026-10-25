@@ -12,8 +12,9 @@ Dutch auction), then holds at the fill price until it fills. See [docs/vl-mm.md]
 
 ## Install
 
-Rotor needs Poetry 2 or newer (Poetry 1.x cannot read its `pyproject.toml`);
-check with `poetry --version`, and upgrade with `pipx install 'poetry>=2'`.
+Rotor needs Python 3.11 or newer and Poetry 2 or newer (Poetry 1.x cannot read
+its `pyproject.toml`); check with `python3 --version` and `poetry --version`, and
+upgrade Poetry with `pipx install 'poetry>=2'`.
 
 ```bash
 poetry install

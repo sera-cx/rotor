@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-# vl_config's TOML parser: tomllib on Python 3.11+, tomli on 3.10.
-from rotor.mm.vl_config import parse_vl_config, tomllib
+from rotor.mm.vl_config import parse_vl_config
 
 
 def _config(**overrides):

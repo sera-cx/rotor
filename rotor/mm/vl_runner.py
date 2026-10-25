@@ -871,7 +871,7 @@ def _first_line(error: Exception) -> str:
 
 def _rate_date(ts: float) -> str:
     """Label a published timestamp, as a plain date for date-only sources."""
-    stamp = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+    stamp = dt.datetime.fromtimestamp(ts, tz=dt.UTC)
     # Daily sources publish a date, which the adapters stamp as UTC midnight.
     if (stamp.hour, stamp.minute, stamp.second) == (0, 0, 0):
         return f"dated {stamp:%Y-%m-%d}"
@@ -880,7 +880,7 @@ def _rate_date(ts: float) -> str:
 
 def _fmt_utc(ts: float) -> str:
     """Format POSIX seconds as a UTC minute."""
-    return f"{dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc):%Y-%m-%d %H:%M} UTC"
+    return f"{dt.datetime.fromtimestamp(ts, tz=dt.UTC):%Y-%m-%d %H:%M} UTC"
 
 
 def _fmt_duration(seconds: float) -> str:

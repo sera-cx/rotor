@@ -585,7 +585,7 @@ def _date_ts(value: Any) -> float | None:
         return None
     # Treat naive/date-only values as UTC midnight for deterministic freshness.
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=dt.UTC)
     return parsed.timestamp()
 
 
@@ -644,7 +644,7 @@ def _parse_ts(value: Any) -> float:
         parsed = dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
     # Treat naive timestamps as UTC so freshness checks are deterministic.
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=dt.UTC)
     return parsed.timestamp()
 
 

@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-
-try:  # pragma: no cover - exercised only on Python >= 3.11.
-    # Python 3.11+ ships TOML parsing in the standard library.
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10.
-    # Python 3.10 users get the same API from the tomli dependency.
-    import tomli as tomllib
 
 from rotor.price_reference import parse_market_symbol
 
@@ -82,7 +76,7 @@ class VLConfig:
 def load_vl_config(path: str | Path) -> VLConfig:
     """Load and validate a VL TOML config file."""
     config_path = Path(path)
-    # TOML files must be opened as bytes for tomllib/tomli.
+    # TOML files must be opened as bytes for tomllib.
     with config_path.open("rb") as fh:
         raw = tomllib.load(fh)
     # Keep all validation in parse_vl_config so tests can use dict input.

@@ -96,7 +96,7 @@ def parse_ts(value) -> float | None:
         return None
     # Treat naive timestamps as UTC to keep cooldown math deterministic.
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=dt.UTC)
     return parsed.timestamp()
 
 
