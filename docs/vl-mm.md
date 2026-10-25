@@ -383,8 +383,9 @@ Before restarting into new code, Rotor runs it once with the same command plus
 wallet, or state. Only if that passes does Rotor stop the loop, run normal
 shutdown cleanup, and re-exec the same command (with a Telegram notice). If it
 fails (a new dependency needing `poetry install`, or a config the new version
-rejects), Rotor keeps running the old version, alerts with the reason, and
-checks again at the next interval. `--auto-update-interval-seconds` exists for
+rejects), Rotor keeps running the old version, puts the checkout back on it (so
+a `--once` fire or restart does not load the failing code), alerts with the
+reason, and pulls and checks again at the next interval. `--auto-update-interval-seconds` exists for
 testing/custom deployments.
 
 A deployment still on a version from before this check (GitHub `public` at

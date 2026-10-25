@@ -259,7 +259,8 @@ Autonomous updates:
 - Whenever the checkout is at a commit other than the running one, the new code
   must pass `--check-config` (same argv; imports the runner and loads the config,
   no network/wallet/state) before a restart; otherwise the old version keeps
-  running and the check is retried next interval.
+  running, the checkout is reset to it (`git reset --keep`), and the pull and
+  check are retried next interval.
 - A restart stops the loop, runs normal shutdown cleanup, and re-execs the same
   command. A stop signal received during the update check wins: rotor exits
   instead. A failed pull's reason is passed on with any URL credentials

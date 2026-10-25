@@ -124,12 +124,22 @@ class DailyGitUpdater:
                 after=head,
                 output=result.output,
             )
+        # Put the checkout back on the running commit: the next --once fire or
+        # a restart would otherwise load the code that just failed. The next
+        # interval pulls and checks it again.
+        reset = _run_git(self.repo_path, ["reset", "--keep", running], 60.0)
+        checkout = (
+            "the checkout is back on it" if reset.returncode == 0
+            else "the checkout could not be put back on it, so a restart would run the "
+            f"failing version ({_combined_output(reset, limit=200)})"
+        )
         return GitUpdateResult(
             status="failed",
             message=(
                 f"pulled {span}, but the new version fails its start check, so rotor "
-                f"keeps running {_short_sha(running)} (if dependencies changed, run "
-                f"`poetry install`, then restart rotor): {_combined_output(check, limit=300)}"
+                f"keeps running {_short_sha(running)} and {checkout} (if dependencies "
+                f"changed, run `poetry install`, then restart rotor): "
+                f"{_combined_output(check, limit=300)}"
             ),
             before=running,
             after=head,

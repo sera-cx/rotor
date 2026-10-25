@@ -248,6 +248,31 @@ def test_new_code_must_pass_its_start_check_before_a_restart(tmp_path):
     assert len(checks) == 2
 
 
+def test_a_version_that_fails_its_check_is_not_left_checked_out(tmp_path):
+    upstream, deploy = _deployment(tmp_path)
+    running = _git(deploy, "rev-parse", "HEAD")
+    outcomes = iter([GitCommandResult(returncode=1, stderr="ImportError: newdep"),
+                     GitCommandResult(returncode=0)])
+    updater = DailyGitUpdater(repo_path=deploy, interval_seconds=10, running_commit=running,
+                              start_check=lambda: next(outcomes))
+    log = logging.getLogger("tests.updater")
+
+    first = updater.run_if_due(log, now=100.0)
+
+    # A --once fire or restart now would load v1 again, not the failing v2.
+    assert first.status == "failed"
+    assert "the checkout is back on it" in first.message
+    assert _git(deploy, "rev-parse", "HEAD") == running
+    assert (deploy / "README.md").read_text() == "v1\n"
+    # The operator's untracked files are untouched.
+    assert (deploy / "rotor" / "vl.config.toml").read_text() == 'fixed_bps = "50"\n'
+
+    # The next interval pulls v2 again, and this time it passes.
+    second = updater.run_if_due(log, now=111.0)
+    assert second.updated is True
+    assert second.after == _git(upstream, "rev-parse", "HEAD")
+
+
 def test_no_start_check_while_running_the_checked_out_commit(tmp_path):
     def start_check() -> GitCommandResult:
         raise AssertionError("not needed")
