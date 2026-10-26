@@ -169,7 +169,7 @@ Live order lifecycle:
   expiry plus 60 s is dropped too, whatever its cancel answers.
 - A tick with no order to place (every pair's price unavailable) cancels the
   resting quotes once the guard allows, rather than leaving them until expiry.
-- A tick that ran so long its orders would have under 120 s to live places
+- A tick that ran so long its orders would have under 90 s to live places
   nothing.
 - VL batch results are reconciled: server-cancelled legs are not tracked, and a
   clipped (amended) leg tracks its accepted size so a full fill at that size

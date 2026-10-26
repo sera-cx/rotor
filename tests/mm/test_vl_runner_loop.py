@@ -2101,3 +2101,29 @@ def test_an_order_someone_else_places_mid_run_is_alerted_once(monkeypatch):
     alerts = notifier.containing("did not place (someone-else)")
     assert len(alerts) == 1 and alerts[0][1] is True
     assert ("cancel_order", "someone-else", 42) not in client.events
+
+
+@pytest.mark.parametrize(("ttl", "tick_runs", "places"), [
+    # The shortest allowed TTL still quotes after an ordinary tick...
+    (120, 5.0, True),
+    # ...but not after one that leaves its orders under 90 s to live.
+    (120, 31.0, False),
+    (600, 505.0, True),
+    (600, 515.0, False),
+])
+def test_a_tick_that_ran_too_long_for_its_orders_places_nothing(monkeypatch, ttl, tick_runs, places):
+    client = _FakeClient()
+    client.balances = None
+    _wire_runner(monkeypatch, client=client)
+    clock = _fake_clock(monkeypatch, steps=[1.0])
+    read_balances = client.get_vault_balances
+
+    def slow_balances():
+        clock["now"] += tick_runs
+        return read_balances()
+
+    client.get_vault_balances = slow_balances
+
+    _run(order_ttl_seconds=ttl)
+
+    assert bool(client.batch_places) is places

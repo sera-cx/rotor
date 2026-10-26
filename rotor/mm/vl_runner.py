@@ -70,6 +70,9 @@ SERA_CANCEL_COOLDOWN_SECONDS = 300.0
 # Sera sweeps, every 30 s, orders due to expire within 60 s, so a shorter TTL
 # leaves an order almost no time on the book.
 MIN_ORDER_TTL_SECONDS = 120
+# A tick that ran so long its orders would have less than this left to live
+# places nothing: Sera's next sweep (within 30 s) would take them off the book.
+MIN_ORDER_LIFE_SECONDS = 90.0
 # An order whose fills are still pending/confirming this long after it expired
 # is reported once: settlement looks stuck, and its fill is not yet stored.
 STUCK_SETTLEMENT_SECONDS = 3600.0
@@ -1320,10 +1323,10 @@ def run(
             # orders with almost no life left, which Sera sweeps within 60 s of
             # expiry; skip it, and the next tick signs fresh ones.
             elapsed = time.time() - tick_started
-            if elapsed > order_ttl_seconds - MIN_ORDER_TTL_SECONDS:
+            if order_ttl_seconds - elapsed < MIN_ORDER_LIFE_SECONDS:
                 log.warning(
-                    "skip tick: it ran %.0fs, leaving its orders under %ds to live",
-                    elapsed, MIN_ORDER_TTL_SECONDS,
+                    "skip tick: it ran %.0fs, leaving its orders under %.0fs to live",
+                    elapsed, MIN_ORDER_LIFE_SECONDS,
                 )
                 if once:
                     code = 1
