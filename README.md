@@ -7,8 +7,11 @@ a bid and an ask on each configured market at Wise's after-fee price for that
 order's size, cancels the previous tracked quote set when safe, and places the
 fresh set through Sera VL where possible. Inventory a fill moves becomes a
 position that rotor quotes back on the opposite side: the return order starts
-`2 x fixed_bps` from the fill price and walks to it over 48 hours (a reverse
-Dutch auction), then holds at the fill price until it fills. See [docs/vl-mm.md](docs/vl-mm.md#returning-fills).
+`2 x fixed_bps` from the fill price and walks toward it over 48 hours (a
+reverse Dutch auction). It stops `return_bps` from the mid, which normal quotes
+filled past, so it usually ends a few bps from the mid; it reaches the fill
+price only if the market moved against the position, and never goes past it.
+See [docs/vl-mm.md](docs/vl-mm.md#returning-fills).
 
 ## Install
 

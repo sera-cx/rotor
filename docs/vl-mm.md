@@ -25,14 +25,19 @@ time) in `rotor/mm/positions.py` and quotes it back on the opposite side:
   `2 x fixed_bps` from the fill price and
   walks linearly to the fill price over `return_window_hours` (default 48): a
   reverse Dutch auction that asks for less profit the longer it waits.
-- After the window it **holds at the fill price indefinitely**. Rotor never
-  returns a position at a loss against its fill price. Breakeven is measured on
+- It never quotes closer to the latest mid than `return_bps`. Normal quotes
+  fill at Wise's after-fee price, past the mid, so this is usually where the
+  auction stops: a few bps from the mid, well inside Wise's price for whoever
+  takes it (in a USD/SGD example with Wise 0.4% from mid, `fixed_bps` 100 and
+  `return_bps` 3, after about 38 hours). It waits there, following the mid.
+- It never goes past the fill price: rotor never returns a position at a loss
+  against its fill price. Only when the market has moved against the position
+  (the mid is past the fill) does the auction reach the fill price at the end of
+  the window, and it then **holds there indefinitely**. Breakeven is measured on
   price alone; any fees or gas a deployment charges are not included.
 - Unlike normal quotes, it is not priced at Wise: it can start outside Wise's
   after-fee price and walks back toward the fill price, so the position can
   return to neutral.
-- It never quotes closer to the latest mid than `return_bps`. If the market moved
-  in rotor's favour, the order sits `return_bps` from mid instead of overpaying.
 - It never spends more than the normal order it replaces, so a larger position is
   returned over several fills and budgets see no new spend. A position below the
   market's minimum order, or under a tenth of the normal order on that side
